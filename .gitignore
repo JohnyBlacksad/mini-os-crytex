@@ -11,3 +11,6 @@ Thumbs.db
 *.iml
 ARCHITECTURE.md
 idea.md
+/trash
+/docs
+.playwright-mcp

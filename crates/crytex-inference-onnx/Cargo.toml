@@ -1,0 +1,17 @@
+[package]
+name = "crytex-inference-onnx"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+
+[dependencies]
+async-trait = "0.1"
+crytex-core = { path = "../crytex-core" }
+crytex-inference = { path = "../crytex-inference" }
+fastembed = "5.17"
+serde_json = "1.0"
+thiserror = "2.0"
+tokio = { version = "1", features = ["full"] }
+
+[dev-dependencies]
+tokio-test = "0.4"

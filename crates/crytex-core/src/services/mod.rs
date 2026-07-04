@@ -1,0 +1,100 @@
+//! Domain services for the Crytex kernel.
+//!
+//! Each service is defined by a trait (contract) and one or more implementations.
+//! This keeps the core decoupled from concrete infrastructure.
+
+pub mod agent_service;
+pub mod alert_service;
+pub mod audit_log_service;
+pub mod bulk_audit_log;
+pub mod caching;
+pub mod context_assembler;
+pub mod critic_council;
+pub mod embedder;
+pub mod event_service;
+pub mod hardware;
+pub mod hybrid;
+pub mod inference_service;
+pub mod lora_evolution;
+pub mod lora_router;
+pub mod lora_trainer;
+pub mod memory_bank;
+pub mod model_manager;
+pub mod orchestrator;
+pub mod project_service;
+pub mod project_watcher;
+pub mod prompt_evolution;
+pub mod rate_limit;
+pub mod reranker;
+pub mod reward_service;
+pub mod role;
+pub mod sandbox_service;
+pub mod scheduler;
+pub mod task_service;
+pub mod tool_service;
+pub mod vector_store;
+pub mod worker;
+pub mod workflow;
+
+pub use agent_service::{Agent, AgentError, AgentService, AgentServiceError, AgentServiceImpl};
+pub use alert_service::{Alert, AlertService, AlertServiceImpl, AlertSeverity, AlertThresholds};
+pub use audit_log_service::{
+    AuditError, AuditEvent, AuditLogEntry, AuditLogService, AuditLogServiceImpl,
+};
+pub use bulk_audit_log::BulkAuditLogService;
+pub use context_assembler::{ContextAssembler, ContextAssemblerError, ContextRequest};
+pub use critic_council::{CriticCouncil, CriticCouncilError};
+pub use embedder::{Embedder, EmbeddingError, MockEmbedder, MockSparseEmbedder, SparseEmbedder};
+pub use event_service::{EventHandler, EventService, EventServiceImpl};
+pub use hardware::{
+    DeviceKind, HardwareDetector, HardwareRecommendation, SystemHardwareDetector,
+    recommend_local_device,
+};
+pub use hybrid::{
+    build_fusion_strategy, DistributionBasedScoreFusion, FusionStrategy, FusionStrategyKind,
+    HybridRetriever, HybridSearchError, RankedList, RankedResult, ReciprocalRankFusion,
+    RetrieverSource,
+};
+pub use inference_service::{InferenceService, InferenceServiceError, InferenceServiceImpl};
+pub use lora_evolution::{LoraEvolutionError, LoraEvolutionService, LoraEvolutionServiceImpl};
+pub use lora_router::{LoraRouter, LoraRouterError, LoraRouterImpl};
+pub use lora_trainer::{
+    LoraMetrics, LoraTrainer, LoraTrainingConfig, LoraTrainingError, LoraTrainingResult,
+};
+pub use memory_bank::{
+    MemoryBankError, MemoryBankService, MemoryBankServiceImpl, MemoryEntryBuilder,
+};
+pub use model_manager::{
+    FileSystemManifestSource, HardwareModelRecommender, HfHubDownloader, ManagedModel,
+    ManifestEntry, ModelDownloader, ModelManager, ModelManagerError, ModelManagerImpl,
+    ModelManifestSource, ModelRecommender, ModelRegistryStore, ModelStatus, Quantization,
+    RecommendedConfig, RegistryEntry, TomlRegistryStore,
+};
+pub use orchestrator::{Orchestrator, OrchestratorError, OrchestratorImpl};
+pub use project_service::{CreateProjectRequest, ProjectError, ProjectService, ProjectServiceImpl};
+pub use project_watcher::{ProjectWatcher, WatcherError};
+pub use prompt_evolution::{MutationOperator, PromptEvolutionError, PromptEvolutionService};
+pub use rate_limit::{RetryPolicy, RetryRateLimitBackend, TokenBucket};
+pub use reranker::{Reranker, RerankerError, RerankPassage, RerankResult};
+pub use reward_service::{RecordRewardRequest, RewardService, RewardServiceError};
+pub use role::AgentRole;
+pub use sandbox_service::{
+    ExecutionRequest, ExecutionResult, SandboxMount, SandboxNetwork, SandboxResources,
+    SandboxService, SandboxServiceError,
+};
+pub use scheduler::{Scheduler, SchedulerError, SchedulerImpl};
+pub use task_service::{CreateTaskRequest, TaskError, TaskService, TaskServiceImpl};
+pub use tool_service::{ToolDescription, ToolService, ToolServiceError};
+pub use vector_store::{
+    SearchOptions, SearchResult, SparseVector, SparseVectorPoint, VectorPoint, VectorStore,
+    VectorStoreError,
+};
+pub use worker::{TaskHandler, WorkerError, WorkerPool};
+pub use workflow::{
+    AgentWorkflowNodeExecutor, BackoffStrategy, MemoryWorkflowRepository, TomlWorkflowRepository,
+    WorkflowDefinition, WorkflowEdge, WorkflowEngine, WorkflowError, WorkflowNode,
+    WorkflowNodeExecutor, WorkflowRepository, WorkflowResult, WorkflowRetryPolicy, WorkflowState,
+};
+
+// AuditLogLevel is defined in models.rs; re-export it here for ergonomic service API usage.
+pub use crate::models::AuditLogLevel;

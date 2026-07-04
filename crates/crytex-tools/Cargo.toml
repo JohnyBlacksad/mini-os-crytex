@@ -1,0 +1,23 @@
+[package]
+name = "crytex-tools"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+
+[dependencies]
+crytex-core = { path = "../crytex-core" }
+crytex-sandbox = { path = "../crytex-sandbox" }
+async-trait = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+fs2 = "0.4"
+thiserror = "2.0"
+tokio = { version = "1", features = ["full"] }
+git2 = "0.19"
+walkdir = "2"
+regex = "1"
+ignore = "0.4"
+
+[dev-dependencies]
+tokio-test = "0.4"
+tempfile = "3"

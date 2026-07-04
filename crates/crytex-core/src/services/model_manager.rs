@@ -1,0 +1,941 @@
+//! Model lifecycle management.
+//!
+//! `ModelManager` is a trait seam. The default implementation (`ModelManagerImpl`)
+//! composes small single-responsibility collaborators:
+//!
+//! - `ModelManifestSource` — reads the static user-editable manifest.
+//! - `ModelRegistryStore` — reads/writes the runtime registry of downloaded models.
+//! - `ModelDownloader` — performs the actual download and reports progress.
+//! - `ModelRecommender` — suggests quantization, context size and backend from hardware.
+//!
+//! This keeps the manager open for extension (new download sources, new recommender
+//! strategies) and closed for modification.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+use crate::bus::Event;
+use crate::config::BackendKind;
+use crate::services::{EventService, HardwareDetector};
+
+/// Errors that can occur in [`ModelManager`].
+#[derive(Debug, Error)]
+pub enum ModelManagerError {
+    #[error("model not found: {0}")]
+    NotFound(String),
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("TOML error: {0}")]
+    Toml(#[from] toml::de::Error),
+    #[error("serialization error: {0}")]
+    TomlSerialize(#[from] toml::ser::Error),
+    #[error("download error: {0}")]
+    Download(String),
+    #[error("recommendation error: {0}")]
+    Recommendation(String),
+}
+
+/// Status of a managed model.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum ModelStatus {
+    /// Model is known but not downloaded.
+    Available,
+    /// Model is currently being downloaded (progress 0.0-1.0).
+    Downloading(f32),
+    /// Model is downloaded and ready to use.
+    Downloaded,
+    /// Download or validation failed.
+    Error(String),
+}
+
+/// A model that can be selected by the user.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagedModel {
+    pub id: String,
+    pub name: String,
+    pub repo: Option<String>,
+    pub filename: Option<String>,
+    pub local_path: Option<PathBuf>,
+    pub quantization: Option<Quantization>,
+    pub preferred_backend: BackendKind,
+    pub params_b: Option<f32>,
+    pub status: ModelStatus,
+}
+
+/// Supported quantization levels.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Quantization {
+    Q2K,
+    Q3KS,
+    Q4KM,
+    Q5KM,
+    Q8_0,
+    FP16,
+}
+
+impl Quantization {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Quantization::Q2K => "Q2_K",
+            Quantization::Q3KS => "Q3_K_S",
+            Quantization::Q4KM => "Q4_K_M",
+            Quantization::Q5KM => "Q5_K_M",
+            Quantization::Q8_0 => "Q8_0",
+            Quantization::FP16 => "FP16",
+        }
+    }
+
+    /// Approximate GiB per 1B parameters for a quantized model.
+    pub fn gib_per_b_params(&self) -> f32 {
+        match self {
+            Quantization::Q2K => 0.30,
+            Quantization::Q3KS => 0.40,
+            Quantization::Q4KM => 0.50,
+            Quantization::Q5KM => 0.65,
+            Quantization::Q8_0 => 1.00,
+            Quantization::FP16 => 2.00,
+        }
+    }
+}
+
+impl std::str::FromStr for Quantization {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_uppercase().as_str() {
+            "Q2_K" => Ok(Quantization::Q2K),
+            "Q3_K_S" => Ok(Quantization::Q3KS),
+            "Q4_K_M" => Ok(Quantization::Q4KM),
+            "Q5_K_M" => Ok(Quantization::Q5KM),
+            "Q8_0" => Ok(Quantization::Q8_0),
+            "FP16" => Ok(Quantization::FP16),
+            other => Err(format!("unknown quantization: {other}")),
+        }
+    }
+}
+
+/// Recommended runtime configuration for a model.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RecommendedConfig {
+    pub backend: BackendKind,
+    pub quantization: Quantization,
+    pub gpu_layers: Option<usize>,
+    pub context_size: usize,
+}
+
+/// Static user-editable manifest entry.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ManifestEntry {
+    pub id: Option<String>,
+    pub name: Option<String>,
+    pub repo: Option<String>,
+    pub filename: Option<String>,
+    pub quantization: Option<String>,
+    pub backend: Option<String>,
+    pub params_b: Option<f32>,
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+pub struct Manifest {
+    #[serde(default)]
+    pub models: Vec<ManifestEntry>,
+}
+
+/// Runtime registry entry for a downloaded model.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RegistryEntry {
+    pub local_path: PathBuf,
+    pub size: u64,
+    pub sha256: Option<String>,
+}
+
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+pub struct Registry {
+    #[serde(default)]
+    pub models: HashMap<String, RegistryEntry>,
+}
+
+/// Source required to download a model.
+#[derive(Debug, Clone)]
+pub struct DownloadSource {
+    pub model_id: String,
+    pub repo: String,
+    pub filename: String,
+    pub target_dir: PathBuf,
+}
+
+/// Trait for reading the static model manifest.
+pub trait ModelManifestSource: Send + Sync {
+    fn load(&self) -> Result<Manifest, ModelManagerError>;
+}
+
+/// Trait for reading/writing the runtime registry of downloaded models.
+pub trait ModelRegistryStore: Send + Sync {
+    fn load(&self) -> Result<Registry, ModelManagerError>;
+    fn save(&self, registry: &Registry) -> Result<(), ModelManagerError>;
+}
+
+/// Trait for downloading model files with progress callbacks.
+#[async_trait]
+pub trait ModelDownloader: Send + Sync {
+    async fn download(
+        &self,
+        source: &DownloadSource,
+        on_progress: Arc<dyn Fn(f32) + Send + Sync>,
+    ) -> Result<PathBuf, ModelManagerError>;
+}
+
+/// Trait for recommending runtime config from a model and hardware.
+pub trait ModelRecommender: Send + Sync {
+    fn recommend(&self, model: &ManagedModel) -> Result<RecommendedConfig, ModelManagerError>;
+}
+
+/// High-level model lifecycle trait.
+#[async_trait]
+pub trait ModelManager: Send + Sync {
+    /// List all known models (manifest + registry).
+    fn list_models(&self) -> Result<Vec<ManagedModel>, ModelManagerError>;
+
+    /// Get a single model by id.
+    fn get_model(&self, id: &str) -> Result<ManagedModel, ModelManagerError>;
+
+    /// Download a model and register it locally.
+    async fn download_model(&self, id: &str) -> Result<ManagedModel, ModelManagerError>;
+
+    /// Recommend runtime configuration for a model.
+    fn recommend_config(&self, id: &str) -> Result<RecommendedConfig, ModelManagerError>;
+}
+
+/// Default composable implementation of [`ModelManager`].
+pub struct ModelManagerImpl {
+    manifest_source: Arc<dyn ModelManifestSource>,
+    registry_store: Arc<dyn ModelRegistryStore>,
+    downloader: Arc<dyn ModelDownloader>,
+    recommender: Arc<dyn ModelRecommender>,
+    event_service: Arc<dyn EventService>,
+    models_dir: PathBuf,
+}
+
+impl ModelManagerImpl {
+    pub fn new(
+        manifest_source: Arc<dyn ModelManifestSource>,
+        registry_store: Arc<dyn ModelRegistryStore>,
+        downloader: Arc<dyn ModelDownloader>,
+        recommender: Arc<dyn ModelRecommender>,
+        event_service: Arc<dyn EventService>,
+        models_dir: PathBuf,
+    ) -> Self {
+        Self {
+            manifest_source,
+            registry_store,
+            downloader,
+            recommender,
+            event_service,
+            models_dir,
+        }
+    }
+
+    /// Convenience constructor for the standard file-backed + HF downloader setup.
+    pub fn new_standard(
+        config_dir: impl AsRef<Path>,
+        cache_dir: impl AsRef<Path>,
+        event_service: Arc<dyn EventService>,
+        hardware_detector: Arc<dyn HardwareDetector>,
+    ) -> Self {
+        let config_dir = config_dir.as_ref();
+        let cache_dir = cache_dir.as_ref();
+        let manifest_path = config_dir.join("manifest.toml");
+        let registry_path = cache_dir.join("registry.toml");
+        let models_dir = cache_dir.join("models");
+
+        Self::new(
+            Arc::new(FileSystemManifestSource::new(manifest_path)),
+            Arc::new(TomlRegistryStore::new(registry_path)),
+            Arc::new(HfHubDownloader),
+            Arc::new(HardwareModelRecommender::new(hardware_detector)),
+            event_service,
+            models_dir,
+        )
+    }
+}
+
+#[async_trait]
+impl ModelManager for ModelManagerImpl {
+    fn list_models(&self) -> Result<Vec<ManagedModel>, ModelManagerError> {
+        let manifest = self.manifest_source.load()?;
+        let registry = self.registry_store.load().unwrap_or_default();
+
+        let mut models = Vec::new();
+        for entry in manifest.models {
+            let id = entry
+                .id
+                .clone()
+                .or_else(|| entry.filename.clone())
+                .unwrap_or_else(|| "unknown".to_string());
+            let local_path = registry.models.get(&id).map(|e| e.local_path.clone());
+            let status = if local_path.is_some() {
+                ModelStatus::Downloaded
+            } else {
+                ModelStatus::Available
+            };
+            models.push(ManagedModel {
+                id: id.clone(),
+                name: entry.name.clone().unwrap_or_else(|| id.clone()),
+                repo: entry.repo.clone(),
+                filename: entry.filename.clone(),
+                local_path,
+                quantization: entry.quantization.as_deref().and_then(|s| s.parse().ok()),
+                preferred_backend: parse_backend_kind(entry.backend.as_deref()),
+                params_b: entry.params_b,
+                status,
+            });
+        }
+
+        for (id, entry) in &registry.models {
+            if models.iter().any(|m| &m.id == id) {
+                continue;
+            }
+            models.push(ManagedModel {
+                id: id.clone(),
+                name: id.clone(),
+                repo: None,
+                filename: None,
+                local_path: Some(entry.local_path.clone()),
+                quantization: None,
+                preferred_backend: recommend_backend_from_path(&entry.local_path),
+                params_b: None,
+                status: ModelStatus::Downloaded,
+            });
+        }
+
+        Ok(models)
+    }
+
+    fn get_model(&self, id: &str) -> Result<ManagedModel, ModelManagerError> {
+        self.list_models()?
+            .into_iter()
+            .find(|m| m.id == id)
+            .ok_or_else(|| ModelManagerError::NotFound(id.to_string()))
+    }
+
+    async fn download_model(&self, id: &str) -> Result<ManagedModel, ModelManagerError> {
+        let model = self.get_model(id)?;
+
+        if model.local_path.is_some() {
+            return Ok(model);
+        }
+
+        let repo = model.repo.clone().ok_or_else(|| {
+            ModelManagerError::Download(format!("model {} has no HuggingFace repo", id))
+        })?;
+        let filename = model
+            .filename
+            .clone()
+            .ok_or_else(|| ModelManagerError::Download(format!("model {} has no filename", id)))?;
+
+        let target_dir = self.models_dir.join(sanitize_id(id));
+        tokio::fs::create_dir_all(&target_dir).await?;
+
+        self.event_service.publish(Event::ModelDownloadProgress {
+            model_id: id.to_string(),
+            progress: 0.0,
+        });
+
+        let event_service = self.event_service.clone();
+        let model_id = id.to_string();
+        let on_progress: Arc<dyn Fn(f32) + Send + Sync> = Arc::new(move |progress: f32| {
+            event_service.publish(Event::ModelDownloadProgress {
+                model_id: model_id.clone(),
+                progress,
+            });
+        });
+
+        let source = DownloadSource {
+            model_id: id.to_string(),
+            repo,
+            filename,
+            target_dir,
+        };
+
+        let target_path = self.downloader.download(&source, on_progress).await?;
+
+        self.event_service.publish(Event::ModelDownloadProgress {
+            model_id: id.to_string(),
+            progress: 1.0,
+        });
+
+        let mut registry = self.registry_store.load().unwrap_or_default();
+        let size = tokio::fs::metadata(&target_path).await?.len();
+        registry.models.insert(
+            id.to_string(),
+            RegistryEntry {
+                local_path: target_path.clone(),
+                size,
+                sha256: None,
+            },
+        );
+        self.registry_store.save(&registry)?;
+
+        Ok(ManagedModel {
+            local_path: Some(target_path),
+            status: ModelStatus::Downloaded,
+            ..model
+        })
+    }
+
+    fn recommend_config(&self, id: &str) -> Result<RecommendedConfig, ModelManagerError> {
+        let model = self.get_model(id)?;
+        self.recommender.recommend(&model)
+    }
+}
+
+/// File-system backed manifest source.
+pub struct FileSystemManifestSource {
+    path: PathBuf,
+}
+
+impl FileSystemManifestSource {
+    pub fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+impl ModelManifestSource for FileSystemManifestSource {
+    fn load(&self) -> Result<Manifest, ModelManagerError> {
+        if !self.path.exists() {
+            return Ok(Manifest::default());
+        }
+        let contents = std::fs::read_to_string(&self.path)?;
+        let manifest: Manifest = toml::from_str(&contents)?;
+        Ok(manifest)
+    }
+}
+
+/// TOML-backed registry store.
+pub struct TomlRegistryStore {
+    path: PathBuf,
+}
+
+impl TomlRegistryStore {
+    pub fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+impl ModelRegistryStore for TomlRegistryStore {
+    fn load(&self) -> Result<Registry, ModelManagerError> {
+        if !self.path.exists() {
+            return Ok(Registry::default());
+        }
+        let contents = std::fs::read_to_string(&self.path)?;
+        let registry: Registry = toml::from_str(&contents)?;
+        Ok(registry)
+    }
+
+    fn save(&self, registry: &Registry) -> Result<(), ModelManagerError> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let contents = toml::to_string_pretty(registry)?;
+        std::fs::write(&self.path, contents)?;
+        Ok(())
+    }
+}
+
+/// HuggingFace Hub downloader.
+pub struct HfHubDownloader;
+
+#[async_trait]
+impl ModelDownloader for HfHubDownloader {
+    async fn download(
+        &self,
+        source: &DownloadSource,
+        on_progress: Arc<dyn Fn(f32) + Send + Sync>,
+    ) -> Result<PathBuf, ModelManagerError> {
+        #[cfg(feature = "hf-hub")]
+        {
+            use hf_hub::api::tokio::Api;
+
+            on_progress(0.0);
+            let api = Api::new().map_err(|e| ModelManagerError::Download(e.to_string()))?;
+            let repo = api.model(source.repo.clone());
+            let downloaded = repo
+                .download(&source.filename)
+                .await
+                .map_err(|e| ModelManagerError::Download(e.to_string()))?;
+
+            let target_path = source.target_dir.join(&source.filename);
+            tokio::fs::copy(&downloaded, &target_path).await?;
+            on_progress(1.0);
+            Ok(target_path)
+        }
+
+        #[cfg(not(feature = "hf-hub"))]
+        {
+            let _ = (source, on_progress);
+            Err(ModelManagerError::Download(
+                "hf-hub support is disabled".to_string(),
+            ))
+        }
+    }
+}
+
+/// Recommends config from detected hardware.
+pub struct HardwareModelRecommender {
+    hardware_detector: Arc<dyn HardwareDetector>,
+}
+
+impl HardwareModelRecommender {
+    pub fn new(hardware_detector: Arc<dyn HardwareDetector>) -> Self {
+        Self { hardware_detector }
+    }
+
+    /// Approximate model size in GiB from params and quantization.
+    fn approximate_size_gib(model: &ManagedModel, quantization: Quantization) -> f32 {
+        let params = model.params_b.unwrap_or(7.0);
+        params * quantization.gib_per_b_params()
+    }
+}
+
+impl ModelRecommender for HardwareModelRecommender {
+    fn recommend(&self, model: &ManagedModel) -> Result<RecommendedConfig, ModelManagerError> {
+        use crate::services::hardware::DeviceKind;
+
+        let device = self.hardware_detector.detect();
+
+        // Cloud-preferred models keep their backend; we only tune local ones.
+        let backend = match model.preferred_backend {
+            BackendKind::Anthropic
+            | BackendKind::Ollama
+            | BackendKind::OpenAiCompatible
+            | BackendKind::Custom => model.preferred_backend,
+            BackendKind::MistralRs => BackendKind::MistralRs,
+            BackendKind::Onnx => BackendKind::Onnx,
+        };
+
+        let is_remote = !matches!(backend, BackendKind::MistralRs);
+        if is_remote {
+            return Ok(RecommendedConfig {
+                backend,
+                quantization: model.quantization.unwrap_or(Quantization::Q4KM),
+                gpu_layers: None,
+                context_size: 4096,
+            });
+        }
+
+        let default_quantization = model.quantization.unwrap_or(Quantization::Q4KM);
+
+        match device {
+            DeviceKind::Cpu => Ok(RecommendedConfig {
+                backend: BackendKind::MistralRs,
+                quantization: default_quantization,
+                gpu_layers: Some(0),
+                context_size: 4096,
+            }),
+            DeviceKind::Metal { .. } => Ok(RecommendedConfig {
+                backend: BackendKind::MistralRs,
+                quantization: default_quantization,
+                gpu_layers: None,
+                context_size: 8192,
+            }),
+            DeviceKind::Cuda { vram_mb, .. } => {
+                let vram_gib = vram_mb as f32 / 1024.0;
+                // Leave 20% headroom for context / KV cache / OS.
+                let usable_gib = vram_gib * 0.8;
+
+                let candidates = [
+                    Quantization::FP16,
+                    Quantization::Q8_0,
+                    Quantization::Q5KM,
+                    Quantization::Q4KM,
+                    Quantization::Q3KS,
+                    Quantization::Q2K,
+                ];
+
+                let quantization = candidates
+                    .into_iter()
+                    .find(|q| Self::approximate_size_gib(model, *q) <= usable_gib)
+                    .unwrap_or(Quantization::Q4KM);
+
+                let context_size = if vram_mb >= 24_000 { 8192 } else { 4096 };
+
+                Ok(RecommendedConfig {
+                    backend: BackendKind::MistralRs,
+                    quantization,
+                    gpu_layers: None,
+                    context_size,
+                })
+            }
+        }
+    }
+}
+
+fn parse_backend_kind(kind: Option<&str>) -> BackendKind {
+    match kind.unwrap_or("mistral_rs").to_lowercase().as_str() {
+        "ollama" => BackendKind::Ollama,
+        "openai" | "open_ai_compatible" | "openai_compatible" => BackendKind::OpenAiCompatible,
+        "anthropic" => BackendKind::Anthropic,
+        "mistral" | "mistralrs" | "mistral.rs" | "llama" | "llamacpp" | "llama_cpp"
+        | "llama-gguf" => BackendKind::MistralRs,
+        "onnx" => BackendKind::Onnx,
+        "custom" => BackendKind::Custom,
+        _ => BackendKind::MistralRs,
+    }
+}
+
+fn recommend_backend_from_path(path: &Path) -> BackendKind {
+    if path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("gguf"))
+        .unwrap_or(false)
+    {
+        BackendKind::MistralRs
+    } else {
+        BackendKind::OpenAiCompatible
+    }
+}
+
+fn sanitize_id(id: &str) -> String {
+    id.replace(|c: char| !c.is_alphanumeric() && c != '-' && c != '_', "_")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::hardware::{DeviceKind, HardwareDetector};
+    use std::sync::Mutex;
+
+    struct FixedDetector(DeviceKind);
+
+    impl HardwareDetector for FixedDetector {
+        fn detect(&self) -> DeviceKind {
+            self.0.clone()
+        }
+    }
+
+    fn temp_dirs(suffix: &str) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "crytex-model-test-{}-{}",
+            suffix,
+            std::process::id()
+        ));
+        let config_dir = dir.join("config");
+        let cache_dir = dir.join("cache");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        (config_dir, cache_dir)
+    }
+
+    #[derive(Default)]
+    struct InMemoryManifestSource {
+        manifest: Mutex<Manifest>,
+    }
+
+    impl ModelManifestSource for InMemoryManifestSource {
+        fn load(&self) -> Result<Manifest, ModelManagerError> {
+            Ok(self.manifest.lock().unwrap().clone())
+        }
+    }
+
+    impl Clone for InMemoryManifestSource {
+        fn clone(&self) -> Self {
+            Self {
+                manifest: Mutex::new(self.manifest.lock().unwrap().clone()),
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct InMemoryRegistryStore {
+        registry: Mutex<Registry>,
+    }
+
+    impl ModelRegistryStore for InMemoryRegistryStore {
+        fn load(&self) -> Result<Registry, ModelManagerError> {
+            Ok(self.registry.lock().unwrap().clone())
+        }
+
+        fn save(&self, registry: &Registry) -> Result<(), ModelManagerError> {
+            *self.registry.lock().unwrap() = registry.clone();
+            Ok(())
+        }
+    }
+
+    impl Clone for InMemoryRegistryStore {
+        fn clone(&self) -> Self {
+            Self {
+                registry: Mutex::new(self.registry.lock().unwrap().clone()),
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct MockDownloader {
+        progress: Mutex<Vec<f32>>,
+    }
+
+    #[async_trait]
+    impl ModelDownloader for MockDownloader {
+        async fn download(
+            &self,
+            source: &DownloadSource,
+            on_progress: Arc<dyn Fn(f32) + Send + Sync>,
+        ) -> Result<PathBuf, ModelManagerError> {
+            on_progress(0.0);
+            on_progress(0.5);
+            on_progress(1.0);
+            self.progress.lock().unwrap().push(0.5);
+            let target = source.target_dir.join(&source.filename);
+            std::fs::create_dir_all(&source.target_dir)?;
+            std::fs::write(&target, b"gguf")?;
+            Ok(target)
+        }
+    }
+
+    #[derive(Default)]
+    struct MockEventService {
+        events: Mutex<Vec<Event>>,
+    }
+
+    #[async_trait]
+    impl EventService for MockEventService {
+        fn publish(&self, event: Event) {
+            self.events.lock().unwrap().push(event);
+        }
+        fn subscribe(&self) -> tokio::sync::broadcast::Receiver<Event> {
+            let (tx, _) = tokio::sync::broadcast::channel(1);
+            tx.subscribe()
+        }
+        async fn start_handler(&self, _handler: Arc<dyn crate::services::EventHandler>) {}
+    }
+
+    fn manager_with(
+        manifest: Manifest,
+        registry: Registry,
+        hardware: DeviceKind,
+    ) -> (ModelManagerImpl, Arc<MockEventService>) {
+        let (_config_dir, cache_dir) = temp_dirs("unit");
+        let events = Arc::new(MockEventService::default());
+        let manifest_source: Arc<dyn ModelManifestSource> = Arc::new(InMemoryManifestSource {
+            manifest: Mutex::new(manifest),
+        });
+        let registry_store: Arc<dyn ModelRegistryStore> = Arc::new(InMemoryRegistryStore {
+            registry: Mutex::new(registry),
+        });
+        let downloader: Arc<dyn ModelDownloader> = Arc::new(MockDownloader::default());
+        let recommender: Arc<dyn ModelRecommender> = Arc::new(HardwareModelRecommender::new(
+            Arc::new(FixedDetector(hardware)),
+        ));
+
+        (
+            ModelManagerImpl::new(
+                manifest_source,
+                registry_store,
+                downloader,
+                recommender,
+                events.clone(),
+                cache_dir.join("models"),
+            ),
+            events,
+        )
+    }
+
+    #[test]
+    fn empty_manager_returns_no_models() {
+        let (mgr, _) = manager_with(Manifest::default(), Registry::default(), DeviceKind::Cpu);
+        let models = mgr.list_models().unwrap();
+        assert!(models.is_empty());
+    }
+
+    #[test]
+    fn manifest_models_are_listed() {
+        let manifest = Manifest {
+            models: vec![ManifestEntry {
+                id: Some("qwen-9b".into()),
+                name: Some("Qwen 2.5 Coder 9B".into()),
+                repo: Some("Qwen/Qwen2.5-Coder-9B-Instruct-GGUF".into()),
+                filename: Some("qwen2.5-coder-9b-instruct-q4_k_m.gguf".into()),
+                quantization: Some("Q4_K_M".into()),
+                backend: Some("mistral_rs".into()),
+                params_b: Some(9.0),
+            }],
+        };
+        let (mgr, _) = manager_with(manifest, Registry::default(), DeviceKind::Cpu);
+        let models = mgr.list_models().unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "qwen-9b");
+        assert!(matches!(models[0].status, ModelStatus::Available));
+        assert!(matches!(
+            models[0].preferred_backend,
+            BackendKind::MistralRs
+        ));
+        assert_eq!(models[0].quantization, Some(Quantization::Q4KM));
+    }
+
+    #[test]
+    fn downloaded_models_are_marked() {
+        let manifest = Manifest {
+            models: vec![ManifestEntry {
+                id: Some("qwen-9b".into()),
+                name: Some("Qwen".into()),
+                filename: Some("model.gguf".into()),
+                ..Default::default() // needs Default on ManifestEntry
+            }],
+        };
+        let (_config_dir, cache_dir) = temp_dirs("downloaded");
+        let model_dir = cache_dir.join("models").join("qwen-9b");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(model_dir.join("model.gguf"), b"gguf").unwrap();
+
+        let registry = Registry {
+            models: {
+                let mut map = HashMap::new();
+                map.insert(
+                    "qwen-9b".to_string(),
+                    RegistryEntry {
+                        local_path: model_dir.join("model.gguf"),
+                        size: 4,
+                        sha256: None,
+                    },
+                );
+                map
+            },
+        };
+
+        let manifest_source = Arc::new(InMemoryManifestSource {
+            manifest: Mutex::new(manifest),
+        });
+        let registry_store = Arc::new(InMemoryRegistryStore {
+            registry: Mutex::new(registry),
+        });
+        let events: Arc<dyn EventService> = Arc::new(MockEventService::default());
+        let mgr = ModelManagerImpl::new(
+            manifest_source,
+            registry_store,
+            Arc::new(MockDownloader::default()),
+            Arc::new(HardwareModelRecommender::new(Arc::new(FixedDetector(
+                DeviceKind::Cpu,
+            )))),
+            events,
+            cache_dir.join("models"),
+        );
+
+        let models = mgr.list_models().unwrap();
+        assert_eq!(models.len(), 1);
+        assert!(matches!(models[0].status, ModelStatus::Downloaded));
+    }
+
+    #[tokio::test]
+    async fn download_emits_progress_events() {
+        let manifest = Manifest {
+            models: vec![ManifestEntry {
+                id: Some("qwen-9b".into()),
+                name: Some("Qwen".into()),
+                repo: Some("Qwen/Qwen2.5-Coder-9B-Instruct-GGUF".into()),
+                filename: Some("model.gguf".into()),
+                quantization: None,
+                backend: None,
+                params_b: None,
+            }],
+        };
+        let (mgr, events) = manager_with(manifest, Registry::default(), DeviceKind::Cpu);
+
+        let model = mgr.download_model("qwen-9b").await.unwrap();
+        assert!(matches!(model.status, ModelStatus::Downloaded));
+
+        let progress_events: Vec<_> = events
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                Event::ModelDownloadProgress { model_id, progress } => {
+                    Some((model_id.clone(), *progress))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(!progress_events.is_empty());
+        assert_eq!(progress_events.first().unwrap().1, 0.0);
+        assert_eq!(progress_events.last().unwrap().1, 1.0);
+    }
+
+    #[test]
+    fn recommend_config_uses_highest_quantization_that_fits_vram() {
+        let manifest = Manifest {
+            models: vec![ManifestEntry {
+                id: Some("qwen-9b".into()),
+                name: Some("Qwen".into()),
+                repo: Some("Qwen/Qwen2.5-Coder-9B-Instruct-GGUF".into()),
+                filename: Some("model.gguf".into()),
+                quantization: None,
+                backend: None,
+                params_b: Some(9.0),
+            }],
+        };
+        // 24 GB VRAM, usable 0.8*24 = 19.2 GiB.
+        // 9B FP16 = 18 GiB fits, so the highest quantization is selected.
+        let (mgr, _) = manager_with(
+            manifest,
+            Registry::default(),
+            DeviceKind::Cuda {
+                name: "RTX 4090".into(),
+                vram_mb: 24_000,
+                driver_version: "531".into(),
+            },
+        );
+        let cfg = mgr.recommend_config("qwen-9b").unwrap();
+        assert_eq!(cfg.quantization, Quantization::FP16);
+        assert_eq!(cfg.gpu_layers, None);
+        assert_eq!(cfg.context_size, 8192);
+    }
+
+    #[test]
+    fn recommend_config_falls_back_to_q4_on_low_vram() {
+        let manifest = Manifest {
+            models: vec![ManifestEntry {
+                id: Some("qwen-9b".into()),
+                name: Some("Qwen".into()),
+                filename: Some("model.gguf".into()),
+                params_b: Some(9.0),
+                ..Default::default()
+            }],
+        };
+        // 6 GB VRAM: usable 4.8 GiB. Q4KM = 4.5 GiB fits, Q5KM = 5.85 GiB does not.
+        let (mgr, _) = manager_with(
+            manifest,
+            Registry::default(),
+            DeviceKind::Cuda {
+                name: "RTX 3050".into(),
+                vram_mb: 6_000,
+                driver_version: "531".into(),
+            },
+        );
+        let cfg = mgr.recommend_config("qwen-9b").unwrap();
+        assert_eq!(cfg.quantization, Quantization::Q4KM);
+        assert_eq!(cfg.context_size, 4096);
+    }
+
+    #[test]
+    fn recommend_config_for_cpu_forces_gpu_layers_zero() {
+        let manifest = Manifest {
+            models: vec![ManifestEntry {
+                id: Some("qwen-9b".into()),
+                name: Some("Qwen".into()),
+                filename: Some("model.gguf".into()),
+                params_b: Some(9.0),
+                ..Default::default()
+            }],
+        };
+        let (mgr, _) = manager_with(manifest, Registry::default(), DeviceKind::Cpu);
+        let cfg = mgr.recommend_config("qwen-9b").unwrap();
+        assert_eq!(cfg.gpu_layers, Some(0));
+    }
+}

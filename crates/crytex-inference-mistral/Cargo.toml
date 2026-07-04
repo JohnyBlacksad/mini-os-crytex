@@ -1,0 +1,24 @@
+[package]
+name = "crytex-inference-mistral"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+
+[features]
+default = []
+cuda = ["mistralrs/cuda"]
+metal = ["mistralrs/metal"]
+
+[dependencies]
+crytex-inference = { path = "../crytex-inference" }
+crytex-core = { path = "../crytex-core" }
+async-trait = "0.1"
+tokio = { version = "1", features = ["full"] }
+thiserror = "2.0"
+tracing = "0.1"
+mistralrs = "0.8.1"
+safetensors = "0.7"
+ulid = "1.1"
+
+[dev-dependencies]
+tokio-test = "0.4"

@@ -1,0 +1,42 @@
+[package]
+name = "crytex-core"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+thiserror = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6.0"
+regex = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+sysinfo = "0.39"
+nvml-wrapper = "0.12"
+toml = "0.8"
+petgraph = "0.7"
+ulid = "1.1"
+tokio-util = "0.7"
+rand = "0.8"
+futures = "0.3"
+moka = { version = "0.12", features = ["future"] }
+dashmap = "6.1"
+notify = "8"
+notify-debouncer-mini = "0.7"
+crytex-inference = { path = "../crytex-inference" }
+crytex-compress = { path = "../crytex-compress" }
+crytex-doc = { path = "../crytex-doc" }
+hf-hub = { version = "0.4", optional = true, features = ["tokio"] }
+
+[features]
+default = ["hf-hub"]
+hf-hub = ["dep:hf-hub"]
+
+[dev-dependencies]
+tokio-test = "0.4"
+rand_chacha = "0.3"
+tempfile = "3"

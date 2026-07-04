@@ -1,0 +1,25 @@
+[package]
+name = "crytex-loader"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+
+[dependencies]
+crytex-core = { path = "../crytex-core" }
+crytex-storage = { path = "../crytex-storage" }
+crytex-inference = { path = "../crytex-inference" }
+crytex-inference-mistral = { path = "../crytex-inference-mistral" }
+crytex-inference-candle = { path = "../crytex-inference-candle" }
+crytex-agents = { path = "../crytex-agents" }
+crytex-sandbox = { path = "../crytex-sandbox" }
+crytex-tools = { path = "../crytex-tools" }
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+[[bin]]
+name = "crytex-loader"
+path = "src/main.rs"

@@ -1,0 +1,50 @@
+[package]
+name = "crytex-compress"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+
+[dependencies]
+async-trait = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+dashmap = "6"
+regex = "1"
+aho-corasick = "1"
+flate2 = "1"
+md-5 = "0.10"
+blake3 = "1"
+base64 = "0.22"
+unidiff = "0.4"
+
+# Tokenizer backends (reference-quality)
+tiktoken-rs = { version = "0.11", optional = true }
+tokenizers = { version = "0.22", optional = true }
+hf-hub = { version = "0.4", default-features = false, features = ["ureq", "rustls-tls"], optional = true }
+
+
+# Tree-sitter language parsers for code detection and AST-based compression.
+tree-sitter = "0.25"
+tree-sitter-rust = "0.24"
+tree-sitter-python = "0.25"
+tree-sitter-javascript = "0.25"
+tree-sitter-typescript = "0.23"
+tree-sitter-go = "0.25"
+tree-sitter-java = "0.23"
+tree-sitter-c = "0.24"
+tree-sitter-cpp = "0.23"
+
+# For testing / examples
+crytex-inference = { path = "../crytex-inference" }
+
+[features]
+default = ["tiktoken", "tokenizers"]
+tiktoken = ["dep:tiktoken-rs"]
+tokenizers = ["dep:tokenizers", "dep:hf-hub"]
+
+[dev-dependencies]
+tokio-test = "0.4"
+tempfile = "3"

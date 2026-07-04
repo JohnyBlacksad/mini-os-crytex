@@ -1,3 +1,33 @@
 [workspace]
-members = ["crates/*"]
+members = [
+    "crates/crytex-agents",
+    "crates/crytex-bench",
+    "crates/crytex-compress",
+    "crates/crytex-core",
+    "crates/crytex-doc",
+    "crates/crytex-ide",
+    "crates/crytex-inference",
+    "crates/crytex-inference-anthropic",
+    "crates/crytex-inference-candle",
+    "crates/crytex-inference-mistral",
+    "crates/crytex-inference-onnx",
+    "crates/crytex-inference-ollama",
+    "crates/crytex-inference-openai",
+    "crates/crytex-kernel",
+    "crates/crytex-loader",
+    "crates/crytex-sandbox",
+    "crates/crytex-storage",
+    "crates/crytex-tauri",
+    "crates/crytex-tools",
+]
 resolver = "2"
+
+# Patch esaxx-rs to avoid mixing /MT (static CRT) with /MD (dynamic CRT) on Windows.
+# The upstream build.rs hard-codes static_crt(true), which conflicts with the ONNX
+# Runtime prebuilt binaries. This fork keeps the same algorithm but links against
+# the dynamic CRT to match the rest of the workspace.
+[patch.crates-io]
+esaxx-rs = { path = "patches/esaxx-rs" }
+
+[profile.test.package.crytex-bench]
+debug = false
