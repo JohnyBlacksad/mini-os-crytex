@@ -1988,6 +1988,10 @@ async fn attach_upstream_artifacts(
     let mut upstream_artifacts = Vec::new();
     let mut rejected_count = 0;
     for artifact in upstream {
+        if is_artifact_handoff_remediation_for(task, &artifact) {
+            upstream_artifacts.push(build_rejected_artifact_handoff_for_repair(task, &artifact));
+            continue;
+        }
         if recoveries.iter().any(|recovery| {
             recovery.payload["source_task_id"] == artifact.id
                 && recovery.payload["target_task_id"] == task.id
@@ -2037,6 +2041,35 @@ fn completed_artifact_handoff_recoveries(upstream: &[Task], target_task: &Task) 
         })
         .cloned()
         .collect()
+}
+
+fn is_artifact_handoff_remediation_for(target_task: &Task, source_task: &Task) -> bool {
+    target_task.payload["source"] == "artifact_handoff_rejection"
+        && target_task.payload["source_task_id"] == source_task.id
+}
+
+fn build_rejected_artifact_handoff_for_repair(repair_task: &Task, source_task: &Task) -> Value {
+    let content = source_task
+        .result
+        .as_ref()
+        .map(artifact_content_from_result)
+        .unwrap_or(Value::Null);
+    serde_json::json!({
+        "schema_version": 1,
+        "artifact_id": format!("artifact-{}-{}", source_task.id, source_task.iteration_count),
+        "source_task_id": source_task.id,
+        "source_agent": source_task.assigned_agent,
+        "artifact_kind": repair_task.payload["artifact_kind"],
+        "content": content,
+        "task_id": source_task.id,
+        "title": source_task.title,
+        "kind": source_task.kind,
+        "agent": source_task.assigned_agent,
+        "result": source_task.result,
+        "handoff_status": "rejected_for_repair",
+        "rejection_reason": repair_task.payload["reason"],
+        "repair_task_id": repair_task.id,
+    })
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -4316,8 +4349,8 @@ mod tests {
             remediation.id
         );
         assert_eq!(
-            response.review_tasks[0].payload["upstream_artifacts"][0]["content"]
-                ["files_changed"][0],
+            response.review_tasks[0].payload["upstream_artifacts"][0]["content"]["files_changed"]
+                [0],
             "src/lib.rs"
         );
         assert!(
@@ -4328,6 +4361,140 @@ mod tests {
                 .count()
                 == 1,
             "completed recovery must prevent duplicate remediation"
+        );
+    }
+
+    #[tokio::test]
+    async fn artifact_handoff_remediation_executes_with_rejected_artifact_context() {
+        let upstream = Task {
+            id: "task-coder-invalid".into(),
+            project_id: "project-1".into(),
+            parent_id: Some("goal-1".into()),
+            title: "Invalid coder artifact".into(),
+            description: None,
+            kind: "codegen".into(),
+            status: TaskStatus::Completed,
+            assigned_agent: Some("coder".into()),
+            priority: 5,
+            payload: json!({}),
+            result: Some(json!({
+                "source": "agent_service",
+                "agent_result": {
+                    "artifact": {
+                        "summary": "forgot files_changed"
+                    }
+                }
+            })),
+            created_at: 10,
+            started_at: None,
+            finished_at: None,
+            iteration_count: 0,
+            priority_score: 5.0,
+            critic_score: None,
+            human_score: None,
+            prompt_version_id: None,
+            lora_adapter_id: None,
+            trace_id: "trace-remediation-run".into(),
+        };
+        let remediation = Task {
+            id: "task-debug-recovery".into(),
+            project_id: "project-1".into(),
+            parent_id: Some("goal-1".into()),
+            title: "Fix invalid patch artifact".into(),
+            description: None,
+            kind: "debug".into(),
+            status: TaskStatus::Pending,
+            assigned_agent: Some("coder".into()),
+            priority: 6,
+            payload: json!({
+                "source": "artifact_handoff_rejection",
+                "source_task_id": "task-coder-invalid",
+                "source_agent": "coder",
+                "target_task_id": "task-critic",
+                "target_agent": "critic",
+                "artifact_kind": "patch_artifact",
+                "reason": "artifact content requires non-empty array field `files_changed`"
+            }),
+            result: None,
+            created_at: 15,
+            started_at: None,
+            finished_at: None,
+            iteration_count: 0,
+            priority_score: 6.0,
+            critic_score: None,
+            human_score: None,
+            prompt_version_id: None,
+            lora_adapter_id: None,
+            trace_id: "trace-remediation-run".into(),
+        };
+        let downstream = Task {
+            id: "task-critic".into(),
+            project_id: "project-1".into(),
+            parent_id: Some("goal-1".into()),
+            title: "Review artifacts".into(),
+            description: None,
+            kind: "review".into(),
+            status: TaskStatus::Pending,
+            assigned_agent: Some("critic".into()),
+            priority: 5,
+            payload: json!({}),
+            result: None,
+            created_at: 20,
+            started_at: None,
+            finished_at: None,
+            iteration_count: 0,
+            priority_score: 5.0,
+            critic_score: None,
+            human_score: None,
+            prompt_version_id: None,
+            lora_adapter_id: None,
+            trace_id: "trace-remediation-run".into(),
+        };
+        let task_service = Arc::new(SiblingTaskService::new(vec![
+            upstream,
+            remediation.clone(),
+            downstream,
+        ]));
+
+        let response = start_run_with_orchestrator(
+            task_service.clone(),
+            None,
+            None,
+            None,
+            Arc::new(RecordingExecutor),
+            StartRunCommand {
+                project_id: "project-1".into(),
+                max_steps: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            response.review_tasks.is_empty(),
+            "debug recovery is generated-chain work and should not request human review"
+        );
+        let tasks = task_service.tasks();
+        let completed_remediation = tasks
+            .iter()
+            .find(|task| task.id == remediation.id)
+            .expect("remediation task must remain present");
+        assert_eq!(completed_remediation.status, TaskStatus::Completed);
+        assert_eq!(
+            completed_remediation.payload["upstream_artifacts"][0]["handoff_status"],
+            "rejected_for_repair"
+        );
+        assert_eq!(
+            completed_remediation.payload["upstream_artifacts"][0]["content"]["summary"],
+            "forgot files_changed"
+        );
+        assert_eq!(
+            tasks
+                .iter()
+                .filter(|task| task.payload["source"] == "artifact_handoff_rejection")
+                .count(),
+            1,
+            "running a recovery task must not create nested recovery tasks for the same invalid artifact"
         );
     }
 
