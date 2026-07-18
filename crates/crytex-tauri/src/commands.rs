@@ -1963,6 +1963,15 @@ async fn attach_upstream_artifacts(
                     &rejection,
                 )
                 .await;
+                create_artifact_handoff_remediation_task(
+                    task_service.clone(),
+                    audit_service,
+                    event_service,
+                    run_id,
+                    task,
+                    &rejection,
+                )
+                .await?;
             }
         }
     }
@@ -2039,6 +2048,64 @@ async fn log_artifact_handoff_rejection(
         }),
     )
     .await;
+}
+
+async fn create_artifact_handoff_remediation_task(
+    task_service: Arc<dyn TaskService>,
+    audit_service: Option<&Arc<dyn AuditLogService>>,
+    event_service: Option<&Arc<dyn EventService>>,
+    run_id: &str,
+    target_task: &Task,
+    rejection: &ArtifactHandoffRejection,
+) -> Result<Task, TauriCommandError> {
+    let remediation = task_service
+        .submit(CreateTaskRequest {
+            project_id: target_task.project_id.clone(),
+            parent_id: target_task.parent_id.clone(),
+            title: format!(
+                "Fix invalid {} from {}",
+                rejection.artifact_kind, rejection.source_task_id
+            ),
+            description: Some(rejection.reason.clone()),
+            kind: "debug".to_string(),
+            assigned_agent: rejection.source_agent.clone(),
+            priority: target_task.priority + 1,
+            payload: serde_json::json!({
+                "source": "artifact_handoff_rejection",
+                "source_task_id": rejection.source_task_id,
+                "source_agent": rejection.source_agent,
+                "target_task_id": target_task.id,
+                "target_agent": target_task.assigned_agent,
+                "artifact_kind": rejection.artifact_kind,
+                "reason": rejection.reason,
+                "prompt": format!(
+                    "Fix the rejected {} produced by task {} so it satisfies the handoff schema before task {} reviews it.",
+                    rejection.artifact_kind,
+                    rejection.source_task_id,
+                    target_task.id
+                ),
+            }),
+            trace_id: Some(target_task.trace_id.clone()),
+        })
+        .await?;
+    log_run_event(
+        audit_service,
+        event_service,
+        "artifact_handoff_remediation_task_created",
+        Some(&remediation),
+        &remediation.project_id,
+        Some(&remediation.trace_id),
+        serde_json::json!({
+            "run_id": run_id,
+            "source_task_id": rejection.source_task_id,
+            "target_task_id": target_task.id,
+            "artifact_kind": rejection.artifact_kind,
+            "reason": rejection.reason,
+            "remediation_task_id": remediation.id,
+        }),
+    )
+    .await;
+    Ok(remediation)
 }
 
 fn build_agent_artifact_envelope(task: &Task) -> Option<AgentArtifactEnvelope> {
@@ -3000,12 +3067,41 @@ mod tests {
                 tasks: Mutex::new(tasks),
             }
         }
+
+        fn tasks(&self) -> Vec<Task> {
+            self.tasks.lock().unwrap().clone()
+        }
     }
 
     #[async_trait]
     impl TaskService for SiblingTaskService {
-        async fn submit(&self, _request: CreateTaskRequest) -> Result<Task, TaskError> {
-            Err(TaskError::NotFound("not used".into()))
+        async fn submit(&self, request: CreateTaskRequest) -> Result<Task, TaskError> {
+            let mut tasks = self.tasks.lock().unwrap();
+            let task = Task {
+                id: format!("submitted-{}", tasks.len() + 1),
+                project_id: request.project_id,
+                parent_id: request.parent_id,
+                title: request.title,
+                description: request.description,
+                kind: request.kind,
+                status: TaskStatus::Pending,
+                assigned_agent: request.assigned_agent,
+                priority: request.priority,
+                payload: request.payload,
+                result: None,
+                created_at: tasks.len() as i64 + 100,
+                started_at: None,
+                finished_at: None,
+                iteration_count: 0,
+                priority_score: request.priority as f64,
+                critic_score: None,
+                human_score: None,
+                prompt_version_id: None,
+                lora_adapter_id: None,
+                trace_id: request.trace_id.unwrap_or_else(|| "trace".into()),
+            };
+            tasks.push(task.clone());
+            Ok(task)
         }
         async fn add_dependency(&self, _dep: TaskDependency) -> Result<(), TaskError> {
             Ok(())
@@ -3824,7 +3920,7 @@ mod tests {
         let events = Arc::new(CapturingEventService::default());
 
         let response = start_run_with_orchestrator(
-            task_service,
+            task_service.clone(),
             None,
             Some(audit.clone()),
             Some(events.clone()),
@@ -3864,6 +3960,23 @@ mod tests {
                 && entry.trace_id == "trace-invalid-handoff"
                 && entry.metadata["source_task_id"] == "task-coder-invalid"
         }));
+        let tasks = task_service.tasks();
+        let remediation = tasks
+            .iter()
+            .find(|task| task.payload["source"] == "artifact_handoff_rejection")
+            .expect("artifact handoff rejection should create a remediation task");
+        assert_eq!(remediation.kind, "debug");
+        assert_eq!(remediation.status, TaskStatus::Pending);
+        assert_eq!(remediation.assigned_agent.as_deref(), Some("coder"));
+        assert_eq!(remediation.parent_id.as_deref(), Some("goal-1"));
+        assert_eq!(remediation.payload["source_task_id"], "task-coder-invalid");
+        assert_eq!(remediation.payload["target_task_id"], "task-critic");
+        assert_eq!(remediation.payload["artifact_kind"], "patch_artifact");
+        assert!(
+            remediation.payload["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("files_changed"))
+        );
     }
 
     #[test]
