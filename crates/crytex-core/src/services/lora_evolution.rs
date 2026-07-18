@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use crytex_inference::LoRAAdapter as InferenceLoRAAdapter;
 use serde_json;
+use std::collections::HashSet;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -348,6 +349,20 @@ impl LoraEvolutionServiceImpl {
         examples: &[TrainingExample],
         key: &str,
     ) -> Result<(), LoraEvolutionError> {
+        let mut task_ids = HashSet::with_capacity(examples.len());
+        if let Some(example) = examples
+            .iter()
+            .find(|example| !task_ids.insert(example.task_id.as_str()))
+        {
+            return Err(LoraEvolutionError::ValidationFailed(
+                key.to_string(),
+                format!(
+                    "golden dataset contains duplicate task_id {}; train/validation split would leak task output",
+                    example.task_id
+                ),
+            ));
+        }
+
         if let Some(example) = examples.iter().find(|example| {
             example.input_text.trim().chars().count() < MIN_EXAMPLE_TEXT_CHARS
                 || example.output_text.trim().chars().count() < MIN_EXAMPLE_TEXT_CHARS
@@ -1658,7 +1673,7 @@ mod tests {
     fn example(kind: &str, reward: f64, created_at: i64) -> TrainingExample {
         TrainingExample {
             id: Ulid::new().to_string(),
-            task_id: "t1".into(),
+            task_id: format!("task-{created_at}"),
             project_id: Some("p1".into()),
             prompt_version_id: Some("pv1".into()),
             task_kind: kind.into(),
@@ -2033,7 +2048,7 @@ mod tests {
     fn example_with_role(agent_role: &str, reward: f64, created_at: i64) -> TrainingExample {
         TrainingExample {
             id: Ulid::new().to_string(),
-            task_id: "t1".into(),
+            task_id: format!("task-{agent_role}-{created_at}"),
             project_id: Some("p1".into()),
             prompt_version_id: Some("pv1".into()),
             task_kind: "codegen".into(),
@@ -2130,7 +2145,10 @@ mod tests {
         let examples = vec![
             example("codegen", 5.0, 0),
             example("codegen", 5.0, 1),
-            example("codegen", 5.0, 2),
+            TrainingExample {
+                task_id: "t1".into(),
+                ..example("codegen", 5.0, 2)
+            },
         ];
         let existing_adapter = LoraAdapter {
             id: "codegen-v1".into(),
@@ -2223,7 +2241,10 @@ mod tests {
         let examples = vec![
             example("codegen", 5.0, 0),
             example("codegen", 5.0, 1),
-            example("codegen", 5.0, 2),
+            TrainingExample {
+                task_id: "t1".into(),
+                ..example("codegen", 5.0, 2)
+            },
         ];
         let existing_adapter = LoraAdapter {
             id: "codegen-v1".into(),
@@ -2250,7 +2271,7 @@ mod tests {
             ["codegen-v2"]
         );
 
-        let requests = gate.requests.lock().unwrap();
+        let requests = gate.requests.lock().unwrap().clone();
         assert_eq!(requests.len(), 1);
         assert_eq!(
             requests[0].baseline_adapter_id.as_deref(),
@@ -2333,6 +2354,40 @@ mod tests {
             result,
             Err(LoraEvolutionError::ValidationFailed(kind, reason))
                 if kind == "codegen" && reason.contains("golden dataset")
+        ));
+        assert!(
+            adapter_repo
+                .list_lora_adapters_by_kind("codegen")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(inference.registered.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn training_rejects_duplicate_task_ids_before_train_validation_split() {
+        let task = make_task("p1", "codegen", TaskStatus::Completed, Some(5.0));
+        let examples = vec![
+            TrainingExample {
+                task_id: "same-task".into(),
+                ..example("codegen", 5.0, 0)
+            },
+            TrainingExample {
+                task_id: "same-task".into(),
+                ..example("codegen", 5.0, 1)
+            },
+            example("codegen", 5.0, 2),
+        ];
+        let (service, _, adapter_repo, inference) =
+            evolution_service_with_trainer(task, examples, Arc::new(MockTrainer::new()));
+
+        let result = service.train_and_register("codegen").await;
+
+        assert!(matches!(
+            result,
+            Err(LoraEvolutionError::ValidationFailed(kind, reason))
+                if kind == "codegen" && reason.contains("duplicate task_id")
         ));
         assert!(
             adapter_repo
