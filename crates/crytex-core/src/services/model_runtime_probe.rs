@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use std::{fs, io};
 
-use crytex_inference::{InferenceRequest, Message};
+use crytex_inference::{BackendCapabilityReport, InferenceRequest, Message};
 use serde::{Deserialize, Serialize};
 
 use crate::services::hardware::DeviceKind;
@@ -45,6 +45,7 @@ pub struct ModelRuntimeProbeReport {
     pub trace_id: String,
     pub model_id: String,
     pub backend_id: Option<String>,
+    pub backend_capability: Option<BackendCapabilityReport>,
     pub compatibility: ModelCompatibilityPlan,
     pub stages: Vec<ProbeStageReport>,
     pub generated_preview: Option<String>,
@@ -94,6 +95,7 @@ impl ModelRuntimeProbe {
             .unwrap_or_else(|| TraceContext::new().trace_id);
         let mut stages = Vec::new();
         let compatibility = ModelCompatibilityPlanner::plan(model, device, runtime);
+        let backend_capability = self.backend_capability(request.backend_id.as_deref());
 
         stages.push(stage(
             ProbeStageName::Metadata,
@@ -122,6 +124,7 @@ impl ModelRuntimeProbe {
                 trace_id,
                 model_id: model.id.clone(),
                 backend_id: request.backend_id,
+                backend_capability,
                 compatibility,
                 stages,
                 generated_preview: None,
@@ -157,6 +160,7 @@ impl ModelRuntimeProbe {
                     trace_id,
                     model_id: model.id.clone(),
                     backend_id: request.backend_id,
+                    backend_capability,
                     compatibility,
                     stages,
                     generated_preview: Some(preview),
@@ -164,11 +168,14 @@ impl ModelRuntimeProbe {
                 }
             }
             Ok(content) if !content.trim().is_empty() => failed_generation_report(
-                trace_id,
-                model,
-                request.backend_id,
-                compatibility,
-                stages,
+                FailedProbeContext::new(
+                    trace_id,
+                    model,
+                    request.backend_id,
+                    backend_capability,
+                    compatibility,
+                    stages,
+                ),
                 format!(
                     "smoke generation missed expected sentinel CRYTEX_PROBE_OK: {}",
                     content.chars().take(120).collect::<String>()
@@ -176,24 +183,38 @@ impl ModelRuntimeProbe {
                 duration_ms,
             ),
             Ok(_) => failed_generation_report(
-                trace_id,
-                model,
-                request.backend_id,
-                compatibility,
-                stages,
+                FailedProbeContext::new(
+                    trace_id,
+                    model,
+                    request.backend_id,
+                    backend_capability,
+                    compatibility,
+                    stages,
+                ),
                 "smoke generation returned empty output".to_string(),
                 duration_ms,
             ),
             Err(error) => failed_generation_report(
-                trace_id,
-                model,
-                request.backend_id,
-                compatibility,
-                stages,
+                FailedProbeContext::new(
+                    trace_id,
+                    model,
+                    request.backend_id,
+                    backend_capability,
+                    compatibility,
+                    stages,
+                ),
                 generation_error_message(error),
                 duration_ms,
             ),
         }
+    }
+
+    fn backend_capability(&self, backend_id: Option<&str>) -> Option<BackendCapabilityReport> {
+        self.inference
+            .available_backends()
+            .into_iter()
+            .find(|backend| backend_id.is_none_or(|id| backend.id == id))
+            .map(|backend| backend.capability_report())
     }
 }
 
@@ -353,27 +374,53 @@ fn sanitize_report_file_stem(value: &str) -> String {
     }
 }
 
-fn failed_generation_report(
+struct FailedProbeContext {
     trace_id: String,
-    model: &ManagedModel,
+    model_id: String,
     backend_id: Option<String>,
+    backend_capability: Option<BackendCapabilityReport>,
     compatibility: ModelCompatibilityPlan,
-    mut stages: Vec<ProbeStageReport>,
+    stages: Vec<ProbeStageReport>,
+}
+
+impl FailedProbeContext {
+    fn new(
+        trace_id: String,
+        model: &ManagedModel,
+        backend_id: Option<String>,
+        backend_capability: Option<BackendCapabilityReport>,
+        compatibility: ModelCompatibilityPlan,
+        stages: Vec<ProbeStageReport>,
+    ) -> Self {
+        Self {
+            trace_id,
+            model_id: model.id.clone(),
+            backend_id,
+            backend_capability,
+            compatibility,
+            stages,
+        }
+    }
+}
+
+fn failed_generation_report(
+    mut context: FailedProbeContext,
     message: String,
     duration_ms: u128,
 ) -> ModelRuntimeProbeReport {
-    stages.push(stage(
+    context.stages.push(stage(
         ProbeStageName::Generation,
         ProbeStageStatus::Failed,
         message,
         duration_ms,
     ));
     ModelRuntimeProbeReport {
-        trace_id,
-        model_id: model.id.clone(),
-        backend_id,
-        compatibility,
-        stages,
+        trace_id: context.trace_id,
+        model_id: context.model_id,
+        backend_id: context.backend_id,
+        backend_capability: context.backend_capability,
+        compatibility: context.compatibility,
+        stages: context.stages,
         generated_preview: None,
         passed: false,
     }
@@ -550,6 +597,14 @@ mod tests {
         assert_eq!(report.entries.len(), 2);
         assert_eq!(report.entries[0].label, "baseline");
         assert_eq!(report.entries[1].label, "coder-lora");
+        assert_eq!(
+            report.entries[1]
+                .report
+                .backend_capability
+                .as_ref()
+                .map(|capability| (capability.lora, capability.hot_swap)),
+            Some((true, true))
+        );
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].lora_adapter_id, None);
         assert_eq!(requests[1].lora_adapter_id.as_deref(), Some("coder-lora-v1"));
@@ -615,6 +670,7 @@ mod tests {
                     trace_id: "trace/runtime matrix:01:ollama:baseline".into(),
                     model_id: "ollama-qwen".into(),
                     backend_id: Some("ollama".into()),
+                    backend_capability: None,
                     compatibility: ModelCompatibilityPlanner::plan(
                         &model("ollama-qwen"),
                         &cuda_device(),
@@ -693,7 +749,16 @@ mod tests {
         }
 
         fn available_backends(&self) -> Vec<BackendInfo> {
-            vec![]
+            vec![BackendInfo {
+                id: "mistralrs".into(),
+                name: "mistral.rs".into(),
+                capabilities: vec![
+                    "generate".into(),
+                    "chat".into(),
+                    "lora".into(),
+                    "hot_swap".into(),
+                ],
+            }]
         }
 
         async fn register_lora(&self, _lora: LoRAAdapter) -> Result<(), InferenceServiceError> {
