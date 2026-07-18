@@ -1032,7 +1032,6 @@ Otherwise return:
 }
 
 #[tokio::test]
-#[ignore = "requires local Ollama and a cached/downloadable model"]
 async fn full_happy_path_real_ollama_writes_remediates_and_records_human_reward() {
     let ollama_url =
         std::env::var("CRYTEX_E2E_OLLAMA_URL").unwrap_or_else(|_| DEFAULT_OLLAMA_URL.to_string());
