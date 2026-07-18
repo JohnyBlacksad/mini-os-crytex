@@ -206,6 +206,17 @@ pub struct RunDiagnosticLoraEvolution {
     pub metadata: Value,
 }
 
+/// Typed artifact envelope passed between generated agent-chain tasks.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentArtifactEnvelope {
+    pub schema_version: u32,
+    pub artifact_id: String,
+    pub source_task_id: String,
+    pub source_agent: Option<String>,
+    pub artifact_kind: String,
+    pub content: Value,
+}
+
 /// Structured run evidence for Observe and manual diagnostics.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RunDiagnosticsReport {
@@ -217,6 +228,7 @@ pub struct RunDiagnosticsReport {
     pub events: Vec<RunDiagnosticEvent>,
     pub review_task_ids: Vec<String>,
     pub critic_feedback: Vec<String>,
+    pub artifact_lineage: Vec<AgentArtifactEnvelope>,
     pub remediation_events: Vec<RunDiagnosticEvent>,
     pub lora_evolution: Vec<RunDiagnosticLoraEvolution>,
     pub rag_context_sent_to_model: bool,
@@ -873,6 +885,7 @@ pub fn build_run_diagnostics(
 
     let review_task_ids = diagnostic_review_task_ids(&tasks, &events);
     let critic_feedback = diagnostic_critic_feedback(&tasks, &events);
+    let artifact_lineage = diagnostic_artifact_lineage(&state.tasks);
     let remediation_events = events
         .iter()
         .filter(|event| event.action.contains("remediation"))
@@ -895,6 +908,7 @@ pub fn build_run_diagnostics(
         events,
         review_task_ids,
         critic_feedback,
+        artifact_lineage,
         remediation_events,
         lora_evolution,
         rag_context_sent_to_model,
@@ -1035,6 +1049,22 @@ fn diagnostic_task_row(task: &Task) -> RunDiagnosticTask {
         critic_score: task.critic_score,
         human_score: task.human_score,
     }
+}
+
+fn diagnostic_artifact_lineage(tasks: &[Task]) -> Vec<AgentArtifactEnvelope> {
+    let mut seen = BTreeSet::new();
+    tasks
+        .iter()
+        .flat_map(|task| {
+            task.payload
+                .get("upstream_artifacts")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .filter_map(|value| serde_json::from_value::<AgentArtifactEnvelope>(value.clone()).ok())
+        .filter(|envelope| seen.insert(envelope.artifact_id.clone()))
+        .collect()
 }
 
 fn review_decision_from_result(result: &Value) -> Option<String> {
@@ -1865,21 +1895,62 @@ async fn attach_upstream_artifacts(
 
     let upstream_artifacts = upstream
         .into_iter()
-        .map(|artifact| {
-            serde_json::json!({
-                "task_id": artifact.id,
-                "title": artifact.title,
-                "kind": artifact.kind,
-                "agent": artifact.assigned_agent,
-                "result": artifact.result,
-            })
-        })
+        .filter_map(|artifact| build_agent_artifact_handoff(&artifact))
         .collect::<Vec<_>>();
     if is_reviewer_task(task) && task.payload.get("parent_result").is_none() {
         task.payload["parent_result"] = Value::Array(upstream_artifacts.clone());
     }
     task.payload["upstream_artifacts"] = Value::Array(upstream_artifacts);
     Ok(())
+}
+
+fn build_agent_artifact_handoff(task: &Task) -> Option<Value> {
+    let envelope = build_agent_artifact_envelope(task)?;
+    Some(serde_json::json!({
+        "schema_version": envelope.schema_version,
+        "artifact_id": envelope.artifact_id,
+        "source_task_id": envelope.source_task_id,
+        "source_agent": envelope.source_agent,
+        "artifact_kind": envelope.artifact_kind,
+        "content": envelope.content,
+        "task_id": task.id,
+        "title": task.title,
+        "kind": task.kind,
+        "agent": task.assigned_agent,
+        "result": task.result,
+    }))
+}
+
+fn build_agent_artifact_envelope(task: &Task) -> Option<AgentArtifactEnvelope> {
+    let result = task.result.as_ref()?;
+    Some(AgentArtifactEnvelope {
+        schema_version: 1,
+        artifact_id: format!("artifact-{}-{}", task.id, task.iteration_count),
+        source_task_id: task.id.clone(),
+        source_agent: task.assigned_agent.clone(),
+        artifact_kind: artifact_kind_for_task(task),
+        content: artifact_content_from_result(result),
+    })
+}
+
+fn artifact_kind_for_task(task: &Task) -> String {
+    match task.assigned_agent.as_deref() {
+        Some("architect") => "design_artifact".to_string(),
+        Some("coder") => "patch_artifact".to_string(),
+        Some("qa") => "test_report_artifact".to_string(),
+        Some("security") => "security_report_artifact".to_string(),
+        Some("critic") => "review_decision".to_string(),
+        Some(agent) => format!("{agent}_artifact"),
+        None => format!("{}_artifact", task.kind),
+    }
+}
+
+fn artifact_content_from_result(result: &Value) -> Value {
+    result
+        .pointer("/agent_result/artifact")
+        .or_else(|| result.pointer("/artifact"))
+        .cloned()
+        .unwrap_or_else(|| result.clone())
 }
 
 fn is_generated_chain_task(task: &Task) -> bool {

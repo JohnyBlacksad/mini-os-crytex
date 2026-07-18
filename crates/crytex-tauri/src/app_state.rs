@@ -2731,6 +2731,45 @@ mod tests {
             1
         );
         assert_eq!(coder.payload["upstream_artifacts"][0]["agent"], "architect");
+        assert_eq!(coder.payload["upstream_artifacts"][0]["schema_version"], 1);
+        assert_eq!(
+            coder.payload["upstream_artifacts"][0]["source_agent"],
+            "architect"
+        );
+        assert_eq!(
+            coder.payload["upstream_artifacts"][0]["source_task_id"],
+            coder.payload["upstream_artifacts"][0]["task_id"]
+        );
+        assert_eq!(
+            coder.payload["upstream_artifacts"][0]["artifact_kind"],
+            "design_artifact"
+        );
+        assert!(
+            coder.payload["upstream_artifacts"][0]["artifact_id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("artifact-"))
+        );
+        assert_eq!(
+            coder.payload["upstream_artifacts"][0]["content"]["producer"],
+            "architect"
+        );
+        let diagnostics = state
+            .export_run_diagnostics(ExportRunDiagnosticsCommand {
+                project_id: project.id.clone(),
+                run_id: run.run_id,
+                trace_id: Some("trace-agent-chain".into()),
+            })
+            .await
+            .unwrap();
+        assert!(
+            diagnostics.artifact_lineage.iter().any(|artifact| {
+                artifact.source_agent.as_deref() == Some("architect")
+                    && artifact.artifact_kind == "design_artifact"
+                    && Some(artifact.source_task_id.as_str())
+                        == coder.payload["upstream_artifacts"][0]["task_id"].as_str()
+            }),
+            "run diagnostics should export the typed artifact lineage"
+        );
         state.shutdown_project_watchers().await;
     }
 

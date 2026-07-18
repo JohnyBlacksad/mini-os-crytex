@@ -319,6 +319,15 @@ export type RunDiagnosticLoraEvolution = {
   metadata: unknown;
 };
 
+export type AgentArtifactEnvelope = {
+  schema_version: number;
+  artifact_id: string;
+  source_task_id: string;
+  source_agent: string | null;
+  artifact_kind: string;
+  content: unknown;
+};
+
 export type RunDiagnosticsReport = {
   project_id: string;
   run_id: string;
@@ -328,6 +337,7 @@ export type RunDiagnosticsReport = {
   events: RunDiagnosticEvent[];
   review_task_ids: string[];
   critic_feedback: string[];
+  artifact_lineage: AgentArtifactEnvelope[];
   remediation_events: RunDiagnosticEvent[];
   lora_evolution: RunDiagnosticLoraEvolution[];
   rag_context_sent_to_model: boolean;
