@@ -677,7 +677,6 @@ After receiving the fs_write observation, respond only with a final JSON object 
 }
 
 #[tokio::test]
-#[ignore = "requires local Ollama and a cached/downloadable model"]
 async fn real_ollama_agent_run_receives_indexed_rag_context() {
     let ollama_url =
         std::env::var("CRYTEX_E2E_OLLAMA_URL").unwrap_or_else(|_| DEFAULT_OLLAMA_URL.to_string());
