@@ -32,7 +32,10 @@ impl Embedder for Arc<dyn crate::services::InferenceService> {
     }
 
     async fn dimension(&self) -> Result<usize, EmbeddingError> {
-        let vector = self.embed("").await.map_err(|e| EmbeddingError::EmbeddingFailed(e.to_string()))?;
+        let vector = self
+            .embed("")
+            .await
+            .map_err(|e| EmbeddingError::EmbeddingFailed(e.to_string()))?;
         Ok(vector.len())
     }
 }
@@ -78,12 +81,11 @@ impl SparseEmbedder for MockSparseEmbedder {
 impl MockSparseEmbedder {
     fn embed(text: &str) -> SparseVector {
         let tokens: Vec<&str> = text.split_whitespace().collect();
-        let mut indices = Vec::with_capacity(tokens.len());
-        let mut values = Vec::with_capacity(tokens.len());
+        let mut weighted_indices = std::collections::BTreeMap::new();
         for (i, token) in tokens.iter().enumerate() {
-            indices.push(hash_token(token));
-            values.push(i as f32 + 1.0);
+            *weighted_indices.entry(hash_token(token)).or_insert(0.0) += i as f32 + 1.0;
         }
+        let (indices, values) = weighted_indices.into_iter().unzip();
         SparseVector { indices, values }
     }
 }
@@ -109,5 +111,23 @@ impl Embedder for MockEmbedder {
 
     async fn dimension(&self) -> Result<usize, EmbeddingError> {
         Ok(self.dim)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[tokio::test]
+    async fn mock_sparse_embedder_coalesces_duplicate_indices() {
+        let sparse = MockSparseEmbedder
+            .embed_document("repeat repeat unique")
+            .await
+            .unwrap();
+        let unique = sparse.indices.iter().copied().collect::<HashSet<_>>();
+
+        assert_eq!(sparse.indices.len(), unique.len());
+        assert_eq!(sparse.indices.len(), sparse.values.len());
     }
 }

@@ -155,7 +155,8 @@ impl VectorStore for MemoryVectorStore {
         let Some(col) = collections.get_mut(collection) else {
             return Ok(());
         };
-        col.points.retain(|_, point| !payload_matches(&point.payload, &filter));
+        col.points
+            .retain(|_, point| !payload_matches(&point.payload, &filter));
         Ok(())
     }
 }

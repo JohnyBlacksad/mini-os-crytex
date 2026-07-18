@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
 use crytex_core::services::{
-    Reranker, RerankerError, RerankPassage, RerankResult as CoreRerankResult,
+    RerankPassage, RerankResult as CoreRerankResult, Reranker, RerankerError,
 };
 use crytex_inference::InferenceError;
 use fastembed::{
@@ -199,10 +199,7 @@ fn find_onnx_source(dir: &Path) -> Result<OnnxSource, InferenceError> {
         .collect();
     onnx_files.sort();
     let path = onnx_files.into_iter().next().ok_or_else(|| {
-        InferenceError::EmbeddingFailed(format!(
-            "no .onnx model file found in {}",
-            dir.display()
-        ))
+        InferenceError::EmbeddingFailed(format!("no .onnx model file found in {}", dir.display()))
     })?;
     Ok(OnnxSource::File(path))
 }
@@ -210,8 +207,9 @@ fn find_onnx_source(dir: &Path) -> Result<OnnxSource, InferenceError> {
 fn read_tokenizer_files(dir: &Path) -> Result<TokenizerFiles, InferenceError> {
     fn read(dir: &Path, name: &str) -> Result<Vec<u8>, InferenceError> {
         let path = dir.join(name);
-        std::fs::read(&path)
-            .map_err(|e| InferenceError::EmbeddingFailed(format!("cannot read {}: {}", path.display(), e)))
+        std::fs::read(&path).map_err(|e| {
+            InferenceError::EmbeddingFailed(format!("cannot read {}: {}", path.display(), e))
+        })
     }
     Ok(TokenizerFiles {
         tokenizer_file: read(dir, "tokenizer.json")?,

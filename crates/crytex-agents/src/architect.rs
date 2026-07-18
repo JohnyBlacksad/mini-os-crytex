@@ -1,5 +1,6 @@
 use crate::{
     extract_backend_id, extract_model,
+    json::parse_llm_json_value,
     prompts::{architect_system_prompt, architect_user_prompt, system_prompt_override},
     tooling::ToolingEngine,
 };
@@ -86,21 +87,7 @@ impl Agent for ArchitectAgent {
 
 /// Parse the final model output into a normalized architect result.
 fn parse_architect_output(content: &str) -> Result<Value, AgentError> {
-    let trimmed = content.trim();
-    let mut value: Value = serde_json::from_str(trimmed)
-        .or_else(|_| {
-            let inner = trimmed
-                .strip_prefix("```json")
-                .and_then(|s| s.strip_suffix("```"))
-                .or_else(|| {
-                    trimmed
-                        .strip_prefix("```")
-                        .and_then(|s| s.strip_suffix("```"))
-                })
-                .unwrap_or(trimmed)
-                .trim();
-            serde_json::from_str(inner)
-        })
+    let mut value = parse_llm_json_value(content)
         .map_err(|e| AgentError::Execution(format!("architect output is not valid JSON: {e}")))?;
 
     if value.get("plan").is_none() {

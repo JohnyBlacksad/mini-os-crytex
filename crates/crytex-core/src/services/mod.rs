@@ -19,7 +19,9 @@ pub mod lora_evolution;
 pub mod lora_router;
 pub mod lora_trainer;
 pub mod memory_bank;
+pub mod model_compatibility;
 pub mod model_manager;
+pub mod model_runtime_probe;
 pub mod orchestrator;
 pub mod project_service;
 pub mod project_watcher;
@@ -47,16 +49,20 @@ pub use critic_council::{CriticCouncil, CriticCouncilError};
 pub use embedder::{Embedder, EmbeddingError, MockEmbedder, MockSparseEmbedder, SparseEmbedder};
 pub use event_service::{EventHandler, EventService, EventServiceImpl};
 pub use hardware::{
-    DeviceKind, HardwareDetector, HardwareRecommendation, SystemHardwareDetector,
+    CudaToolchainProbe, CudaToolchainStatus, DeviceKind, HardwareDetector, HardwareRecommendation,
+    SystemHardwareDetector, build_cuda_toolchain_status, detect_cuda_toolchain_status,
     recommend_local_device,
 };
 pub use hybrid::{
-    build_fusion_strategy, DistributionBasedScoreFusion, FusionStrategy, FusionStrategyKind,
-    HybridRetriever, HybridSearchError, RankedList, RankedResult, ReciprocalRankFusion,
-    RetrieverSource,
+    DistributionBasedScoreFusion, FusionStrategy, FusionStrategyKind, HybridRetriever,
+    HybridSearchError, RankedList, RankedResult, ReciprocalRankFusion, RetrieverSource,
+    build_fusion_strategy,
 };
 pub use inference_service::{InferenceService, InferenceServiceError, InferenceServiceImpl};
-pub use lora_evolution::{LoraEvolutionError, LoraEvolutionService, LoraEvolutionServiceImpl};
+pub use lora_evolution::{
+    LoraBenchmarkDecision, LoraBenchmarkGate, LoraBenchmarkRequest, LoraEvolutionError,
+    LoraEvolutionService, LoraEvolutionServiceImpl,
+};
 pub use lora_router::{LoraRouter, LoraRouterError, LoraRouterImpl};
 pub use lora_trainer::{
     LoraMetrics, LoraTrainer, LoraTrainingConfig, LoraTrainingError, LoraTrainingResult,
@@ -64,18 +70,28 @@ pub use lora_trainer::{
 pub use memory_bank::{
     MemoryBankError, MemoryBankService, MemoryBankServiceImpl, MemoryEntryBuilder,
 };
+pub use model_compatibility::{
+    CompatibilityStatus, ExecutionStrategy, ModelCompatibilityPlan, ModelCompatibilityPlanner,
+    ModelFeature, ModelFormat, RuntimeFeatureSet,
+};
 pub use model_manager::{
     FileSystemManifestSource, HardwareModelRecommender, HfHubDownloader, ManagedModel,
     ManifestEntry, ModelDownloader, ModelManager, ModelManagerError, ModelManagerImpl,
     ModelManifestSource, ModelRecommender, ModelRegistryStore, ModelStatus, Quantization,
     RecommendedConfig, RegistryEntry, TomlRegistryStore,
 };
+pub use model_runtime_probe::{
+    ModelRuntimeMatrixProbe, ModelRuntimeMatrixReport, ModelRuntimeMatrixRequest,
+    ModelRuntimeProbe, ModelRuntimeProbeReport, ModelRuntimeProbeRequest, ProbeStageName,
+    ProbeStageReport, ProbeStageStatus, RuntimeMatrixEntryReport, RuntimeMatrixEntryRequest,
+    RuntimeMatrixReportWriter,
+};
 pub use orchestrator::{Orchestrator, OrchestratorError, OrchestratorImpl};
 pub use project_service::{CreateProjectRequest, ProjectError, ProjectService, ProjectServiceImpl};
 pub use project_watcher::{ProjectWatcher, WatcherError};
 pub use prompt_evolution::{MutationOperator, PromptEvolutionError, PromptEvolutionService};
 pub use rate_limit::{RetryPolicy, RetryRateLimitBackend, TokenBucket};
-pub use reranker::{Reranker, RerankerError, RerankPassage, RerankResult};
+pub use reranker::{RerankPassage, RerankResult, Reranker, RerankerError};
 pub use reward_service::{RecordRewardRequest, RewardService, RewardServiceError};
 pub use role::AgentRole;
 pub use sandbox_service::{

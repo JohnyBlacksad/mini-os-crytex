@@ -1,5 +1,6 @@
 use crate::{
     extract_backend_id, extract_model,
+    json::parse_llm_json_value,
     prompts::{researcher_system_prompt, researcher_user_prompt, system_prompt_override},
     tooling::generate_with_tools,
 };
@@ -26,16 +27,7 @@ impl Default for ResearcherAgent {
 }
 
 fn parse_researcher_output(content: &str, usage: &TokenUsage) -> Result<Value, serde_json::Error> {
-    let trimmed = content.trim();
-    let cleaned = if let Some(inner) = trimmed.strip_prefix("```json") {
-        inner.trim().trim_end_matches("```").trim()
-    } else if let Some(inner) = trimmed.strip_prefix("```") {
-        inner.trim().trim_end_matches("```").trim()
-    } else {
-        trimmed
-    };
-
-    let mut value: Value = serde_json::from_str(cleaned)?;
+    let mut value = parse_llm_json_value(content)?;
 
     if value.get("findings").is_none() {
         value["findings"] = Value::Array(Vec::new());

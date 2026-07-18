@@ -65,7 +65,30 @@ impl ProjectWatcher {
         self,
         project_id: String,
         root_path: PathBuf,
+        shutdown: tokio::sync::oneshot::Receiver<()>,
+    ) -> Result<(), WatcherError> {
+        self.watch_inner(project_id, root_path, shutdown, None)
+            .await
+    }
+
+    /// Start watching and signal once the filesystem backend is subscribed.
+    pub async fn watch_with_ready(
+        self,
+        project_id: String,
+        root_path: PathBuf,
+        shutdown: tokio::sync::oneshot::Receiver<()>,
+        ready: tokio::sync::oneshot::Sender<Result<(), String>>,
+    ) -> Result<(), WatcherError> {
+        self.watch_inner(project_id, root_path, shutdown, Some(ready))
+            .await
+    }
+
+    async fn watch_inner(
+        self,
+        project_id: String,
+        root_path: PathBuf,
         mut shutdown: tokio::sync::oneshot::Receiver<()>,
+        ready: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
     ) -> Result<(), WatcherError> {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<PathBuf>>();
         let debounce_ms = self.debounce_ms;
@@ -74,17 +97,35 @@ impl ProjectWatcher {
 
         let watcher_task = tokio::task::spawn_blocking(move || -> Result<(), WatcherError> {
             let (debounce_tx, debounce_rx) = std::sync::mpsc::channel::<DebounceEventResult>();
-            let mut debouncer = new_debouncer(Duration::from_millis(debounce_ms), debounce_tx)?;
-            debouncer
+            let mut ready = ready;
+            let mut debouncer = match new_debouncer(Duration::from_millis(debounce_ms), debounce_tx)
+            {
+                Ok(debouncer) => debouncer,
+                Err(error) => {
+                    if let Some(ready) = ready.take() {
+                        let _ = ready.send(Err(error.to_string()));
+                    }
+                    return Err(error.into());
+                }
+            };
+            if let Err(error) = debouncer
                 .watcher()
-                .watch(&root, notify::RecursiveMode::Recursive)?;
+                .watch(&root, notify::RecursiveMode::Recursive)
+            {
+                if let Some(ready) = ready.take() {
+                    let _ = ready.send(Err(error.to_string()));
+                }
+                return Err(error.into());
+            }
+            if let Some(ready) = ready.take() {
+                let _ = ready.send(Ok(()));
+            }
 
             loop {
                 match debounce_rx.recv_timeout(Duration::from_millis(100)) {
                     Ok(result) => match result {
                         Ok(events) => {
-                            let paths: Vec<PathBuf> =
-                                events.into_iter().map(|e| e.path).collect();
+                            let paths: Vec<PathBuf> = events.into_iter().map(|e| e.path).collect();
                             let unique: Vec<PathBuf> = paths
                                 .into_iter()
                                 .collect::<HashSet<_>>()
@@ -162,11 +203,11 @@ impl ProjectWatcher {
 mod tests {
     use super::*;
     use crate::bus::EventBus;
+    use crate::services::embedder::Embedder;
     use crate::services::{
         EventServiceImpl, MockEmbedder, SearchOptions, SearchResult, VectorPoint, VectorStore,
         VectorStoreError,
     };
-    use crate::services::embedder::Embedder;
     use std::collections::HashMap;
     use std::sync::Mutex;
     use std::time::Duration;
@@ -353,7 +394,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(results.is_empty(), "watcher should remove deleted file chunks");
+        assert!(
+            results.is_empty(),
+            "watcher should remove deleted file chunks"
+        );
 
         shutdown_tx.send(()).unwrap();
         handle.await.unwrap().unwrap();

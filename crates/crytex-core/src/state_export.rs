@@ -54,7 +54,7 @@ pub async fn export_project_state(
 
     let mut recent_logs = audit_service.list_by_project(project_id).await?;
     recent_logs.sort_by_key(|b| std::cmp::Reverse(b.timestamp));
-    recent_logs.truncate(50);
+    recent_logs.truncate(250);
 
     let mut snapshots = snapshot_repo.list_project_snapshots(project_id).await?;
     snapshots.sort_by_key(|b| std::cmp::Reverse(b.created_at));

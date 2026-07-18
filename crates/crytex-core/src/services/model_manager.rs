@@ -130,7 +130,7 @@ pub struct RecommendedConfig {
 }
 
 /// Static user-editable manifest entry.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ManifestEntry {
     pub id: Option<String>,
     pub name: Option<String>,
@@ -141,7 +141,7 @@ pub struct ManifestEntry {
     pub params_b: Option<f32>,
 }
 
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct Manifest {
     #[serde(default)]
     pub models: Vec<ManifestEntry>,
@@ -173,6 +173,12 @@ pub struct DownloadSource {
 /// Trait for reading the static model manifest.
 pub trait ModelManifestSource: Send + Sync {
     fn load(&self) -> Result<Manifest, ModelManagerError>;
+
+    fn save(&self, _manifest: &Manifest) -> Result<(), ModelManagerError> {
+        Err(ModelManagerError::Download(
+            "manifest source is read-only".to_string(),
+        ))
+    }
 }
 
 /// Trait for reading/writing the runtime registry of downloaded models.
@@ -207,6 +213,13 @@ pub trait ModelManager: Send + Sync {
 
     /// Download a model and register it locally.
     async fn download_model(&self, id: &str) -> Result<ManagedModel, ModelManagerError>;
+
+    /// Add or replace a user-managed model in the manifest.
+    fn add_model(&self, _entry: ManifestEntry) -> Result<ManagedModel, ModelManagerError> {
+        Err(ModelManagerError::Download(
+            "model manifest editing is not supported".to_string(),
+        ))
+    }
 
     /// Recommend runtime configuration for a model.
     fn recommend_config(&self, id: &str) -> Result<RecommendedConfig, ModelManagerError>;
@@ -389,6 +402,17 @@ impl ModelManager for ModelManagerImpl {
         })
     }
 
+    fn add_model(&self, entry: ManifestEntry) -> Result<ManagedModel, ModelManagerError> {
+        let id = manifest_entry_id(&entry)?;
+        let mut manifest = self.manifest_source.load()?;
+        manifest
+            .models
+            .retain(|model| manifest_entry_id(model).ok().as_deref() != Some(id.as_str()));
+        manifest.models.push(entry);
+        self.manifest_source.save(&manifest)?;
+        self.get_model(&id)
+    }
+
     fn recommend_config(&self, id: &str) -> Result<RecommendedConfig, ModelManagerError> {
         let model = self.get_model(id)?;
         self.recommender.recommend(&model)
@@ -414,6 +438,15 @@ impl ModelManifestSource for FileSystemManifestSource {
         let contents = std::fs::read_to_string(&self.path)?;
         let manifest: Manifest = toml::from_str(&contents)?;
         Ok(manifest)
+    }
+
+    fn save(&self, manifest: &Manifest) -> Result<(), ModelManagerError> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let contents = toml::to_string_pretty(manifest)?;
+        std::fs::write(&self.path, contents)?;
+        Ok(())
     }
 }
 
@@ -606,6 +639,15 @@ fn sanitize_id(id: &str) -> String {
     id.replace(|c: char| !c.is_alphanumeric() && c != '-' && c != '_', "_")
 }
 
+fn manifest_entry_id(entry: &ManifestEntry) -> Result<String, ModelManagerError> {
+    entry
+        .id
+        .clone()
+        .or_else(|| entry.filename.clone())
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| ModelManagerError::Download("model id or filename is required".to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -780,6 +822,47 @@ mod tests {
     }
 
     #[test]
+    fn add_model_persists_manifest_entry() {
+        let (config_dir, cache_dir) = temp_dirs("add-model");
+        let events: Arc<dyn EventService> = Arc::new(MockEventService::default());
+        let mgr = ModelManagerImpl::new_standard(
+            &config_dir,
+            &cache_dir,
+            events,
+            Arc::new(FixedDetector(DeviceKind::Cpu)),
+        );
+
+        let added = mgr
+            .add_model(ManifestEntry {
+                id: Some("qwen-coder-9b-q4".into()),
+                name: Some("Qwen Coder 9B Q4".into()),
+                repo: Some("Qwen/Qwen2.5-Coder-9B-Instruct-GGUF".into()),
+                filename: Some("qwen2.5-coder-9b-instruct-q4_k_m.gguf".into()),
+                quantization: Some("Q4_K_M".into()),
+                backend: Some("mistral_rs".into()),
+                params_b: Some(9.0),
+            })
+            .unwrap();
+
+        assert_eq!(added.id, "qwen-coder-9b-q4");
+        assert!(matches!(added.status, ModelStatus::Available));
+
+        let reloaded = ModelManagerImpl::new_standard(
+            &config_dir,
+            &cache_dir,
+            Arc::new(MockEventService::default()),
+            Arc::new(FixedDetector(DeviceKind::Cpu)),
+        );
+        let models = reloaded.list_models().unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(
+            models[0].repo.as_deref(),
+            Some("Qwen/Qwen2.5-Coder-9B-Instruct-GGUF")
+        );
+        assert_eq!(models[0].quantization, Some(Quantization::Q4KM));
+    }
+
+    #[test]
     fn downloaded_models_are_marked() {
         let manifest = Manifest {
             models: vec![ManifestEntry {
@@ -865,6 +948,122 @@ mod tests {
         assert!(!progress_events.is_empty());
         assert_eq!(progress_events.first().unwrap().1, 0.0);
         assert_eq!(progress_events.last().unwrap().1, 1.0);
+    }
+
+    #[cfg(feature = "hf-hub")]
+    #[tokio::test]
+    #[ignore = "network smoke: downloads a tiny Hugging Face config file"]
+    async fn real_hf_download_persists_registry_and_reloads_as_downloaded() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let events: Arc<dyn EventService> = Arc::new(MockEventService::default());
+        let mgr = ModelManagerImpl::new_standard(
+            config_dir.path(),
+            cache_dir.path(),
+            events,
+            Arc::new(FixedDetector(DeviceKind::Cpu)),
+        );
+
+        mgr.add_model(ManifestEntry {
+            id: Some("hf-tiny-gpt2-config".into()),
+            name: Some("HF Tiny GPT-2 Config".into()),
+            repo: Some("sshleifer/tiny-gpt2".into()),
+            filename: Some("config.json".into()),
+            quantization: None,
+            backend: Some("custom".into()),
+            params_b: None,
+        })
+        .unwrap();
+
+        let downloaded = mgr.download_model("hf-tiny-gpt2-config").await.unwrap();
+        let local_path = downloaded.local_path.clone().unwrap();
+
+        assert!(matches!(downloaded.status, ModelStatus::Downloaded));
+        assert_eq!(
+            local_path.file_name().and_then(|name| name.to_str()),
+            Some("config.json")
+        );
+        assert!(
+            local_path.starts_with(cache_dir.path().join("models").join("hf-tiny-gpt2-config"))
+        );
+        assert!(tokio::fs::metadata(&local_path).await.unwrap().len() > 0);
+
+        let registry_path = cache_dir.path().join("registry.toml");
+        assert!(registry_path.exists());
+
+        let reloaded = ModelManagerImpl::new_standard(
+            config_dir.path(),
+            cache_dir.path(),
+            Arc::new(MockEventService::default()),
+            Arc::new(FixedDetector(DeviceKind::Cpu)),
+        );
+        let model = reloaded.get_model("hf-tiny-gpt2-config").unwrap();
+
+        assert!(matches!(model.status, ModelStatus::Downloaded));
+        assert_eq!(model.local_path.as_deref(), Some(local_path.as_path()));
+    }
+
+    #[cfg(feature = "hf-hub")]
+    #[tokio::test]
+    #[ignore = "network smoke: downloads an 83 MB tiny GGUF model file"]
+    async fn real_hf_tiny_gguf_download_reloads_as_mistral_runtime_candidate() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let events: Arc<dyn EventService> = Arc::new(MockEventService::default());
+        let mgr = ModelManagerImpl::new_standard(
+            config_dir.path(),
+            cache_dir.path(),
+            events,
+            Arc::new(FixedDetector(DeviceKind::Cpu)),
+        );
+
+        mgr.add_model(ManifestEntry {
+            id: Some("hf-tiny-random-minicpm-q2-gguf".into()),
+            name: Some("HF Tiny Random MiniCPM Q2 GGUF".into()),
+            repo: Some("tensorblock/tiny-random-minicpm-GGUF".into()),
+            filename: Some("tiny-random-minicpm-Q2_K.gguf".into()),
+            quantization: Some("Q2_K".into()),
+            backend: Some("mistral_rs".into()),
+            params_b: Some(0.08),
+        })
+        .unwrap();
+
+        let downloaded = mgr
+            .download_model("hf-tiny-random-minicpm-q2-gguf")
+            .await
+            .unwrap();
+        let local_path = downloaded.local_path.clone().unwrap();
+
+        assert!(matches!(downloaded.status, ModelStatus::Downloaded));
+        assert_eq!(downloaded.preferred_backend, BackendKind::MistralRs);
+        assert_eq!(downloaded.quantization, Some(Quantization::Q2K));
+        assert_eq!(
+            local_path.file_name().and_then(|name| name.to_str()),
+            Some("tiny-random-minicpm-Q2_K.gguf")
+        );
+        assert!(
+            local_path.starts_with(
+                cache_dir
+                    .path()
+                    .join("models")
+                    .join("hf-tiny-random-minicpm-q2-gguf")
+            )
+        );
+        assert!(tokio::fs::metadata(&local_path).await.unwrap().len() > 70 * 1024 * 1024);
+
+        let reloaded = ModelManagerImpl::new_standard(
+            config_dir.path(),
+            cache_dir.path(),
+            Arc::new(MockEventService::default()),
+            Arc::new(FixedDetector(DeviceKind::Cpu)),
+        );
+        let model = reloaded
+            .get_model("hf-tiny-random-minicpm-q2-gguf")
+            .unwrap();
+
+        assert!(matches!(model.status, ModelStatus::Downloaded));
+        assert_eq!(model.preferred_backend, BackendKind::MistralRs);
+        assert_eq!(model.local_path.as_deref(), Some(local_path.as_path()));
     }
 
     #[test]

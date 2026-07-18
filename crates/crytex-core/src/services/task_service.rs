@@ -150,8 +150,9 @@ impl<R> TaskServiceImpl<R> {
 
             // Pending task may start, fail fast, or be cancelled.
             (Pending, InProgress) => true,
+            (Pending, Backlog) => true, // hold generated plan tasks until human approval
             (Pending, Completed) => true, // allow immediate completion for trivial tasks
-            (Pending, Failed) => true,    // allow immediate failure for invalid tasks
+            (Pending, Failed) => true,  // allow immediate failure for invalid tasks
             (Pending, Cancelled) => true,
 
             // Running task can finish, go to review, fail, or be cancelled.
@@ -279,17 +280,30 @@ where
     }
 
     async fn add_dependency(&self, dep: TaskDependency) -> Result<(), TaskError> {
+        {
+            let graph = self.graph.lock().await;
+            let node_map = self.node_map.read().await;
+
+            if let (Some(&from), Some(&to)) =
+                (node_map.get(&dep.depends_on), node_map.get(&dep.task_id))
+            {
+                let mut candidate = graph.clone();
+                candidate.add_edge(from, to, ());
+                if petgraph::algo::is_cyclic_directed(&candidate) {
+                    return Err(TaskError::CycleDetected);
+                }
+            }
+        }
+
         self.repo.add_dependency(&dep).await?;
 
         let mut graph = self.graph.lock().await;
         let node_map = self.node_map.read().await;
-
         if let (Some(&from), Some(&to)) =
             (node_map.get(&dep.depends_on), node_map.get(&dep.task_id))
         {
             let edge = graph.add_edge(from, to, ());
             if petgraph::algo::is_cyclic_directed(&*graph) {
-                // Best-effort rollback of the edge; persistence still holds the dependency.
                 graph.remove_edge(edge);
                 return Err(TaskError::CycleDetected);
             }
@@ -630,7 +644,8 @@ where
 
     async fn load_all_tasks(&self) -> Result<Vec<Task>, TaskError> {
         let db_tasks = self.repo.list_all_tasks().await?;
-        self.load_tasks_into_memory(db_tasks).await
+        let db_deps = self.repo.list_dependencies().await?;
+        self.load_tasks_into_memory(db_tasks, db_deps).await
     }
 
     async fn update_task(&self, task: &Task) -> Result<(), TaskError> {
@@ -642,10 +657,18 @@ where
 }
 
 impl<R> TaskServiceImpl<R> {
-    async fn load_tasks_into_memory(&self, db_tasks: Vec<Task>) -> Result<Vec<Task>, TaskError> {
+    async fn load_tasks_into_memory(
+        &self,
+        db_tasks: Vec<Task>,
+        db_deps: Vec<TaskDependency>,
+    ) -> Result<Vec<Task>, TaskError> {
         let mut tasks = self.tasks.write().await;
         let mut graph = self.graph.lock().await;
         let mut node_map = self.node_map.write().await;
+
+        graph.clear();
+        node_map.clear();
+        tasks.clear();
 
         for task in db_tasks {
             if !node_map.contains_key(&task.id) {
@@ -653,6 +676,26 @@ impl<R> TaskServiceImpl<R> {
                 node_map.insert(task.id.clone(), idx);
             }
             tasks.insert(task.id.clone(), task);
+        }
+
+        for dep in db_deps {
+            let Some(&from) = node_map.get(&dep.depends_on) else {
+                return Err(TaskError::Internal(format!(
+                    "dependency parent task is missing: {}",
+                    dep.depends_on
+                )));
+            };
+            let Some(&to) = node_map.get(&dep.task_id) else {
+                return Err(TaskError::Internal(format!(
+                    "dependency child task is missing: {}",
+                    dep.task_id
+                )));
+            };
+            let edge = graph.add_edge(from, to, ());
+            if petgraph::algo::is_cyclic_directed(&*graph) {
+                graph.remove_edge(edge);
+                return Err(TaskError::CycleDetected);
+            }
         }
         Ok(tasks.values().cloned().collect())
     }
@@ -737,6 +780,10 @@ mod tests {
         async fn add_dependency(&self, dep: &TaskDependency) -> Result<(), PersistenceError> {
             self.deps.lock().unwrap().push(dep.clone());
             Ok(())
+        }
+
+        async fn list_dependencies(&self) -> Result<Vec<TaskDependency>, PersistenceError> {
+            Ok(self.deps.lock().unwrap().clone())
         }
     }
 
@@ -997,6 +1044,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_task_can_be_held_in_backlog_for_human_approval() {
+        let (svc, _bus) = service();
+        let task = svc.submit(request()).await.unwrap();
+
+        let updated = svc.set_status(&task.id, TaskStatus::Backlog).await.unwrap();
+
+        assert_eq!(updated.status, TaskStatus::Backlog);
+    }
+
+    #[tokio::test]
     async fn set_result_marks_completed() {
         let (svc, _bus) = service();
         let task = svc.submit(request()).await.unwrap();
@@ -1065,6 +1122,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cycle_dependency_is_not_persisted() {
+        let repo = Arc::new(MockRepo::default());
+        let svc = TaskServiceImpl::new(
+            repo.clone(),
+            Arc::new(MockEventService::default()),
+            Arc::new(MockAuditService::default()),
+        );
+        let a = svc.submit(request()).await.unwrap();
+        let mut b_req = request();
+        b_req.title = "b".into();
+        let b = svc.submit(b_req).await.unwrap();
+
+        svc.add_dependency(TaskDependency {
+            task_id: b.id.clone(),
+            depends_on: a.id.clone(),
+            dep_type: "blocks".into(),
+        })
+        .await
+        .unwrap();
+        let err = svc
+            .add_dependency(TaskDependency {
+                task_id: a.id.clone(),
+                depends_on: b.id.clone(),
+                dep_type: "blocks".into(),
+            })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, TaskError::CycleDetected));
+        let persisted = repo.list_dependencies().await.unwrap();
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].task_id, b.id);
+        assert_eq!(persisted[0].depends_on, a.id);
+    }
+
+    #[tokio::test]
     async fn load_all_tasks_populates_in_memory_graph() {
         let repo = Arc::new(MockRepo::default());
         let preloaded = sample_task("pre-1", "proj-1", TaskStatus::Pending, None);
@@ -1079,6 +1172,35 @@ mod tests {
 
         assert_eq!(loaded.len(), 1);
         assert!(svc.get("pre-1").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn load_all_tasks_restores_dependency_edges_for_ready_tasks() {
+        let repo = Arc::new(MockRepo::default());
+        repo.insert_task(&sample_task("parent", "proj-1", TaskStatus::Pending, None))
+            .await
+            .unwrap();
+        repo.insert_task(&sample_task("child", "proj-1", TaskStatus::Pending, None))
+            .await
+            .unwrap();
+        repo.add_dependency(&TaskDependency {
+            task_id: "child".into(),
+            depends_on: "parent".into(),
+            dep_type: "blocks".into(),
+        })
+        .await
+        .unwrap();
+
+        let svc = TaskServiceImpl::new(
+            repo,
+            Arc::new(MockEventService::default()),
+            Arc::new(MockAuditService::default()),
+        );
+        svc.load_all_tasks().await.unwrap();
+
+        let ready = svc.list_ready().await.unwrap();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].id, "parent");
     }
 
     #[test]

@@ -224,7 +224,10 @@ pub struct SearchSparse {
 }
 
 impl SearchSparse {
-    pub fn new(sparse_embedder: Arc<dyn SparseEmbedder>, vector_store: Arc<dyn VectorStore>) -> Self {
+    pub fn new(
+        sparse_embedder: Arc<dyn SparseEmbedder>,
+        vector_store: Arc<dyn VectorStore>,
+    ) -> Self {
         Self {
             sparse_embedder,
             vector_store,
@@ -340,7 +343,7 @@ fn is_ignored(path: &std::path::Path, project_root: &std::path::Path) -> bool {
 mod tests {
     use super::*;
     use crytex_core::services::{
-        Embedder, EmbeddingError, MockSparseEmbedder, SearchOptions, SparseVector, SparseEmbedder,
+        Embedder, EmbeddingError, MockSparseEmbedder, SearchOptions, SparseEmbedder, SparseVector,
         SparseVectorPoint, VectorPoint, VectorStoreError,
     };
     use std::collections::HashMap;
@@ -576,7 +579,10 @@ mod tests {
             .embed_document("pub fn fetch url")
             .await
             .unwrap();
-        let sparse_main = sparse_embedder.embed_document("fn main hello").await.unwrap();
+        let sparse_main = sparse_embedder
+            .embed_document("fn main hello")
+            .await
+            .unwrap();
         {
             let mut cols = vector_store.sparse_collections.lock().unwrap();
             cols.insert(

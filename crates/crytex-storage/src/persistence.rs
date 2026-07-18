@@ -91,6 +91,10 @@ impl TaskRepository for Storage {
     async fn add_dependency(&self, dep: &TaskDependency) -> Result<(), PersistenceError> {
         self.graph.add_dependency(dep).await.map_err(map_error)
     }
+
+    async fn list_dependencies(&self) -> Result<Vec<TaskDependency>, PersistenceError> {
+        self.graph.list_dependencies().await.map_err(map_error)
+    }
 }
 
 #[async_trait]

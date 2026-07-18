@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
-use crate::{BackendInfo, InferenceManager};
+use crate::{BackendCapabilityReport, BackendInfo, InferenceManager};
 
 /// Errors returned by [`BackendRegistry`].
 #[derive(Debug, Error)]
@@ -67,6 +67,14 @@ impl BackendRegistry {
         self.backends
             .values()
             .flat_map(|b| b.available_backends())
+            .collect()
+    }
+
+    /// Lists typed capability reports for all registered backends.
+    pub fn capability_reports(&self) -> Vec<BackendCapabilityReport> {
+        self.list()
+            .into_iter()
+            .map(|backend| backend.capability_report())
             .collect()
     }
 
@@ -171,5 +179,20 @@ mod tests {
         let mut registry = BackendRegistry::new("a");
         registry.register("a", dummy("a"));
         assert!(registry.set_default("unknown").is_err());
+    }
+
+    #[test]
+    fn capability_reports_reflect_registered_backend_capabilities() {
+        let mut registry = BackendRegistry::new("a");
+        registry.register("a", dummy("a"));
+
+        let reports = registry.capability_reports();
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].id, "a");
+        assert!(reports[0].generate);
+        assert!(!reports[0].embed);
+        assert!(!reports[0].lora);
+        assert!(!reports[0].hot_swap);
     }
 }

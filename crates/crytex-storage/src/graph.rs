@@ -513,7 +513,17 @@ CREATE INDEX IF NOT EXISTS idx_ab_test_challenger ON ab_test_reports(challenger_
                     ],
                 )?;
             }
-            TaskStatus::Backlog | TaskStatus::Pending | TaskStatus::Review => {
+            TaskStatus::Review => {
+                conn.execute(
+                    "UPDATE tasks SET status = ?1, started_at = NULL, finished_at = NULL, result = ?2 WHERE id = ?3",
+                    [
+                        status.as_str(),
+                        &result.map(|v| v.to_string()).unwrap_or_default(),
+                        id,
+                    ],
+                )?;
+            }
+            TaskStatus::Backlog | TaskStatus::Pending => {
                 conn.execute(
                     "UPDATE tasks SET status = ?1, started_at = NULL, finished_at = NULL, result = NULL WHERE id = ?2",
                     [status.as_str(), id],
@@ -594,6 +604,26 @@ CREATE INDEX IF NOT EXISTS idx_ab_test_challenger ON ab_test_reports(challenger_
         Ok(())
     }
 
+    pub async fn list_dependencies(&self) -> Result<Vec<TaskDependency>, Error> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT task_id, depends_on, dep_type
+             FROM task_dependencies",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(TaskDependency {
+                task_id: row.get(0)?,
+                depends_on: row.get(1)?,
+                dep_type: row.get(2)?,
+            })
+        })?;
+        let mut deps = Vec::new();
+        for dep in rows {
+            deps.push(dep?);
+        }
+        Ok(deps)
+    }
+
     pub async fn insert_artifact(&self, artifact: &Artifact) -> Result<(), Error> {
         let conn = self.conn.lock().await;
         conn.execute(
@@ -632,15 +662,15 @@ CREATE INDEX IF NOT EXISTS idx_ab_test_challenger ON ab_test_reports(challenger_
                 agent_role = excluded.agent_role",
             rusqlite::params![
                 &lora.id,
-                lora.project_id.as_deref().unwrap_or(""),
+                lora.project_id.as_deref(),
                 &lora.name,
                 &lora.file_path,
                 &lora.base_model,
-                lora.task_kind.as_deref().unwrap_or(""),
+                lora.task_kind.as_deref(),
                 lora.metrics.to_string(),
                 lora.created_at,
                 if lora.active { 1 } else { 0 },
-                lora.agent_role.as_deref().unwrap_or(""),
+                lora.agent_role.as_deref(),
             ],
         )?;
         Ok(())
@@ -726,14 +756,14 @@ CREATE INDEX IF NOT EXISTS idx_ab_test_challenger ON ab_test_reports(challenger_
             "INSERT INTO agent_log (id, project_id, task_id, agent, action, message, level, timestamp, metadata)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             [
-                &log.id,
-                &log.project_id.as_ref().map(|s| s.as_str().to_string()).unwrap_or_default(),
-                &log.task_id.as_ref().map(|s| s.as_str().to_string()).unwrap_or_default(),
+                &log.id as &dyn rusqlite::ToSql,
+                &log.project_id.as_deref(),
+                &log.task_id.as_deref(),
                 &log.agent,
                 &log.action,
-                &log.message.as_ref().map(|s| s.as_str().to_string()).unwrap_or_default(),
+                &log.message.as_deref(),
                 &log.level,
-                &log.timestamp.to_string(),
+                &log.timestamp,
                 &log.metadata.to_string(),
             ],
         )?;
@@ -1152,9 +1182,9 @@ CREATE INDEX IF NOT EXISTS idx_ab_test_challenger ON ab_test_reports(challenger_
                 job.status.as_str(),
                 job.started_at,
                 job.finished_at,
-                job.adapter_id.as_deref().unwrap_or(""),
+                job.adapter_id.as_deref(),
                 job.metrics.to_string(),
-                job.error_message.as_deref().unwrap_or(""),
+                job.error_message.as_deref(),
             ],
         )?;
         Ok(())
@@ -1625,6 +1655,40 @@ mod tests {
         let fetched = store.get_task("task-1").await.unwrap();
         assert!(fetched.is_some());
         assert_eq!(fetched.unwrap().title, "Test");
+    }
+
+    #[tokio::test]
+    async fn project_level_agent_log_preserves_null_task_id() {
+        let store = GraphStore::new(":memory:").await.unwrap();
+        let project = Project {
+            id: "proj-1".to_string(),
+            name: "Test Project".to_string(),
+            root_path: "/tmp/test".to_string(),
+            created_at: Utc::now().timestamp(),
+            updated_at: Utc::now().timestamp(),
+            metadata: serde_json::Value::Null,
+        };
+        store.insert_project(&project).await.unwrap();
+
+        store
+            .insert_agent_log(&AgentLog {
+                id: "log-1".to_string(),
+                project_id: Some("proj-1".to_string()),
+                task_id: None,
+                agent: "runner".to_string(),
+                action: "run_started".to_string(),
+                message: None,
+                level: "info".to_string(),
+                timestamp: Utc::now().timestamp_millis(),
+                metadata: serde_json::json!({ "trace_id": "trace-run" }),
+            })
+            .await
+            .unwrap();
+
+        let logs = store.list_logs_by_project("proj-1").await.unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].action, "run_started");
+        assert_eq!(logs[0].task_id, None);
     }
 
     #[tokio::test]

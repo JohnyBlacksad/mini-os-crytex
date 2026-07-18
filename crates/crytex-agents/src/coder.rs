@@ -1,5 +1,6 @@
 use crate::{
     extract_backend_id, extract_model,
+    json::parse_llm_json_value,
     prompts::{coder_system_prompt, coder_user_prompt, system_prompt_override},
     tooling::ToolingEngine,
 };
@@ -135,32 +136,19 @@ impl ToolService for ToolRecorder {
 /// a best-effort fallback is built from the recorded tool calls.
 fn parse_coder_output(content: &str, calls: &[(String, Value)]) -> Result<Value, AgentError> {
     let trimmed = content.trim();
-    let mut value: Value = serde_json::from_str(trimmed)
-        .or_else(|_| {
-            // Try stripping a markdown JSON fence.
-            let inner = trimmed
-                .strip_prefix("```json")
-                .and_then(|s| s.strip_suffix("```"))
-                .or_else(|| {
-                    trimmed
-                        .strip_prefix("```")
-                        .and_then(|s| s.strip_suffix("```"))
-                })
-                .unwrap_or(trimmed)
-                .trim();
-            serde_json::from_str(inner)
+    let mut value = parse_llm_json_value(trimmed).unwrap_or_else(|_| {
+        serde_json::json!({
+            "files_changed": infer_files_changed(calls),
+            "test_results": null,
+            "summary": trimmed,
         })
-        .unwrap_or_else(|_| {
-            serde_json::json!({
-                "files_changed": infer_files_changed(calls),
-                "test_results": null,
-                "summary": trimmed,
-            })
-        });
+    });
 
     if value.get("files_changed").is_none() {
         value["files_changed"] = serde_json::to_value(infer_files_changed(calls))
             .map_err(|e| AgentError::Execution(e.to_string()))?;
+    } else {
+        merge_recorded_writes(&mut value["files_changed"], infer_files_changed(calls));
     }
 
     if value.get("test_results").is_none() {
@@ -191,6 +179,21 @@ fn infer_files_changed(calls: &[(String, Value)]) -> Vec<Value> {
             }
         })
         .collect()
+}
+
+fn merge_recorded_writes(files_changed: &mut Value, recorded_writes: Vec<Value>) {
+    let Some(files) = files_changed.as_array_mut() else {
+        *files_changed = Value::Array(recorded_writes);
+        return;
+    };
+
+    for write in recorded_writes {
+        let path = write.get("path");
+        let already_recorded = files.iter().any(|file| file.get("path") == path);
+        if !already_recorded {
+            files.push(write);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -433,5 +436,19 @@ mod tests {
         let result = parse_coder_output("plain prose", &calls).unwrap();
         assert_eq!(result["files_changed"][0]["path"], "b.rs");
         assert_eq!(result["summary"].as_str().unwrap(), "plain prose");
+    }
+
+    #[test]
+    fn parse_coder_output_merges_recorded_writes_when_model_returns_empty_files_changed() {
+        let calls = vec![(
+            "fs_write".to_string(),
+            serde_json::json!({"path": "crytex-smoke.txt", "content": "ok"}),
+        )];
+        let content = r#"{"files_changed":[],"test_results":null,"summary":"ok"}"#;
+
+        let result = parse_coder_output(content, &calls).unwrap();
+
+        assert_eq!(result["files_changed"][0]["path"], "crytex-smoke.txt");
+        assert_eq!(result["files_changed"][0]["action"], "created");
     }
 }

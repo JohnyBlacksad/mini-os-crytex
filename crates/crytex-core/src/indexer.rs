@@ -3,7 +3,12 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use crytex_doc::{Chunk, ChunkKind, chunk_code, parse_doc, walk_project};
+use crytex_doc::{
+    Chunk, ChunkKind, chunk_code,
+    chunking::chunk_code_with_graph,
+    graph::{CodeGraph, builder::CodeGraphBuilder},
+    parse_doc, walk_project,
+};
 
 use crate::services::{
     Embedder, EmbeddingError, SearchOptions, SparseEmbedder, SparseVectorPoint, VectorPoint,
@@ -42,10 +47,7 @@ impl ProjectIndexer {
 
     /// Attach a sparse embedder (e.g. BM25) so that chunks are also indexed as
     /// sparse vectors when the store supports them.
-    pub fn with_sparse_embedder(
-        mut self,
-        sparse_embedder: Arc<dyn SparseEmbedder>,
-    ) -> Self {
+    pub fn with_sparse_embedder(mut self, sparse_embedder: Arc<dyn SparseEmbedder>) -> Self {
         self.sparse_embedder = Some(sparse_embedder);
         self
     }
@@ -58,18 +60,22 @@ impl ProjectIndexer {
     ) -> Result<IndexStats, IndexerError> {
         let mut stats = IndexStats::default();
         let files = walk_project(project_root).map_err(|e| IndexerError::Chunk(e.to_string()))?;
+        let code_graph = CodeGraphBuilder::new()
+            .index_project(project_root)
+            .map_err(|e| IndexerError::Chunk(e.to_string()))?;
 
         for path in files {
             let relative = Path::new(&path)
                 .strip_prefix(project_root)
                 .unwrap_or(Path::new(&path))
                 .to_string_lossy()
-                .to_string();
+                .to_string()
+                .replace('\\', "/");
             let Ok(source) = tokio::fs::read_to_string(&path).await else {
                 continue;
             };
 
-            let chunks = self.chunk_file(&path, &relative, &source)?;
+            let chunks = self.chunk_file(&path, &relative, &source, Some(&code_graph))?;
             if chunks.is_empty() {
                 continue;
             }
@@ -102,10 +108,15 @@ impl ProjectIndexer {
     ) -> Result<IndexStats, IndexerError> {
         let full_path = project_root.join(relative_path);
         let source = tokio::fs::read_to_string(&full_path).await?;
+        let code_graph = CodeGraphBuilder::new()
+            .index_project(project_root)
+            .map_err(|e| IndexerError::Chunk(e.to_string()))?;
+        let normalized_relative_path = relative_path.replace('\\', "/");
         let chunks = self.chunk_file(
             full_path.to_string_lossy().as_ref(),
-            relative_path,
+            &normalized_relative_path,
             &source,
+            Some(&code_graph),
         )?;
         if chunks.is_empty() {
             self.remove_file(project_id, relative_path).await?;
@@ -118,8 +129,9 @@ impl ProjectIndexer {
             "doc_chunks"
         };
 
-        self.remove_file(project_id, relative_path).await?;
-        self.upsert_chunks(project_id, relative_path, collection, chunks)
+        self.remove_file(project_id, &normalized_relative_path)
+            .await?;
+        self.upsert_chunks(project_id, &normalized_relative_path, collection, chunks)
             .await?;
 
         Ok(IndexStats {
@@ -140,9 +152,14 @@ impl ProjectIndexer {
             "relative_path": {"match": {"value": relative_path}}
         });
         for collection in ["code_chunks", "doc_chunks"] {
-            self.vector_store
+            match self
+                .vector_store
                 .delete_by_filter(collection, filter.clone())
-                .await?;
+                .await
+            {
+                Ok(()) | Err(VectorStoreError::Collection(_)) => {}
+                Err(error) => return Err(error.into()),
+            }
         }
         Ok(())
     }
@@ -152,6 +169,7 @@ impl ProjectIndexer {
         full_path: &str,
         relative_path: &str,
         source: &str,
+        code_graph: Option<&CodeGraph>,
     ) -> Result<Vec<Chunk>, IndexerError> {
         let ext = Path::new(full_path)
             .extension()
@@ -163,7 +181,12 @@ impl ProjectIndexer {
         let doc_exts = ["md", "html", "htm"];
 
         if code_exts.contains(&ext) {
-            chunk_code(relative_path, source).map_err(|e| IndexerError::Chunk(e.to_string()))
+            match code_graph {
+                Some(graph) => chunk_code_with_graph(relative_path, source, graph)
+                    .map_err(|e| IndexerError::Chunk(e.to_string())),
+                None => chunk_code(relative_path, source)
+                    .map_err(|e| IndexerError::Chunk(e.to_string())),
+            }
         } else if doc_exts.contains(&ext) {
             Ok(parse_doc(relative_path, source))
         } else {
@@ -183,7 +206,6 @@ impl ProjectIndexer {
         }
 
         let dim = self.embedder.dimension().await?;
-        self.vector_store.create_collection(collection, dim).await?;
 
         // Always embed dense vectors first; they are the fallback if the store
         // does not support sparse vectors.
@@ -211,7 +233,11 @@ impl ProjectIndexer {
                         });
                     }
 
-                    match self.vector_store.upsert_with_sparse(collection, sparse_points).await {
+                    match self
+                        .vector_store
+                        .upsert_with_sparse(collection, sparse_points)
+                        .await
+                    {
                         Ok(()) => return Ok(()),
                         Err(VectorStoreError::Unsupported(_)) => {
                             // Fall through to dense-only upsert.
@@ -226,6 +252,7 @@ impl ProjectIndexer {
             }
         }
 
+        self.vector_store.create_collection(collection, dim).await?;
         let points = dense_points
             .into_iter()
             .map(|(chunk, vector)| VectorPoint {
@@ -249,6 +276,12 @@ impl ProjectIndexer {
             "text": chunk.text,
             "start_line": chunk.start_line,
             "end_line": chunk.end_line,
+            "symbol_id": chunk.symbol_id.as_ref().map(|id| id.as_str()),
+            "related_symbols": chunk
+                .related_symbols
+                .iter()
+                .map(|id| id.as_str())
+                .collect::<Vec<_>>(),
         })
     }
 }
@@ -310,8 +343,8 @@ pub async fn search_chunks(
 mod tests {
     use super::*;
     use crate::services::{
-        MockEmbedder, MockSparseEmbedder, SearchResult, SparseVector, SparseVectorPoint, VectorPoint,
-        VectorStoreError,
+        MockEmbedder, MockSparseEmbedder, SearchResult, SparseVector, SparseVectorPoint,
+        VectorPoint, VectorStoreError,
     };
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -427,9 +460,8 @@ mod tests {
             let mut results: Vec<SearchResult> = points
                 .iter()
                 .filter(|p| {
-                    project_filter.is_none_or(|expected| {
-                        payload_matches_project(&p.payload, expected)
-                    })
+                    project_filter
+                        .is_none_or(|expected| payload_matches_project(&p.payload, expected))
                 })
                 .map(|p| SearchResult {
                     id: p.id.clone(),
@@ -491,9 +523,8 @@ mod tests {
             let mut results: Vec<SearchResult> = points
                 .iter()
                 .filter(|p| {
-                    project_filter.is_none_or(|expected| {
-                        payload_matches_project(&p.payload, expected)
-                    })
+                    project_filter
+                        .is_none_or(|expected| payload_matches_project(&p.payload, expected))
                 })
                 .map(|p| SearchResult {
                     id: p.id.clone(),
@@ -511,6 +542,18 @@ mod tests {
             collection: &str,
             filter: serde_json::Value,
         ) -> Result<(), VectorStoreError> {
+            let dense_exists = self.collections.lock().unwrap().contains_key(collection);
+            let sparse_exists = self
+                .sparse_collections
+                .lock()
+                .unwrap()
+                .contains_key(collection);
+            if !dense_exists && !sparse_exists {
+                return Err(VectorStoreError::Collection(format!(
+                    "collection {collection} does not exist"
+                )));
+            }
+
             {
                 let mut cols = self.collections.lock().unwrap();
                 if let Some(points) = cols.get_mut(collection) {
@@ -598,6 +641,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn indexer_persists_graph_symbol_metadata_for_code_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::write(
+            root.join("lib.rs"),
+            "fn helper() -> i32 { 1 }\nfn caller() -> i32 { helper() }\n",
+        )
+        .unwrap();
+
+        let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::new(8));
+        let vector_store: Arc<dyn VectorStore> = Arc::new(TestVectorStore::default());
+        let indexer = ProjectIndexer::new(embedder, vector_store.clone());
+        indexer.index("proj-graph", root).await.unwrap();
+
+        let results = vector_store
+            .search(
+                "code_chunks",
+                &[1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                SearchOptions {
+                    limit: 10,
+                    filter: Some(
+                        serde_json::json!({"project_id": {"match": {"value": "proj-graph"}}}),
+                    ),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let helper = results
+            .iter()
+            .find(|result| {
+                result
+                    .payload
+                    .get("text")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|text| text.contains("fn helper"))
+            })
+            .expect("helper chunk should be indexed");
+
+        assert!(
+            helper
+                .payload
+                .get("symbol_id")
+                .and_then(|value| value.as_str())
+                .is_some(),
+            "code chunk payload should include graph symbol_id: {}",
+            helper.payload
+        );
+        assert!(
+            helper
+                .payload
+                .get("related_symbols")
+                .and_then(|value| value.as_array())
+                .is_some_and(|symbols| !symbols.is_empty()),
+            "code chunk payload should include related_symbols from the code graph: {}",
+            helper.payload
+        );
+    }
+
+    #[tokio::test]
     async fn semantic_search_finds_function_by_description() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -666,11 +771,7 @@ mod tests {
     async fn index_file_indexes_single_file() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        std::fs::write(
-            root.join("lib.rs"),
-            "fn indexed_function() -> i32 { 42 }\n",
-        )
-        .unwrap();
+        std::fs::write(root.join("lib.rs"), "fn indexed_function() -> i32 { 42 }\n").unwrap();
 
         let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::new(16));
         let vector_store: Arc<dyn VectorStore> = Arc::new(TestVectorStore::default());
@@ -691,6 +792,39 @@ mod tests {
         assert!(!results.is_empty());
         let text = results[0].payload.get("text").unwrap().as_str().unwrap();
         assert!(text.contains("indexed_function"));
+    }
+
+    #[tokio::test]
+    async fn index_file_ignores_missing_collection_during_stale_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("main.rs"),
+            "fn first_file_after_empty_index() {}\n",
+        )
+        .unwrap();
+
+        let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::new(16));
+        let vector_store: Arc<dyn VectorStore> = Arc::new(TestVectorStore::default());
+        let indexer = ProjectIndexer::new(embedder.clone(), vector_store.clone());
+
+        indexer
+            .index_file("proj-1", root, "main.rs")
+            .await
+            .expect("first single-file index should tolerate absent collections");
+
+        let results = search_chunks(
+            vector_store.as_ref(),
+            "code_chunks",
+            embedder.as_ref(),
+            "proj-1",
+            "first_file_after_empty_index",
+            5,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results.len(), 1);
     }
 
     #[tokio::test]
@@ -734,7 +868,9 @@ mod tests {
         indexer.index_file("proj-1", root, "main.rs").await.unwrap();
 
         let cols = test_store.collections.lock().unwrap();
-        let code = cols.get("code_chunks").expect("code_chunks collection missing");
+        let code = cols
+            .get("code_chunks")
+            .expect("code_chunks collection missing");
         assert_eq!(code.len(), 1, "only the new chunk should remain");
         let text = code[0].payload.get("text").unwrap().as_str().unwrap();
         assert!(text.contains("new_func"));

@@ -575,7 +575,10 @@ mod tests {
             .await
             .unwrap();
         cached
-            .delete_by_filter("col", serde_json::json!({"project_id": {"match": {"value": "p1"}}}))
+            .delete_by_filter(
+                "col",
+                serde_json::json!({"project_id": {"match": {"value": "p1"}}}),
+            )
             .await
             .unwrap();
         let after = cached

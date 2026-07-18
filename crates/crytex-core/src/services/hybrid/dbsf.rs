@@ -40,16 +40,17 @@ impl ScoreDistribution {
         }
 
         let mean = scores.iter().sum::<f64>() / scores.len() as f64;
-        let variance = scores
-            .iter()
-            .map(|s| (s - mean).powi(2))
-            .sum::<f64>()
-            / scores.len() as f64;
+        let variance = scores.iter().map(|s| (s - mean).powi(2)).sum::<f64>() / scores.len() as f64;
         let std = variance.sqrt();
         let min = scores.iter().copied().fold(f64::INFINITY, f64::min);
         let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
 
-        Self { mean, std, min, max }
+        Self {
+            mean,
+            std,
+            min,
+            max,
+        }
     }
 }
 

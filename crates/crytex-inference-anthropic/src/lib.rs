@@ -139,13 +139,13 @@ impl InferenceManager for AnthropicBackend {
     }
 
     async fn register_lora(&self, _lora: LoRAAdapter) -> Result<(), InferenceError> {
-        Err(InferenceError::LoRALoadFailed(
+        Err(InferenceError::UnsupportedOperation(
             "Anthropic does not support LoRA".to_string(),
         ))
     }
 
     async fn swap_lora(&self, _lora_id: &str) -> Result<(), InferenceError> {
-        Err(InferenceError::LoRALoadFailed(
+        Err(InferenceError::UnsupportedOperation(
             "Anthropic does not support LoRA".to_string(),
         ))
     }
@@ -267,15 +267,16 @@ mod tests {
         let backend = AnthropicBackend::new("http://localhost", "model", "key");
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
+            let err = backend
+                .register_lora(LoRAAdapter {
+                    id: "1".to_string(),
+                    path: "/tmp".to_string(),
+                    base_model: "base".to_string(),
+                })
+                .await
+                .unwrap_err();
             assert!(
-                backend
-                    .register_lora(LoRAAdapter {
-                        id: "1".to_string(),
-                        path: "/tmp".to_string(),
-                        base_model: "base".to_string(),
-                    })
-                    .await
-                    .is_err()
+                matches!(err, InferenceError::UnsupportedOperation(message) if message.contains("Anthropic"))
             );
         });
     }

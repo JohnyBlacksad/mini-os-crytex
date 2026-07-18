@@ -14,6 +14,7 @@ use crytex_core::services::vector_store::{
     SearchOptions, SearchResult, SparseVector, SparseVectorPoint, VectorPoint, VectorStore,
     VectorStoreError,
 };
+use qdrant_edge::external::ordered_float::OrderedFloat;
 use qdrant_edge::{
     Condition, Distance, EdgeConfigBuilder, EdgeShard, EdgeSparseVectorParamsBuilder,
     EdgeVectorParamsBuilder, FieldCondition, Filter, JsonPath, Match, MatchValue, Modifier,
@@ -21,7 +22,6 @@ use qdrant_edge::{
     QueryRequest, ScoringQuery, ValueVariants, Vector, VectorInternal, Vectors,
     WithPayloadInterface, WithVector,
 };
-use qdrant_edge::external::ordered_float::OrderedFloat;
 use serde_json::Value;
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -58,10 +58,9 @@ impl EdgeVectorStore {
 
     async fn get_shard(&self, collection: &str) -> Result<Arc<EdgeShard>, VectorStoreError> {
         let shards = self.shards.read().await;
-        shards
-            .get(collection)
-            .cloned()
-            .ok_or_else(|| VectorStoreError::Collection(format!("collection {collection} does not exist")))
+        shards.get(collection).cloned().ok_or_else(|| {
+            VectorStoreError::Collection(format!("collection {collection} does not exist"))
+        })
     }
 }
 
@@ -194,7 +193,9 @@ impl VectorStore for EdgeVectorStore {
                 PointOperations::UpsertPoints(PointInsertOperations::from(persisted)),
             );
 
-            shard.update(operation).map_err(|e| VectorStoreError::Upsert(e.to_string()))
+            shard
+                .update(operation)
+                .map_err(|e| VectorStoreError::Upsert(e.to_string()))
         })
         .await
         .map_err(|e| VectorStoreError::Upsert(format!("upsert task panicked: {e}")))?
@@ -212,10 +213,14 @@ impl VectorStore for EdgeVectorStore {
                 .into_iter()
                 .map(|p| -> Result<PointStruct, VectorStoreError> {
                     let payload = payload_with_original_id(p.payload, &p.id)?;
-                    let sparse = Vector::new_sparse(p.sparse_vector.indices, p.sparse_vector.values)
-                        .map_err(|e| VectorStoreError::Upsert(e.to_string()))?;
+                    let sparse =
+                        Vector::new_sparse(p.sparse_vector.indices, p.sparse_vector.values)
+                            .map_err(|e| VectorStoreError::Upsert(e.to_string()))?;
                     let vectors = Vectors::new_named([
-                        (qdrant_edge::DEFAULT_VECTOR_NAME, Vector::new_dense(p.vector)),
+                        (
+                            qdrant_edge::DEFAULT_VECTOR_NAME,
+                            Vector::new_dense(p.vector),
+                        ),
                         ("bm25", sparse),
                     ]);
                     Ok(PointStruct::new(
@@ -284,7 +289,11 @@ impl VectorStore for EdgeVectorStore {
                         .and_then(|map| map.remove(ORIGINAL_ID_KEY))
                         .and_then(|v| v.as_str().map(String::from))
                         .unwrap_or_else(|| p.id.to_string());
-                    SearchResult { id, score: p.score, payload }
+                    SearchResult {
+                        id,
+                        score: p.score,
+                        payload,
+                    }
                 })
                 .collect())
         })
@@ -337,7 +346,11 @@ impl VectorStore for EdgeVectorStore {
                         .and_then(|map| map.remove(ORIGINAL_ID_KEY))
                         .and_then(|v| v.as_str().map(String::from))
                         .unwrap_or_else(|| p.id.to_string());
-                    SearchResult { id, score: p.score, payload }
+                    SearchResult {
+                        id,
+                        score: p.score,
+                        payload,
+                    }
                 })
                 .collect())
         })
@@ -368,16 +381,16 @@ impl VectorStore for EdgeVectorStore {
     }
 }
 
-fn payload_with_original_id(
-    payload: Value,
-    original_id: &str,
-) -> Result<Value, VectorStoreError> {
+fn payload_with_original_id(payload: Value, original_id: &str) -> Result<Value, VectorStoreError> {
     let Value::Object(mut map) = payload else {
         return Err(VectorStoreError::Upsert(format!(
             "payload must be a JSON object, got {payload}"
         )));
     };
-    map.insert(ORIGINAL_ID_KEY.to_string(), Value::String(original_id.to_string()));
+    map.insert(
+        ORIGINAL_ID_KEY.to_string(),
+        Value::String(original_id.to_string()),
+    );
     Ok(Value::Object(map))
 }
 
@@ -396,9 +409,9 @@ fn build_filter(filter: Option<&Value>) -> Result<Option<Filter>, VectorStoreErr
 
     let mut conditions = Vec::new();
     for (key, clause) in obj {
-        let match_clause = clause
-            .get("match")
-            .ok_or_else(|| VectorStoreError::Search(format!("unsupported filter clause for {key}")))?;
+        let match_clause = clause.get("match").ok_or_else(|| {
+            VectorStoreError::Search(format!("unsupported filter clause for {key}"))
+        })?;
         let value = match_clause.get("value").ok_or_else(|| {
             VectorStoreError::Search(format!("filter match for {key} missing value"))
         })?;
@@ -415,13 +428,12 @@ fn build_filter(filter: Option<&Value>) -> Result<Option<Filter>, VectorStoreErr
             _ => {
                 return Err(VectorStoreError::Search(format!(
                     "unsupported filter value type: {value}"
-                )))
+                )));
             }
         };
 
-        let json_path = JsonPath::try_from(key.as_str()).map_err(|()| {
-            VectorStoreError::Search(format!("invalid filter key {key}"))
-        })?;
+        let json_path = JsonPath::try_from(key.as_str())
+            .map_err(|()| VectorStoreError::Search(format!("invalid filter key {key}")))?;
         conditions.push(Condition::Field(FieldCondition::new_match(
             json_path,
             Match::Value(MatchValue { value: variant }),
@@ -438,7 +450,13 @@ fn build_filter(filter: Option<&Value>) -> Result<Option<Filter>, VectorStoreErr
 
 fn sanitize_collection_name(name: &str) -> String {
     name.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -538,7 +556,10 @@ mod tests {
         let store = EdgeVectorStore::new(dir.path()).unwrap();
 
         assert!(store.supports_sparse().await);
-        store.create_sparse_collection("code_chunks", 3).await.unwrap();
+        store
+            .create_sparse_collection("code_chunks", 3)
+            .await
+            .unwrap();
 
         // A sparse-only upsert should succeed after sparse collection creation.
         store
@@ -564,7 +585,10 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let store = EdgeVectorStore::new(dir.path()).unwrap();
-        store.create_sparse_collection("code_chunks", 3).await.unwrap();
+        store
+            .create_sparse_collection("code_chunks", 3)
+            .await
+            .unwrap();
 
         let bm25 = EdgeBm25::new(EdgeBm25Config::default()).unwrap();
 
@@ -585,7 +609,10 @@ mod tests {
                 payload: serde_json::json!({"text": text}),
             });
         }
-        store.upsert_with_sparse("code_chunks", points).await.unwrap();
+        store
+            .upsert_with_sparse("code_chunks", points)
+            .await
+            .unwrap();
 
         let query = bm25.embed_query("fox");
         let results = store
@@ -619,7 +646,10 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let store = EdgeVectorStore::new(dir.path()).unwrap();
-        store.create_sparse_collection("code_chunks", 3).await.unwrap();
+        store
+            .create_sparse_collection("code_chunks", 3)
+            .await
+            .unwrap();
 
         let bm25 = EdgeBm25::new(EdgeBm25Config::default()).unwrap();
         let docs = [
@@ -641,7 +671,10 @@ mod tests {
                 }
             })
             .collect();
-        store.upsert_with_sparse("code_chunks", points).await.unwrap();
+        store
+            .upsert_with_sparse("code_chunks", points)
+            .await
+            .unwrap();
 
         let query = bm25.embed_query("fetch");
         let results = store
@@ -671,14 +704,28 @@ mod tests {
 
         store.create_collection("temp", 2).await.unwrap();
         store
-            .upsert("temp", vec![point("1", vec![1.0, 0.0], Value::Object(serde_json::Map::new()))])
+            .upsert(
+                "temp",
+                vec![point(
+                    "1",
+                    vec![1.0, 0.0],
+                    Value::Object(serde_json::Map::new()),
+                )],
+            )
             .await
             .unwrap();
 
         store.delete_collection("temp").await.unwrap();
 
         let err = store
-            .upsert("temp", vec![point("1", vec![1.0, 0.0], Value::Object(serde_json::Map::new()))])
+            .upsert(
+                "temp",
+                vec![point(
+                    "1",
+                    vec![1.0, 0.0],
+                    Value::Object(serde_json::Map::new()),
+                )],
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, VectorStoreError::Collection(_)));
@@ -759,16 +806,18 @@ mod tests {
     #[tokio::test]
     async fn edge_hybrid_search_fuses_dense_and_sparse() {
         use crate::sparse_embedder::EdgeBm25SparseEmbedder;
-        use crytex_core::services::hybrid::{HybridRetriever, ReciprocalRankFusion};
         use crytex_core::services::MockEmbedder;
+        use crytex_core::services::hybrid::{HybridRetriever, ReciprocalRankFusion};
 
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(EdgeVectorStore::new(dir.path()).unwrap());
-        store.create_sparse_collection("code_chunks", 3).await.unwrap();
+        store
+            .create_sparse_collection("code_chunks", 3)
+            .await
+            .unwrap();
 
-        let sparse_embedder = Arc::new(
-            EdgeBm25SparseEmbedder::with_language(Some("english".into())).unwrap(),
-        );
+        let sparse_embedder =
+            Arc::new(EdgeBm25SparseEmbedder::with_language(Some("english".into())).unwrap());
         let embedder = Arc::new(MockEmbedder::new(3));
         let query = "bar";
         let query_vector = embedder.embed(query).await.unwrap();
@@ -794,7 +843,10 @@ mod tests {
                 payload: json!({"project_id": "proj-1", "text": "contains the bar keyword"}),
             },
         ];
-        store.upsert_with_sparse("code_chunks", points).await.unwrap();
+        store
+            .upsert_with_sparse("code_chunks", points)
+            .await
+            .unwrap();
 
         let fusion = Arc::new(ReciprocalRankFusion::default());
         let retriever = HybridRetriever::new(embedder, store, Some(sparse_embedder), fusion);
@@ -806,6 +858,9 @@ mod tests {
 
         let ids: Vec<_> = results.iter().map(|r| r.id.as_str()).collect();
         assert!(ids.contains(&"chunk-dense"), "dense match missing: {ids:?}");
-        assert!(ids.contains(&"chunk-sparse"), "sparse match missing: {ids:?}");
+        assert!(
+            ids.contains(&"chunk-sparse"),
+            "sparse match missing: {ids:?}"
+        );
     }
 }

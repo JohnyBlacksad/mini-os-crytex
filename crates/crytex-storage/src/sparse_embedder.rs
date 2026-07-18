@@ -20,8 +20,8 @@ pub struct EdgeBm25SparseEmbedder {
 impl EdgeBm25SparseEmbedder {
     /// Create an embedder from a raw qdrant-edge BM25 configuration.
     pub fn new(config: EdgeBm25Config) -> Result<Self, EmbeddingError> {
-        let bm25 = EdgeBm25::new(config)
-            .map_err(|e| EmbeddingError::EmbeddingFailed(e.to_string()))?;
+        let bm25 =
+            EdgeBm25::new(config).map_err(|e| EmbeddingError::EmbeddingFailed(e.to_string()))?;
         Ok(Self {
             bm25: Arc::new(bm25),
         })

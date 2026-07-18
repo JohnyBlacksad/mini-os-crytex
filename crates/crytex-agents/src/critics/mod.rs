@@ -5,6 +5,7 @@ pub mod test;
 
 use crate::{
     extract_backend_id, extract_model,
+    json::parse_llm_json_value,
     prompts::{
         specialized_critic_system_prompt, specialized_critic_user_prompt, system_prompt_override,
     },
@@ -21,16 +22,7 @@ pub(crate) fn parse_critic_score(
     content: &str,
     usage: &TokenUsage,
 ) -> Result<Value, serde_json::Error> {
-    let trimmed = content.trim();
-    let cleaned = if let Some(inner) = trimmed.strip_prefix("```json") {
-        inner.trim().trim_end_matches("```").trim()
-    } else if let Some(inner) = trimmed.strip_prefix("```") {
-        inner.trim().trim_end_matches("```").trim()
-    } else {
-        trimmed
-    };
-
-    let mut value: Value = serde_json::from_str(cleaned)?;
+    let mut value = parse_llm_json_value(content)?;
 
     value["dimension"] = Value::String(dimension.to_string());
 

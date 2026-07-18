@@ -426,7 +426,9 @@ mod tests {
         let prompt = critic_system_prompt(&[], None);
         assert!(prompt.contains("Critic Agent"));
         assert!(prompt.contains("score"));
-        assert!(prompt.contains("approved"));
+        assert!(prompt.contains("review_decision"));
+        assert!(prompt.contains("target_task_id"));
+        assert!(prompt.contains("feedback"));
         assert!(prompt.contains("comments"));
     }
 

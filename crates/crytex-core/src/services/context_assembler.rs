@@ -15,8 +15,9 @@ use crytex_compress::token::{CharTokenEstimator, TokenEstimator};
 use thiserror::Error;
 
 use crate::services::{
-    build_fusion_strategy, Embedder, EmbeddingError, HybridRetriever, HybridSearchError,
-    MemoryBankError, MemoryBankService, SearchResult, SparseEmbedder, VectorStore, VectorStoreError,
+    Embedder, EmbeddingError, HybridRetriever, HybridSearchError, MemoryBankError,
+    MemoryBankService, RerankPassage, Reranker, RerankerError, SearchResult, SparseEmbedder,
+    VectorStore, VectorStoreError, build_fusion_strategy,
 };
 
 /// Errors produced while assembling context.
@@ -30,6 +31,8 @@ pub enum ContextAssemblerError {
     HybridSearch(#[from] HybridSearchError),
     #[error("memory bank failed: {0}")]
     MemoryBank(#[from] MemoryBankError),
+    #[error("reranker failed: {0}")]
+    Reranker(#[from] RerankerError),
     #[error("token estimation failed: {0}")]
     TokenEstimation(String),
     #[error("budget too small to fit mandatory messages")]
@@ -79,6 +82,7 @@ pub struct ContextAssembler {
     summarizer: Arc<dyn Summarizer>,
     memory_bank: Option<Arc<dyn MemoryBankService>>,
     hybrid_retriever: Arc<HybridRetriever>,
+    reranker: Option<Arc<dyn Reranker>>,
 }
 
 impl ContextAssembler {
@@ -110,6 +114,7 @@ impl ContextAssembler {
             summarizer,
             memory_bank: None,
             hybrid_retriever,
+            reranker: None,
         }
     }
 
@@ -123,6 +128,12 @@ impl ContextAssembler {
     /// Replace the hybrid retriever used for chunk retrieval.
     pub fn with_hybrid_retriever(mut self, hybrid_retriever: Arc<HybridRetriever>) -> Self {
         self.hybrid_retriever = hybrid_retriever;
+        self
+    }
+
+    /// Attach a second-stage reranker for retrieved chunks.
+    pub fn with_reranker(mut self, reranker: Arc<dyn Reranker>) -> Self {
+        self.reranker = Some(reranker);
         self
     }
 
@@ -220,7 +231,48 @@ impl ContextAssembler {
                 request.top_k,
             )
             .await?;
-        Ok(results)
+        self.rerank_results(&request.user_query, results).await
+    }
+
+    async fn rerank_results(
+        &self,
+        query: &str,
+        results: Vec<SearchResult>,
+    ) -> Result<Vec<SearchResult>, ContextAssemblerError> {
+        let Some(reranker) = &self.reranker else {
+            return Ok(results);
+        };
+        if results.len() < 2 {
+            return Ok(results);
+        }
+
+        let passages: Vec<RerankPassage> = results
+            .into_iter()
+            .map(|result| RerankPassage {
+                id: result.id,
+                text: result
+                    .payload
+                    .get("text")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                payload: Some(result.payload),
+            })
+            .collect();
+
+        let reranked = reranker.rerank(query, &passages).await?;
+        Ok(reranked
+            .into_iter()
+            .map(|result| SearchResult {
+                id: result.id,
+                score: result.score,
+                payload: result.payload.unwrap_or_else(|| {
+                    serde_json::json!({
+                        "text": result.text,
+                    })
+                }),
+            })
+            .collect())
     }
 
     async fn fit_to_budget(
@@ -363,9 +415,10 @@ mod tests {
     use super::*;
     use crate::models::MemoryEntry;
     use crate::services::{
+        MemoryBankError, MemoryBankService, MockEmbedder, MockSparseEmbedder, RerankPassage,
+        RerankResult, Reranker, RerankerError, SearchOptions, SparseVector, VectorPoint,
+        VectorStoreError,
         hybrid::{HybridRetriever, ReciprocalRankFusion},
-        MemoryBankError, MemoryBankService, MockEmbedder, MockSparseEmbedder, SearchOptions,
-        SparseVector, VectorPoint, VectorStoreError,
     };
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -682,6 +735,86 @@ mod tests {
 
         assert!(context.contains("dense match"));
         assert!(context.contains("sparse match"));
+    }
+
+    #[derive(Debug, Default)]
+    struct PreferSecondReranker;
+
+    #[async_trait::async_trait]
+    impl Reranker for PreferSecondReranker {
+        async fn rerank(
+            &self,
+            _query: &str,
+            passages: &[RerankPassage],
+        ) -> Result<Vec<RerankResult>, RerankerError> {
+            let mut results: Vec<RerankResult> = passages
+                .iter()
+                .map(|passage| RerankResult {
+                    id: passage.id.clone(),
+                    score: if passage.id == "second" { 10.0 } else { 1.0 },
+                    text: passage.text.clone(),
+                    payload: passage.payload.clone(),
+                })
+                .collect();
+            results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+            Ok(results)
+        }
+    }
+
+    #[tokio::test]
+    async fn assembler_uses_reranker_to_order_retrieved_context() {
+        let store = Arc::new(TestVectorStore::default());
+        store
+            .upsert(
+                "code_chunks",
+                vec![
+                    VectorPoint {
+                        id: "first".into(),
+                        vector: vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                        payload: serde_json::json!({
+                            "project_id": "proj-1",
+                            "source": "first.rs",
+                            "text": "first dense result",
+                        }),
+                    },
+                    VectorPoint {
+                        id: "second".into(),
+                        vector: vec![0.99, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                        payload: serde_json::json!({
+                            "project_id": "proj-1",
+                            "source": "second.rs",
+                            "text": "second reranked result",
+                        }),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        let assembler =
+            make_assembler_with_store(store).with_reranker(Arc::new(PreferSecondReranker));
+        let request = ContextRequest {
+            system_prompt: "You are a coder.".into(),
+            user_query: "query".into(),
+            project_id: Some("proj-1".into()),
+            token_budget: 200,
+            top_k: 2,
+            ..Default::default()
+        };
+
+        let messages = assembler.assemble(request).await.unwrap();
+        let context = messages
+            .iter()
+            .find(|message| message.content.starts_with("Relevant context:"))
+            .map(|message| message.content.as_str())
+            .expect("retrieved context should be present");
+
+        let second_pos = context.find("second reranked result").unwrap();
+        let first_pos = context.find("first dense result").unwrap();
+        assert!(
+            second_pos < first_pos,
+            "reranker should move the second result before the dense winner: {context}"
+        );
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 //! Collects approved tasks as golden examples and evolves per-domain LoRA adapters.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -18,9 +18,10 @@ use crate::persistence::{
     ExperienceRepository, LoraAdapterRepository, PersistenceError, PromptVersionRepository,
     TrainingExampleRepository, TrainingJobRepository,
 };
+use crate::services::LoraMetrics;
 use crate::services::{
     AgentRole, Embedder, EventService, InferenceService, LoraTrainer, LoraTrainingConfig,
-    LoraTrainingError, RewardService, TaskError, TaskService,
+    LoraTrainingError, LoraTrainingResult, RewardService, TaskError, TaskService,
     vector_store::{VectorPoint, VectorStore},
 };
 
@@ -44,6 +45,57 @@ pub enum LoraEvolutionError {
 }
 
 const LORA_ADAPTER_COLLECTION: &str = "lora_adapters";
+const DEFAULT_MAX_ADAPTER_BYTES: u64 = 512 * 1024 * 1024;
+const DEFAULT_MAX_TRAIN_VALIDATION_LOSS_GAP: f64 = 1.0;
+const MIN_EXAMPLE_TEXT_CHARS: usize = 4;
+
+/// Input passed to a benchmark gate before a freshly trained LoRA adapter is promoted.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LoraBenchmarkRequest {
+    pub task_kind: String,
+    pub agent_role: Option<String>,
+    pub baseline_adapter_id: Option<String>,
+    pub challenger_adapter_id: String,
+    pub challenger_adapter_path: PathBuf,
+    pub base_model: String,
+    pub challenger_metrics: serde_json::Value,
+    pub validation_reward: f64,
+}
+
+/// Promotion decision returned by a LoRA benchmark gate.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LoraBenchmarkDecision {
+    pub accepted: bool,
+    pub reason: String,
+    pub metadata: serde_json::Value,
+}
+
+impl LoraBenchmarkDecision {
+    pub fn accept(reason: impl Into<String>) -> Self {
+        Self {
+            accepted: true,
+            reason: reason.into(),
+            metadata: serde_json::Value::Null,
+        }
+    }
+
+    pub fn reject(reason: impl Into<String>) -> Self {
+        Self {
+            accepted: false,
+            reason: reason.into(),
+            metadata: serde_json::Value::Null,
+        }
+    }
+}
+
+/// Compares a newly trained LoRA adapter against the current baseline.
+#[async_trait]
+pub trait LoraBenchmarkGate: Send + Sync {
+    async fn evaluate(
+        &self,
+        request: LoraBenchmarkRequest,
+    ) -> Result<LoraBenchmarkDecision, LoraEvolutionError>;
+}
 
 /// Evolves LoRA adapters from human-approved task outcomes.
 #[async_trait]
@@ -103,6 +155,9 @@ pub struct LoraEvolutionServiceImpl {
     min_human_score: f64,
     experience_repo: Option<Arc<dyn ExperienceRepository>>,
     training_job_repo: Option<Arc<dyn TrainingJobRepository>>,
+    benchmark_gate: Option<Arc<dyn LoraBenchmarkGate>>,
+    max_adapter_bytes: u64,
+    max_train_validation_loss_gap: f64,
 }
 
 impl LoraEvolutionServiceImpl {
@@ -137,6 +192,9 @@ impl LoraEvolutionServiceImpl {
             min_human_score: 4.0,
             experience_repo: None,
             training_job_repo: None,
+            benchmark_gate: None,
+            max_adapter_bytes: DEFAULT_MAX_ADAPTER_BYTES,
+            max_train_validation_loss_gap: DEFAULT_MAX_TRAIN_VALIDATION_LOSS_GAP,
         }
     }
 
@@ -179,6 +237,24 @@ impl LoraEvolutionServiceImpl {
     /// Attach a training-job repository so train runs are tracked.
     pub fn with_training_job_repo(mut self, repo: Arc<dyn TrainingJobRepository>) -> Self {
         self.training_job_repo = Some(repo);
+        self
+    }
+
+    /// Attach a benchmark gate that must accept a new adapter before promotion.
+    pub fn with_benchmark_gate(mut self, gate: Arc<dyn LoraBenchmarkGate>) -> Self {
+        self.benchmark_gate = Some(gate);
+        self
+    }
+
+    /// Override the maximum accepted LoRA artifact size.
+    pub fn with_max_adapter_bytes(mut self, bytes: u64) -> Self {
+        self.max_adapter_bytes = bytes;
+        self
+    }
+
+    /// Override the maximum accepted validation-loss minus train-loss gap.
+    pub fn with_max_train_validation_loss_gap(mut self, gap: f64) -> Self {
+        self.max_train_validation_loss_gap = gap;
         self
     }
 
@@ -266,6 +342,145 @@ impl LoraEvolutionServiceImpl {
             .unwrap_or(0);
         format!("{task_kind}-v{}", max_version + 1)
     }
+
+    fn validate_training_examples(
+        &self,
+        examples: &[TrainingExample],
+        key: &str,
+    ) -> Result<(), LoraEvolutionError> {
+        if let Some(example) = examples.iter().find(|example| {
+            example.input_text.trim().chars().count() < MIN_EXAMPLE_TEXT_CHARS
+                || example.output_text.trim().chars().count() < MIN_EXAMPLE_TEXT_CHARS
+        }) {
+            return Err(LoraEvolutionError::ValidationFailed(
+                key.to_string(),
+                format!(
+                    "golden dataset contains low-information example {}",
+                    example.id
+                ),
+            ));
+        }
+
+        Ok(())
+    }
+
+    async fn validate_adapter_artifact(
+        &self,
+        result: &LoraTrainingResult,
+        key: &str,
+    ) -> Result<(), LoraEvolutionError> {
+        let metadata = Self::read_metadata(&result.adapter_path, key).await?;
+        if !metadata.is_dir() {
+            return Err(LoraEvolutionError::ValidationFailed(
+                key.to_string(),
+                format!(
+                    "adapter artifact must be a directory containing adapter_config.json and adapter_model.safetensors: {}",
+                    result.adapter_path.display()
+                ),
+            ));
+        }
+
+        let config_path = result.adapter_path.join("adapter_config.json");
+        let weights_path = result.adapter_path.join("adapter_model.safetensors");
+        let config = tokio::fs::read_to_string(&config_path).await.map_err(|e| {
+            LoraEvolutionError::ValidationFailed(
+                key.to_string(),
+                format!(
+                    "adapter_config.json is unreadable at {}: {e}",
+                    config_path.display()
+                ),
+            )
+        })?;
+        let config: serde_json::Value = serde_json::from_str(&config).map_err(|e| {
+            LoraEvolutionError::ValidationFailed(
+                key.to_string(),
+                format!(
+                    "adapter_config.json is not valid JSON at {}: {e}",
+                    config_path.display()
+                ),
+            )
+        })?;
+        if config
+            .get("peft_type")
+            .and_then(|value| value.as_str())
+            .is_none_or(|peft_type| !peft_type.eq_ignore_ascii_case("LORA"))
+        {
+            return Err(LoraEvolutionError::ValidationFailed(
+                key.to_string(),
+                "adapter_config.json must declare peft_type=LORA".to_string(),
+            ));
+        }
+
+        let weights_metadata = Self::read_metadata(&weights_path, key).await?;
+        if !weights_metadata.is_file() || weights_metadata.len() == 0 {
+            return Err(LoraEvolutionError::ValidationFailed(
+                key.to_string(),
+                format!(
+                    "adapter_model.safetensors must be a non-empty file at {}",
+                    weights_path.display()
+                ),
+            ));
+        }
+
+        let artifact_bytes = weights_metadata.len();
+        if artifact_bytes > self.max_adapter_bytes {
+            return Err(LoraEvolutionError::ValidationFailed(
+                key.to_string(),
+                format!(
+                    "adapter artifact is too large: {} bytes exceeds {} bytes",
+                    artifact_bytes, self.max_adapter_bytes
+                ),
+            ));
+        }
+
+        Ok(())
+    }
+
+    async fn read_metadata(
+        path: &Path,
+        key: &str,
+    ) -> Result<std::fs::Metadata, LoraEvolutionError> {
+        tokio::fs::metadata(path).await.map_err(|e| {
+            LoraEvolutionError::ValidationFailed(
+                key.to_string(),
+                format!(
+                    "adapter artifact metadata is unreadable at {}: {e}",
+                    path.display()
+                ),
+            )
+        })
+    }
+
+    async fn remove_adapter_artifact(path: &Path) {
+        match tokio::fs::metadata(path).await {
+            Ok(metadata) if metadata.is_dir() => {
+                let _ = tokio::fs::remove_dir_all(path).await;
+            }
+            Ok(_) => {
+                let _ = tokio::fs::remove_file(path).await;
+            }
+            Err(_) => {}
+        }
+    }
+
+    fn validate_overfit_gap(
+        &self,
+        metrics: &LoraMetrics,
+        key: &str,
+    ) -> Result<(), LoraEvolutionError> {
+        let gap = metrics.validation_loss - metrics.train_loss;
+        if gap > self.max_train_validation_loss_gap {
+            return Err(LoraEvolutionError::ValidationFailed(
+                key.to_string(),
+                format!(
+                    "overfit risk: validation/train loss gap {:.4} exceeds {:.4}",
+                    gap, self.max_train_validation_loss_gap
+                ),
+            ));
+        }
+
+        Ok(())
+    }
 }
 
 impl LoraEvolutionServiceImpl {
@@ -280,7 +495,12 @@ impl LoraEvolutionServiceImpl {
             .await?
             .ok_or_else(|| LoraEvolutionError::InvalidGoldenExample(task_id.to_string()))?;
 
-        if task.status != TaskStatus::Completed {
+        let valid_status = if counter {
+            matches!(task.status, TaskStatus::Completed | TaskStatus::Pending)
+        } else {
+            task.status == TaskStatus::Completed
+        };
+        if !valid_status {
             return Err(LoraEvolutionError::InvalidGoldenExample(task.id));
         }
 
@@ -356,6 +576,7 @@ impl LoraEvolutionServiceImpl {
         agent_role: Option<String>,
     ) -> Result<LoraAdapter, LoraEvolutionError> {
         examples.sort_by_key(|e| e.created_at);
+        self.validate_training_examples(&examples, key)?;
 
         let validation_count = ((examples.len() as f64
             * LoraTrainingConfig::default().validation_ratio)
@@ -409,6 +630,40 @@ impl LoraEvolutionServiceImpl {
                 return Err(LoraEvolutionError::Training(e));
             }
         };
+        if let Err(e) = self.validate_adapter_artifact(&result, key).await {
+            Self::remove_adapter_artifact(&result.adapter_path).await;
+            if let Some(repo) = &job_repo {
+                let job = TrainingJob {
+                    id: job_id.clone(),
+                    task_kind: key.to_string(),
+                    status: TrainingJobStatus::RolledBack,
+                    started_at: Utc::now().timestamp_millis(),
+                    finished_at: Some(Utc::now().timestamp_millis()),
+                    adapter_id: None,
+                    metrics: serde_json::to_value(&result.metrics).unwrap_or_default(),
+                    error_message: Some(e.to_string()),
+                };
+                let _ = repo.update_training_job(&job).await;
+            }
+            return Err(e);
+        }
+        if let Err(e) = self.validate_overfit_gap(&result.metrics, key) {
+            Self::remove_adapter_artifact(&result.adapter_path).await;
+            if let Some(repo) = &job_repo {
+                let job = TrainingJob {
+                    id: job_id.clone(),
+                    task_kind: key.to_string(),
+                    status: TrainingJobStatus::RolledBack,
+                    started_at: Utc::now().timestamp_millis(),
+                    finished_at: Some(Utc::now().timestamp_millis()),
+                    adapter_id: None,
+                    metrics: serde_json::to_value(&result.metrics).unwrap_or_default(),
+                    error_message: Some(e.to_string()),
+                };
+                let _ = repo.update_training_job(&job).await;
+            }
+            return Err(e);
+        }
 
         let validation_reward = validation_examples.iter().map(|e| e.reward).sum::<f64>()
             / validation_examples.len().max(1) as f64;
@@ -430,7 +685,7 @@ impl LoraEvolutionServiceImpl {
             };
 
             // Roll back the failed adapter artifact.
-            let _ = tokio::fs::remove_file(&result.adapter_path).await;
+            Self::remove_adapter_artifact(&result.adapter_path).await;
 
             if let Some(repo) = &job_repo {
                 let job = TrainingJob {
@@ -463,6 +718,77 @@ impl LoraEvolutionServiceImpl {
         };
         let adapter_id = self.next_adapter_id(key, &existing);
         let adapter_path = result.adapter_path.to_string_lossy().to_string();
+        let baseline_adapter_id = existing
+            .iter()
+            .find(|adapter| adapter.active)
+            .or_else(|| existing.first())
+            .map(|adapter| adapter.id.clone());
+        let mut metrics = serde_json::to_value(&result.metrics).unwrap_or_default();
+
+        if let Some(gate) = &self.benchmark_gate {
+            let decision = gate
+                .evaluate(LoraBenchmarkRequest {
+                    task_kind: key.to_string(),
+                    agent_role: agent_role.clone(),
+                    baseline_adapter_id,
+                    challenger_adapter_id: adapter_id.clone(),
+                    challenger_adapter_path: result.adapter_path.clone(),
+                    base_model: self.base_model.clone(),
+                    challenger_metrics: metrics.clone(),
+                    validation_reward,
+                })
+                .await?;
+            let gate_metadata = serde_json::json!({
+                "accepted": decision.accepted,
+                "reason": decision.reason.clone(),
+                "metadata": decision.metadata.clone(),
+            });
+            let mut benchmark_gate = gate_metadata.clone();
+            if let (Some(target), Some(source)) = (
+                benchmark_gate.as_object_mut(),
+                gate_metadata["metadata"].as_object(),
+            ) {
+                for (key, value) in source {
+                    target.insert(key.clone(), value.clone());
+                }
+            }
+            if let Some(metrics_object) = metrics.as_object_mut() {
+                metrics_object.insert("benchmark_gate".into(), benchmark_gate);
+            }
+
+            if !decision.accepted {
+                let reason = format!("benchmark gate rejected challenger: {}", decision.reason);
+                Self::remove_adapter_artifact(&result.adapter_path).await;
+
+                if let Some(repo) = &job_repo {
+                    let job = TrainingJob {
+                        id: job_id.clone(),
+                        task_kind: key.to_string(),
+                        status: TrainingJobStatus::RolledBack,
+                        started_at: Utc::now().timestamp_millis(),
+                        finished_at: Some(Utc::now().timestamp_millis()),
+                        adapter_id: None,
+                        metrics: metrics.clone(),
+                        error_message: Some(reason.clone()),
+                    };
+                    let _ = repo.update_training_job(&job).await;
+                }
+                self.publish_evolution_observed(
+                    "lora_evolution_rejected",
+                    key,
+                    &examples,
+                    &job_id,
+                    Some(&adapter_id),
+                    &metrics,
+                )
+                .await;
+
+                return Err(LoraEvolutionError::ValidationFailed(
+                    key.to_string(),
+                    reason,
+                ));
+            }
+        }
 
         let adapter = LoraAdapter {
             id: adapter_id.clone(),
@@ -472,11 +798,16 @@ impl LoraEvolutionServiceImpl {
             base_model: self.base_model.clone(),
             task_kind: Some(key.to_string()),
             agent_role: agent_role.clone(),
-            metrics: serde_json::to_value(&result.metrics).unwrap_or_default(),
+            metrics,
             created_at: Utc::now().timestamp_millis(),
             active: true,
         };
 
+        for previous in existing.iter().filter(|adapter| adapter.active) {
+            self.lora_adapter_repo
+                .set_lora_adapter_active(&previous.id, false)
+                .await?;
+        }
         self.lora_adapter_repo.insert_lora_adapter(&adapter).await?;
 
         self.inference_service
@@ -494,7 +825,7 @@ impl LoraEvolutionServiceImpl {
 
         if let Some(repo) = &job_repo {
             let job = TrainingJob {
-                id: job_id,
+                id: job_id.clone(),
                 task_kind: key.to_string(),
                 status: TrainingJobStatus::Succeeded,
                 started_at: Utc::now().timestamp_millis(),
@@ -506,12 +837,75 @@ impl LoraEvolutionServiceImpl {
             let _ = repo.update_training_job(&job).await;
         }
 
+        self.publish_evolution_observed(
+            "lora_evolution_promoted",
+            key,
+            &examples,
+            &job_id,
+            Some(&adapter_id),
+            &adapter.metrics,
+        )
+        .await;
+
         self.event_service.publish(Event::LoraSwapped {
             project_id: String::new(),
             lora_id: adapter_id.clone(),
         });
 
         Ok(adapter)
+    }
+
+    async fn publish_evolution_observed(
+        &self,
+        action: &str,
+        task_kind: &str,
+        examples: &[TrainingExample],
+        training_job_id: &str,
+        adapter_id: Option<&str>,
+        metrics: &serde_json::Value,
+    ) {
+        let project_id = examples
+            .iter()
+            .find_map(|example| example.project_id.clone())
+            .unwrap_or_default();
+        let triggering_task_id = examples.last().map(|example| example.task_id.clone());
+        let triggering_task = match triggering_task_id.as_deref() {
+            Some(task_id) => self.task_service.get(task_id).await.ok().flatten(),
+            None => None,
+        };
+        let trace_id = triggering_task
+            .as_ref()
+            .map(|task| task.trace_id.clone())
+            .unwrap_or_default();
+        let run_id = triggering_task
+            .as_ref()
+            .and_then(|task| task.result.as_ref())
+            .and_then(|result| result.get("run_id"))
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned);
+        let mut metadata = serde_json::json!({
+            "training_job_id": training_job_id,
+            "task_kind": task_kind,
+            "adapter_id": adapter_id,
+            "trace_id": trace_id,
+            "run_id": run_id,
+            "triggering_task_id": triggering_task_id,
+            "training_example_count": examples.len(),
+            "metrics": metrics,
+        });
+        if let Some(benchmark_gate) = metrics.get("benchmark_gate")
+            && let Some(object) = metadata.as_object_mut()
+        {
+            object.insert("benchmark_gate".into(), benchmark_gate.clone());
+        }
+
+        self.event_service.publish(Event::RunObserved {
+            project_id,
+            task_id: triggering_task_id,
+            trace_id,
+            action: action.to_string(),
+            metadata,
+        });
     }
 }
 
@@ -955,10 +1349,51 @@ mod tests {
         }
         async fn set_lora_adapter_active(
             &self,
-            _id: &str,
-            _active: bool,
+            id: &str,
+            active: bool,
         ) -> Result<(), PersistenceError> {
+            if let Some(adapter) = self
+                .adapters
+                .lock()
+                .unwrap()
+                .iter_mut()
+                .find(|adapter| adapter.id == id)
+            {
+                adapter.active = active;
+            }
             Ok(())
+        }
+    }
+
+    struct RejectingBenchmarkGate;
+
+    #[async_trait]
+    impl LoraBenchmarkGate for RejectingBenchmarkGate {
+        async fn evaluate(
+            &self,
+            _request: LoraBenchmarkRequest,
+        ) -> Result<LoraBenchmarkDecision, LoraEvolutionError> {
+            Ok(LoraBenchmarkDecision::reject(
+                "baseline kept: challenger regressed benchmark pass rate",
+            ))
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingBenchmarkGate {
+        requests: Mutex<Vec<LoraBenchmarkRequest>>,
+    }
+
+    #[async_trait]
+    impl LoraBenchmarkGate for RecordingBenchmarkGate {
+        async fn evaluate(
+            &self,
+            request: LoraBenchmarkRequest,
+        ) -> Result<LoraBenchmarkDecision, LoraEvolutionError> {
+            self.requests.lock().unwrap().push(request);
+            Ok(LoraBenchmarkDecision::accept(
+                "challenger improved benchmark pass rate",
+            ))
         }
     }
 
@@ -1054,11 +1489,37 @@ mod tests {
         async fn start_handler(&self, _handler: Arc<dyn crate::services::EventHandler>) {}
     }
 
-    struct MockTrainer;
+    struct MockTrainer {
+        adapter_bytes: usize,
+        train_loss: f64,
+        validation_loss: f64,
+        single_file_layout: bool,
+    }
 
     impl MockTrainer {
         fn new() -> Self {
-            Self
+            Self {
+                adapter_bytes: 5,
+                train_loss: 0.1,
+                validation_loss: 0.2,
+                single_file_layout: false,
+            }
+        }
+
+        fn with_adapter_bytes(mut self, bytes: usize) -> Self {
+            self.adapter_bytes = bytes;
+            self
+        }
+
+        fn with_losses(mut self, train_loss: f64, validation_loss: f64) -> Self {
+            self.train_loss = train_loss;
+            self.validation_loss = validation_loss;
+            self
+        }
+
+        fn with_single_file_layout(mut self) -> Self {
+            self.single_file_layout = true;
+            self
         }
     }
 
@@ -1073,14 +1534,38 @@ mod tests {
             tokio::fs::create_dir_all(output_dir).await?;
             let average_reward =
                 examples.iter().map(|e| e.reward).sum::<f64>() / examples.len() as f64;
-            let adapter_path = output_dir.join("adapter.safetensors");
-            tokio::fs::write(&adapter_path, b"dummy").await?;
+            let adapter_path = if self.single_file_layout {
+                let adapter_path = output_dir.join("adapter.safetensors");
+                tokio::fs::write(&adapter_path, vec![b'x'; self.adapter_bytes]).await?;
+                adapter_path
+            } else {
+                let adapter_path = output_dir.join("adapter");
+                tokio::fs::create_dir_all(&adapter_path).await?;
+                tokio::fs::write(
+                    adapter_path.join("adapter_config.json"),
+                    serde_json::json!({
+                        "peft_type": "LORA",
+                        "base_model_name_or_path": "mistral-7b",
+                        "r": 16,
+                        "lora_alpha": 32,
+                        "target_modules": ["q_proj", "v_proj"]
+                    })
+                    .to_string(),
+                )
+                .await?;
+                tokio::fs::write(
+                    adapter_path.join("adapter_model.safetensors"),
+                    vec![b'x'; self.adapter_bytes],
+                )
+                .await?;
+                adapter_path
+            };
             Ok(LoraTrainingResult {
                 adapter_id: "mock-adapter".into(),
                 adapter_path,
                 metrics: LoraMetrics {
-                    train_loss: 0.1,
-                    validation_loss: 0.2,
+                    train_loss: self.train_loss,
+                    validation_loss: self.validation_loss,
                     average_reward,
                 },
             })
@@ -1121,7 +1606,7 @@ mod tests {
             inference.clone(),
             events.clone(),
             trainer,
-            std::env::temp_dir().join("crytex-test-adapters"),
+            std::env::temp_dir().join(format!("crytex-test-adapters-{}", Ulid::new())),
             "mistral-7b".into(),
         )
         .with_threshold(2)
@@ -1129,6 +1614,45 @@ mod tests {
         .with_min_human_score(4.0);
 
         (service, example_repo, adapter_repo, inference, events)
+    }
+
+    fn evolution_service_with_trainer(
+        task: Task,
+        examples: Vec<TrainingExample>,
+        trainer: Arc<dyn LoraTrainer>,
+    ) -> (
+        LoraEvolutionServiceImpl,
+        Arc<InMemoryTrainingExampleRepo>,
+        Arc<InMemoryLoraAdapterRepo>,
+        Arc<DummyInferenceService>,
+    ) {
+        let task_service = Arc::new(DummyTaskService::with_task(task));
+        let prompt_repo: Arc<dyn PromptVersionRepository> =
+            Arc::new(DummyPromptVersionRepo::default());
+        let example_repo = Arc::new(InMemoryTrainingExampleRepo::default());
+        for e in examples {
+            example_repo.examples.lock().unwrap().push(e);
+        }
+        let adapter_repo = Arc::new(InMemoryLoraAdapterRepo::default());
+        let inference = Arc::new(DummyInferenceService::default());
+        let events = Arc::new(DummyEventService::default());
+
+        let service = LoraEvolutionServiceImpl::new(
+            task_service,
+            prompt_repo,
+            example_repo.clone(),
+            adapter_repo.clone(),
+            inference.clone(),
+            events,
+            trainer,
+            std::env::temp_dir().join(format!("crytex-test-adapters-{}", Ulid::new())),
+            "mistral-7b".into(),
+        )
+        .with_threshold(2)
+        .with_validation_reward_threshold(3.0)
+        .with_min_human_score(4.0);
+
+        (service, example_repo, adapter_repo, inference)
     }
 
     fn example(kind: &str, reward: f64, created_at: i64) -> TrainingExample {
@@ -1259,6 +1783,21 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn rejected_retry_task_creates_counter_example() {
+        let task = make_task("p1", "codegen", TaskStatus::Pending, Some(0.0));
+        let (service, example_repo, _, _, _) = evolution_service(task, vec![], vec![]);
+
+        service.collect_counter_example("t1").await.unwrap();
+
+        let examples = example_repo
+            .list_training_examples_by_kind("codegen")
+            .await
+            .unwrap();
+        assert_eq!(examples.len(), 1);
+        assert_eq!(examples[0].reward, 0.0);
     }
 
     #[tokio::test]
@@ -1583,5 +2122,320 @@ mod tests {
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].status, TrainingJobStatus::Succeeded);
         assert_eq!(jobs[0].adapter_id, Some(adapter.id));
+    }
+
+    #[tokio::test]
+    async fn benchmark_gate_rejects_lora_challenger_without_registering_adapter() {
+        let task = make_task("p1", "codegen", TaskStatus::Completed, Some(5.0));
+        let examples = vec![
+            example("codegen", 5.0, 0),
+            example("codegen", 5.0, 1),
+            example("codegen", 5.0, 2),
+        ];
+        let existing_adapter = LoraAdapter {
+            id: "codegen-v1".into(),
+            project_id: None,
+            name: "codegen-v1".into(),
+            file_path: "/tmp/baseline.safetensors".into(),
+            base_model: "mistral-7b".into(),
+            task_kind: Some("codegen".into()),
+            agent_role: None,
+            metrics: json!({ "benchmark": { "winner": "baseline" } }),
+            created_at: 1,
+            active: true,
+        };
+        let (service, _, adapter_repo, inference, events) =
+            evolution_service(task, examples, vec![existing_adapter]);
+        let job_repo = Arc::new(InMemoryTrainingJobRepo::default());
+        let service = service
+            .with_training_job_repo(job_repo.clone())
+            .with_benchmark_gate(Arc::new(RejectingBenchmarkGate));
+
+        let result = service.train_and_register("codegen").await;
+
+        assert!(matches!(
+            result,
+            Err(LoraEvolutionError::ValidationFailed(kind, reason))
+                if kind == "codegen" && reason.contains("benchmark")
+        ));
+        assert!(inference.registered.lock().unwrap().is_empty());
+
+        let adapters = adapter_repo
+            .list_lora_adapters_by_kind("codegen")
+            .await
+            .unwrap();
+        assert_eq!(adapters.len(), 1);
+        assert_eq!(adapters[0].id, "codegen-v1");
+        assert!(adapters[0].active);
+
+        let jobs = job_repo
+            .list_training_jobs_by_kind("codegen")
+            .await
+            .unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].status, TrainingJobStatus::RolledBack);
+        assert_eq!(
+            jobs[0].metrics["benchmark_gate"]["accepted"],
+            serde_json::Value::Bool(false)
+        );
+        assert!(
+            jobs[0]
+                .metrics
+                .get("benchmark_gate")
+                .and_then(|gate| gate.get("reason"))
+                .and_then(|reason| reason.as_str())
+                .is_some_and(|reason| reason.contains("regressed benchmark"))
+        );
+        assert!(
+            jobs[0]
+                .error_message
+                .as_deref()
+                .unwrap()
+                .contains("benchmark")
+        );
+        let emitted = events.events.lock().unwrap().clone();
+        let rejected = emitted
+            .iter()
+            .find_map(|event| match event {
+                Event::RunObserved {
+                    action, metadata, ..
+                } if action == "lora_evolution_rejected" => Some(metadata),
+                _ => None,
+            })
+            .expect("rejection event should be emitted");
+        assert_eq!(rejected["training_job_id"], jobs[0].id);
+        assert_eq!(rejected["adapter_id"], "codegen-v2");
+        assert_eq!(rejected["trace_id"], "trace");
+        assert_eq!(rejected["benchmark_gate"]["accepted"], false);
+        assert!(emitted.iter().any(|event| matches!(
+            event,
+            Event::RunObserved {
+                action,
+                trace_id,
+                ..
+            } if action == "lora_evolution_rejected" && trace_id == "trace"
+        )));
+    }
+
+    #[tokio::test]
+    async fn benchmark_gate_accepts_lora_challenger_and_promotes_it() {
+        let task = make_task("p1", "codegen", TaskStatus::Completed, Some(5.0));
+        let examples = vec![
+            example("codegen", 5.0, 0),
+            example("codegen", 5.0, 1),
+            example("codegen", 5.0, 2),
+        ];
+        let existing_adapter = LoraAdapter {
+            id: "codegen-v1".into(),
+            project_id: None,
+            name: "codegen-v1".into(),
+            file_path: "/tmp/baseline.safetensors".into(),
+            base_model: "mistral-7b".into(),
+            task_kind: Some("codegen".into()),
+            agent_role: None,
+            metrics: json!({}),
+            created_at: 1,
+            active: true,
+        };
+        let (service, _, adapter_repo, inference, events) =
+            evolution_service(task, examples, vec![existing_adapter]);
+        let gate = Arc::new(RecordingBenchmarkGate::default());
+        let service = service.with_benchmark_gate(gate.clone());
+
+        let adapter = service.train_and_register("codegen").await.unwrap();
+
+        assert_eq!(adapter.id, "codegen-v2");
+        assert_eq!(
+            inference.registered.lock().unwrap().as_slice(),
+            ["codegen-v2"]
+        );
+
+        let requests = gate.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].baseline_adapter_id.as_deref(),
+            Some("codegen-v1")
+        );
+        assert_eq!(requests[0].challenger_adapter_id, "codegen-v2");
+        assert_eq!(requests[0].base_model, "mistral-7b");
+        assert!(requests[0].challenger_adapter_path.ends_with("adapter"));
+        assert!(
+            requests[0]
+                .challenger_adapter_path
+                .join("adapter_config.json")
+                .exists()
+        );
+        assert!(
+            requests[0]
+                .challenger_adapter_path
+                .join("adapter_model.safetensors")
+                .exists()
+        );
+
+        let adapters = adapter_repo
+            .list_lora_adapters_by_kind("codegen")
+            .await
+            .unwrap();
+        let baseline = adapters
+            .iter()
+            .find(|adapter| adapter.id == "codegen-v1")
+            .unwrap();
+        let challenger = adapters
+            .iter()
+            .find(|adapter| adapter.id == "codegen-v2")
+            .unwrap();
+        assert!(!baseline.active);
+        assert!(challenger.active);
+
+        let emitted = events.events.lock().unwrap().clone();
+        let promoted = emitted
+            .iter()
+            .find_map(|event| match event {
+                Event::RunObserved {
+                    action, metadata, ..
+                } if action == "lora_evolution_promoted" => Some(metadata),
+                _ => None,
+            })
+            .expect("promotion event should be emitted");
+        assert_eq!(promoted["adapter_id"], "codegen-v2");
+        assert_eq!(promoted["trace_id"], "trace");
+        assert_eq!(promoted["benchmark_gate"]["accepted"], true);
+        assert!(emitted.iter().any(|event| matches!(
+            event,
+            Event::RunObserved {
+                action,
+                trace_id,
+                ..
+            } if action == "lora_evolution_promoted" && trace_id == "trace"
+        )));
+    }
+
+    #[tokio::test]
+    async fn training_rejects_golden_dataset_with_empty_outputs() {
+        let task = make_task("p1", "codegen", TaskStatus::Completed, Some(5.0));
+        let examples = vec![
+            TrainingExample {
+                output_text: "   ".into(),
+                ..example("codegen", 5.0, 0)
+            },
+            example("codegen", 5.0, 1),
+            example("codegen", 5.0, 2),
+        ];
+        let (service, _, adapter_repo, inference) = evolution_service_with_trainer(
+            task,
+            examples,
+            Arc::new(MockTrainer::new().with_single_file_layout()),
+        );
+
+        let result = service.train_and_register("codegen").await;
+
+        assert!(matches!(
+            result,
+            Err(LoraEvolutionError::ValidationFailed(kind, reason))
+                if kind == "codegen" && reason.contains("golden dataset")
+        ));
+        assert!(
+            adapter_repo
+                .list_lora_adapters_by_kind("codegen")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(inference.registered.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn training_rejects_oversized_lora_artifact_before_registering() {
+        let task = make_task("p1", "codegen", TaskStatus::Completed, Some(5.0));
+        let examples = vec![
+            example("codegen", 5.0, 0),
+            example("codegen", 5.0, 1),
+            example("codegen", 5.0, 2),
+        ];
+        let (service, _, adapter_repo, inference) = evolution_service_with_trainer(
+            task,
+            examples,
+            Arc::new(MockTrainer::new().with_adapter_bytes(128)),
+        );
+        let service = service.with_max_adapter_bytes(16);
+
+        let result = service.train_and_register("codegen").await;
+
+        assert!(matches!(
+            result,
+            Err(LoraEvolutionError::ValidationFailed(kind, reason))
+                if kind == "codegen" && reason.contains("adapter artifact")
+        ));
+        assert!(
+            adapter_repo
+                .list_lora_adapters_by_kind("codegen")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(inference.registered.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn training_rejects_single_file_lora_artifact_before_registering() {
+        let task = make_task("p1", "codegen", TaskStatus::Completed, Some(5.0));
+        let examples = vec![
+            example("codegen", 5.0, 0),
+            example("codegen", 5.0, 1),
+            example("codegen", 5.0, 2),
+        ];
+        let (service, _, adapter_repo, inference) = evolution_service_with_trainer(
+            task,
+            examples,
+            Arc::new(MockTrainer::new().with_single_file_layout()),
+        );
+
+        let result = service.train_and_register("codegen").await;
+
+        assert!(matches!(
+            result,
+            Err(LoraEvolutionError::ValidationFailed(kind, reason))
+                if kind == "codegen" && reason.contains("adapter_config.json")
+        ));
+        assert!(
+            adapter_repo
+                .list_lora_adapters_by_kind("codegen")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(inference.registered.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn training_rejects_overfit_loss_gap_before_promotion() {
+        let task = make_task("p1", "codegen", TaskStatus::Completed, Some(5.0));
+        let examples = vec![
+            example("codegen", 5.0, 0),
+            example("codegen", 5.0, 1),
+            example("codegen", 5.0, 2),
+        ];
+        let (service, _, adapter_repo, inference) = evolution_service_with_trainer(
+            task,
+            examples,
+            Arc::new(MockTrainer::new().with_losses(0.01, 0.49)),
+        );
+        let service = service.with_max_train_validation_loss_gap(0.1);
+
+        let result = service.train_and_register("codegen").await;
+
+        assert!(matches!(
+            result,
+            Err(LoraEvolutionError::ValidationFailed(kind, reason))
+                if kind == "codegen" && reason.contains("overfit")
+        ));
+        assert!(
+            adapter_repo
+                .list_lora_adapters_by_kind("codegen")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(inference.registered.lock().unwrap().is_empty());
     }
 }

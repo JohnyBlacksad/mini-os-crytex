@@ -4,6 +4,9 @@
 //! kernel can default to GPU and fall back to CPU without hard-coding
 //! platform-specific checks.
 
+use serde::{Deserialize, Serialize};
+use std::path::Path;
+
 /// Detected compute device for local inference.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeviceKind {
@@ -39,6 +42,31 @@ pub struct HardwareRecommendation {
     /// `None` means "GPU with automatic layer placement".
     pub gpu_layers: Option<usize>,
     pub reason: String,
+}
+
+/// CUDA build/runtime readiness reported before a GPU inference attempt.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CudaToolchainStatus {
+    pub gpu_detected: bool,
+    pub nvcc_available: bool,
+    pub msvc_cl_available: bool,
+    pub msvc_cl_path: Option<String>,
+    pub nvcc_ccbin: Option<String>,
+    pub recommended_nvcc_ccbin: Option<String>,
+    pub ready: bool,
+    pub diagnostics: Vec<String>,
+}
+
+/// Pure inputs for CUDA preflight evaluation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CudaToolchainProbe {
+    pub device: DeviceKind,
+    pub nvcc_available: bool,
+    pub msvc_cl_available: bool,
+    pub msvc_cl_path: Option<String>,
+    pub nvcc_ccbin: Option<String>,
+    pub nvcc_ccbin_exists: bool,
+    pub is_windows: bool,
 }
 
 /// Detects available hardware.
@@ -184,6 +212,147 @@ pub fn recommend_local_device(
     }
 }
 
+/// Detect whether the local CUDA stack is ready enough to build/run CUDA backends.
+pub fn detect_cuda_toolchain_status(detector: &dyn HardwareDetector) -> CudaToolchainStatus {
+    let nvcc_ccbin = std::env::var("NVCC_CCBIN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let nvcc_ccbin_exists = nvcc_ccbin
+        .as_deref()
+        .map(Path::new)
+        .is_some_and(Path::exists);
+
+    build_cuda_toolchain_status(CudaToolchainProbe {
+        device: detector.detect(),
+        nvcc_available: command_can_start("nvcc", &["--version"]),
+        msvc_cl_available: command_can_start("cl.exe", &["/help"]),
+        msvc_cl_path: find_msvc_cl_path(),
+        nvcc_ccbin,
+        nvcc_ccbin_exists,
+        is_windows: cfg!(target_os = "windows"),
+    })
+}
+
+/// Evaluate CUDA readiness from pre-collected facts.
+pub fn build_cuda_toolchain_status(probe: CudaToolchainProbe) -> CudaToolchainStatus {
+    let gpu_detected = matches!(probe.device, DeviceKind::Cuda { .. });
+    let recommended_nvcc_ccbin = probe
+        .nvcc_ccbin
+        .clone()
+        .filter(|_| probe.nvcc_ccbin_exists)
+        .or_else(|| probe.msvc_cl_path.clone());
+    let windows_compiler_ready =
+        !probe.is_windows || probe.msvc_cl_available || recommended_nvcc_ccbin.is_some();
+    let ready = gpu_detected && probe.nvcc_available && windows_compiler_ready;
+    let mut diagnostics = Vec::new();
+
+    if !gpu_detected {
+        diagnostics.push("CUDA GPU was not detected; GPU inference will fall back or fail.".into());
+    }
+    if !probe.nvcc_available {
+        diagnostics.push("nvcc is not available in PATH; CUDA-enabled crates cannot build.".into());
+    }
+    if probe.is_windows && !probe.msvc_cl_available && recommended_nvcc_ccbin.is_none() {
+        diagnostics.push(
+            "cl.exe is not available in PATH and NVCC_CCBIN does not point to an existing compiler; run from a VS Developer PowerShell or set NVCC_CCBIN.".into(),
+        );
+    } else if probe.is_windows && !probe.msvc_cl_available && probe.nvcc_ccbin_exists {
+        diagnostics.push("cl.exe is not in PATH; using NVCC_CCBIN for CUDA builds.".into());
+    } else if probe.is_windows && !probe.msvc_cl_available && probe.msvc_cl_path.is_some() {
+        diagnostics
+            .push("cl.exe is not in PATH; use recommended_nvcc_ccbin for CUDA builds.".into());
+    }
+
+    CudaToolchainStatus {
+        gpu_detected,
+        nvcc_available: probe.nvcc_available,
+        msvc_cl_available: probe.msvc_cl_available,
+        msvc_cl_path: probe.msvc_cl_path,
+        nvcc_ccbin: probe.nvcc_ccbin,
+        recommended_nvcc_ccbin,
+        ready,
+        diagnostics,
+    }
+}
+
+fn command_can_start(program: &str, args: &[&str]) -> bool {
+    std::process::Command::new(program)
+        .args(args)
+        .output()
+        .is_ok()
+}
+
+#[cfg(target_os = "windows")]
+fn find_msvc_cl_path() -> Option<String> {
+    find_msvc_cl_path_with_vswhere(
+        "C:\\Program Files (x86)\\Microsoft Visual Studio\\Installer\\vswhere.exe",
+    )
+    .or_else(find_msvc_cl_path_in_default_roots)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn find_msvc_cl_path() -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn find_msvc_cl_path_with_vswhere(vswhere: &str) -> Option<String> {
+    let out = std::process::Command::new(vswhere)
+        .args([
+            "-latest",
+            "-products",
+            "*",
+            "-requires",
+            "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+            "-find",
+            "VC\\Tools\\MSVC\\**\\bin\\Hostx64\\x64\\cl.exe",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8(out.stdout)
+        .ok()?
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && Path::new(line).exists())
+        .map(ToOwned::to_owned)
+}
+
+#[cfg(target_os = "windows")]
+fn find_msvc_cl_path_in_default_roots() -> Option<String> {
+    [
+        "C:\\Program Files\\Microsoft Visual Studio",
+        "C:\\Program Files (x86)\\Microsoft Visual Studio",
+    ]
+    .into_iter()
+    .filter_map(|root| std::fs::read_dir(root).ok())
+    .flat_map(|entries| entries.filter_map(Result::ok))
+    .map(|entry| entry.path())
+    .filter(|path| path.is_dir())
+    .find_map(find_host_x64_cl_under)
+}
+
+#[cfg(target_os = "windows")]
+fn find_host_x64_cl_under(root: std::path::PathBuf) -> Option<String> {
+    let tools = root.join("VC").join("Tools").join("MSVC");
+    let versions = std::fs::read_dir(tools).ok()?;
+    versions
+        .filter_map(Result::ok)
+        .map(|entry| {
+            entry
+                .path()
+                .join("bin")
+                .join("Hostx64")
+                .join("x64")
+                .join("cl.exe")
+        })
+        .find(|path| path.exists())
+        .map(|path| path.display().to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,5 +408,129 @@ mod tests {
                 driver_version: "531.41".into(),
             }
         );
+    }
+
+    #[test]
+    fn cuda_preflight_is_ready_when_gpu_nvcc_and_windows_compiler_are_available() {
+        let status = build_cuda_toolchain_status(CudaToolchainProbe {
+            device: DeviceKind::Cuda {
+                name: "RTX 5080".into(),
+                vram_mb: 16_303,
+                driver_version: "596.36".into(),
+            },
+            nvcc_available: true,
+            msvc_cl_available: true,
+            msvc_cl_path: None,
+            nvcc_ccbin: None,
+            nvcc_ccbin_exists: false,
+            is_windows: true,
+        });
+
+        assert!(status.gpu_detected);
+        assert!(status.nvcc_available);
+        assert!(status.msvc_cl_available);
+        assert!(status.ready);
+        assert!(status.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn cuda_preflight_reports_missing_cl_exe_when_nvcc_cannot_build_on_windows() {
+        let status = build_cuda_toolchain_status(CudaToolchainProbe {
+            device: DeviceKind::Cuda {
+                name: "RTX 5080".into(),
+                vram_mb: 16_303,
+                driver_version: "596.36".into(),
+            },
+            nvcc_available: true,
+            msvc_cl_available: false,
+            msvc_cl_path: None,
+            nvcc_ccbin: None,
+            nvcc_ccbin_exists: false,
+            is_windows: true,
+        });
+
+        assert!(status.gpu_detected);
+        assert!(status.nvcc_available);
+        assert!(!status.msvc_cl_available);
+        assert!(!status.ready);
+        assert!(
+            status
+                .diagnostics
+                .iter()
+                .any(|line| line.contains("cl.exe"))
+        );
+    }
+
+    #[test]
+    fn cuda_preflight_accepts_existing_nvcc_ccbin_when_cl_exe_is_not_on_path() {
+        let status = build_cuda_toolchain_status(CudaToolchainProbe {
+            device: DeviceKind::Cuda {
+                name: "RTX 5080".into(),
+                vram_mb: 16_303,
+                driver_version: "596.36".into(),
+            },
+            nvcc_available: true,
+            msvc_cl_available: false,
+            msvc_cl_path: None,
+            nvcc_ccbin: Some("C:\\BuildTools\\VC\\Tools\\MSVC\\cl.exe".into()),
+            nvcc_ccbin_exists: true,
+            is_windows: true,
+        });
+
+        assert!(status.ready);
+        assert_eq!(
+            status.nvcc_ccbin.as_deref(),
+            Some("C:\\BuildTools\\VC\\Tools\\MSVC\\cl.exe")
+        );
+        assert_eq!(
+            status.recommended_nvcc_ccbin.as_deref(),
+            Some("C:\\BuildTools\\VC\\Tools\\MSVC\\cl.exe")
+        );
+    }
+
+    #[test]
+    fn cuda_preflight_recommends_discovered_cl_path_when_cl_exe_is_not_on_path() {
+        let status = build_cuda_toolchain_status(CudaToolchainProbe {
+            device: DeviceKind::Cuda {
+                name: "RTX 5080".into(),
+                vram_mb: 16_303,
+                driver_version: "596.36".into(),
+            },
+            nvcc_available: true,
+            msvc_cl_available: false,
+            msvc_cl_path: Some(
+                "C:\\Program Files\\Microsoft Visual Studio\\18\\Community\\VC\\Tools\\MSVC\\14.51.36231\\bin\\Hostx64\\x64\\cl.exe".into(),
+            ),
+            nvcc_ccbin: None,
+            nvcc_ccbin_exists: false,
+            is_windows: true,
+        });
+
+        assert!(status.ready);
+        assert!(status.nvcc_ccbin.is_none());
+        assert_eq!(status.msvc_cl_path, status.recommended_nvcc_ccbin);
+        assert!(
+            status
+                .diagnostics
+                .iter()
+                .any(|line| line.contains("recommended_nvcc_ccbin"))
+        );
+    }
+
+    #[test]
+    fn cuda_preflight_is_not_ready_without_a_cuda_gpu() {
+        let status = build_cuda_toolchain_status(CudaToolchainProbe {
+            device: DeviceKind::Cpu,
+            nvcc_available: true,
+            msvc_cl_available: true,
+            msvc_cl_path: None,
+            nvcc_ccbin: None,
+            nvcc_ccbin_exists: false,
+            is_windows: true,
+        });
+
+        assert!(!status.gpu_detected);
+        assert!(!status.ready);
+        assert!(status.diagnostics.iter().any(|line| line.contains("GPU")));
     }
 }

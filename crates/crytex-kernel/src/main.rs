@@ -18,8 +18,9 @@ use crytex_agents::{
     researcher::ResearcherAgent, security::SecurityAgent, summarizer::SummarizerAgent,
 };
 use crytex_bench::{
-    ABTest, AgentBenchmarkRunner, BenchmarkHarness, BenchmarkRunRequest, BenchmarkVariant,
-    DefaultBenchmarkHarness, ExactMatchScorer, JsonSchemaScorer, LlmJudgeScorer, SandboxTestScorer,
+    ABTest, AgentBenchmarkRunner, BenchLoraBenchmarkGate, BenchmarkHarness, BenchmarkRunRequest,
+    BenchmarkVariant, DefaultBenchmarkHarness, ExactMatchScorer, JsonSchemaScorer, LlmJudgeScorer,
+    SandboxTestScorer,
 };
 use crytex_compress::{
     DiskCcrStore,
@@ -44,10 +45,13 @@ use crytex_core::{
         AgentRole, AgentService, AgentServiceImpl, AgentWorkflowNodeExecutor, AlertService,
         AlertServiceImpl, AlertThresholds, BulkAuditLogService, CreateProjectRequest,
         CreateTaskRequest, CriticCouncil, EventServiceImpl, InferenceServiceImpl, LoraRouter,
-        ModelManagerImpl, MutationOperator, Orchestrator, OrchestratorImpl, ProjectServiceImpl,
-        ProjectWatcher, PromptEvolutionService, RecordRewardRequest, RewardService, SchedulerImpl,
-        SystemHardwareDetector, TaskHandler, TaskServiceImpl, TomlWorkflowRepository, WorkerError,
-        WorkerPool, WorkflowRepository, recommend_local_device,
+        ModelManagerImpl, ModelRuntimeMatrixProbe, ModelRuntimeMatrixRequest, ModelRuntimeProbe,
+        ModelRuntimeProbeRequest, MutationOperator, Orchestrator, OrchestratorImpl,
+        ProjectService, ProjectServiceImpl, ProjectWatcher, PromptEvolutionService,
+        RecordRewardRequest, RewardService, RuntimeFeatureSet, RuntimeMatrixEntryRequest,
+        RuntimeMatrixReportWriter, SchedulerImpl, SystemHardwareDetector, TaskHandler,
+        TaskServiceImpl, TomlWorkflowRepository, WorkerError, WorkerPool, WorkflowRepository,
+        recommend_local_device,
     },
     state_export::export_project_state,
 };
@@ -148,6 +152,36 @@ enum Commands {
     RecommendModel {
         #[arg(short, long)]
         id: String,
+    },
+    /// Run metadata, compatibility, and generation smoke probe for a managed model
+    ProbeModel {
+        #[arg(short, long)]
+        id: String,
+        #[arg(short, long)]
+        backend: Option<String>,
+        #[arg(short, long)]
+        model: Option<String>,
+        #[arg(long)]
+        trace_id: Option<String>,
+        #[arg(long, default_value = "16")]
+        max_tokens: usize,
+    },
+    /// Run baseline and LoRA runtime probe matrix for a managed model
+    ProbeRuntimeMatrix {
+        #[arg(short, long)]
+        id: String,
+        #[arg(short, long)]
+        backend: Vec<String>,
+        #[arg(short, long)]
+        model: Option<String>,
+        #[arg(long)]
+        lora: Vec<String>,
+        #[arg(long)]
+        trace_id: Option<String>,
+        #[arg(long)]
+        report_dir: Option<PathBuf>,
+        #[arg(long, default_value = "16")]
+        max_tokens: usize,
     },
     /// Switch the default inference backend
     SwitchBackend {
@@ -689,7 +723,276 @@ async fn main() {
         warn!("Failed to create data directories: {}", e);
     }
 
+    if let Commands::AddBackend {
+        id,
+        kind,
+        model,
+        url,
+        api_key,
+        header,
+        gpu_layers,
+        context_size,
+    } = &cli.command
+    {
+        let kind = parse_backend_kind(kind).unwrap_or_else(|e| {
+            eprintln!("{}", e);
+            std::process::exit(1);
+        });
+        let headers = parse_headers(header).unwrap_or_else(|e| {
+            eprintln!("{}", e);
+            std::process::exit(1);
+        });
+        let backend_config = BackendConfig {
+            id: id.clone(),
+            kind,
+            model: model.clone(),
+            url: url.clone(),
+            api_key: api_key.clone(),
+            headers,
+            timeout_seconds: None,
+            context_size: *context_size,
+            gpu_layers: *gpu_layers,
+            supports_lora: false,
+        };
+        let mut config = config.clone();
+        config
+            .inference
+            .backends
+            .retain(|backend| backend.id != *id);
+        config.inference.backends.push(backend_config);
+        if let Err(e) = config.save() {
+            eprintln!("Failed to save config: {}", e);
+            std::process::exit(1);
+        }
+        println!("Backend {} added. Use switch-backend to select it.", id);
+        return;
+    }
+
     let inference = create_inference_service(&config).expect("Failed to create inference service");
+
+    if let Commands::ProbeModel {
+        id,
+        backend,
+        model,
+        trace_id,
+        max_tokens,
+    } = &cli.command
+    {
+        let event_bus = Arc::new(crytex_core::EventBus::new());
+        let event_service = Arc::new(EventServiceImpl::new(event_bus));
+        let config_dir = CrytexConfig::config_path()
+            .parent()
+            .expect("config path must have a parent")
+            .to_path_buf();
+        let model_manager: Arc<dyn crytex_core::services::ModelManager> =
+            Arc::new(ModelManagerImpl::new_standard(
+                &config_dir,
+                &config.paths.data_dir,
+                event_service,
+                Arc::new(SystemHardwareDetector::new()),
+            ));
+        let backend_id = backend.clone().or_else(|| {
+            config
+                .inference
+                .default_backend
+                .as_ref()
+                .map(ToString::to_string)
+        });
+        let managed_model = match model_manager.get_model(id) {
+            Ok(model) => model,
+            Err(_error) if model.is_some() => {
+                let preferred_backend = backend_id
+                    .as_ref()
+                    .and_then(|id| config.inference.backend(id))
+                    .map(|backend| backend.kind)
+                    .unwrap_or(BackendKind::Custom);
+                crytex_core::services::ManagedModel {
+                    id: id.clone(),
+                    name: model.clone().unwrap_or_else(|| id.clone()),
+                    repo: None,
+                    filename: None,
+                    local_path: None,
+                    quantization: None,
+                    preferred_backend,
+                    params_b: None,
+                    status: crytex_core::services::ModelStatus::Available,
+                }
+            }
+            Err(error) => {
+                eprintln!("Failed to get model: {}", error);
+                std::process::exit(1);
+            }
+        };
+        let detector = SystemHardwareDetector::new();
+        let device = crytex_core::services::HardwareDetector::detect(&detector);
+        let runtime = RuntimeFeatureSet::from_device(&device);
+        let model_name = model.clone().unwrap_or_else(|| {
+            managed_model
+                .local_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .or_else(|| {
+                    backend_id
+                        .as_ref()
+                        .and_then(|id| config.inference.backend(id))
+                        .map(|backend| backend.model.clone())
+                })
+                .unwrap_or_else(|| managed_model.id.clone())
+        });
+        let probe = ModelRuntimeProbe::new(inference);
+        let report = probe
+            .probe(
+                &managed_model,
+                &device,
+                &runtime,
+                ModelRuntimeProbeRequest {
+                    backend_id,
+                    model_name,
+                    trace_id: trace_id.clone(),
+                    max_tokens: *max_tokens,
+                    lora_adapter_id: None,
+                },
+            )
+            .await;
+        let json = unwrap_or_exit!(
+            serde_json::to_string_pretty(&report),
+            "Failed to serialize probe"
+        );
+        println!("{}", json);
+        if !report.passed {
+            std::process::exit(2);
+        }
+        return;
+    }
+
+    if let Commands::ProbeRuntimeMatrix {
+        id,
+        backend,
+        model,
+        lora,
+        trace_id,
+        report_dir,
+        max_tokens,
+    } = &cli.command
+    {
+        let event_bus = Arc::new(crytex_core::EventBus::new());
+        let event_service = Arc::new(EventServiceImpl::new(event_bus));
+        let config_dir = CrytexConfig::config_path()
+            .parent()
+            .expect("config path must have a parent")
+            .to_path_buf();
+        let model_manager: Arc<dyn crytex_core::services::ModelManager> =
+            Arc::new(ModelManagerImpl::new_standard(
+                &config_dir,
+                &config.paths.data_dir,
+                event_service,
+                Arc::new(SystemHardwareDetector::new()),
+            ));
+        let backend_ids = if backend.is_empty() {
+            config
+                .inference
+                .default_backend
+                .as_ref()
+                .map(|backend| vec![backend.clone()])
+                .unwrap_or_default()
+        } else {
+            backend.clone()
+        };
+        if backend_ids.is_empty() {
+            eprintln!("No backend was provided and no default backend is configured");
+            std::process::exit(1);
+        }
+        let managed_model = match model_manager.get_model(id) {
+            Ok(model) => model,
+            Err(_error) if model.is_some() => {
+                let preferred_backend = backend_ids
+                    .first()
+                    .and_then(|id| config.inference.backend(id))
+                    .map(|backend| backend.kind)
+                    .unwrap_or(BackendKind::Custom);
+                crytex_core::services::ManagedModel {
+                    id: id.clone(),
+                    name: model.clone().unwrap_or_else(|| id.clone()),
+                    repo: None,
+                    filename: None,
+                    local_path: None,
+                    quantization: None,
+                    preferred_backend,
+                    params_b: None,
+                    status: crytex_core::services::ModelStatus::Available,
+                }
+            }
+            Err(error) => {
+                eprintln!("Failed to get model: {}", error);
+                std::process::exit(1);
+            }
+        };
+        let detector = SystemHardwareDetector::new();
+        let device = crytex_core::services::HardwareDetector::detect(&detector);
+        let runtime = RuntimeFeatureSet::from_device(&device);
+        let lora_variants = if lora.is_empty() {
+            vec![None]
+        } else {
+            std::iter::once(None)
+                .chain(lora.iter().cloned().map(Some))
+                .collect::<Vec<_>>()
+        };
+        let mut entries = Vec::new();
+        for backend_id in &backend_ids {
+            let runtime_model_name = model.clone().unwrap_or_else(|| {
+                managed_model
+                    .local_path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .or_else(|| {
+                        config
+                            .inference
+                            .backend(backend_id)
+                            .map(|backend| backend.model.clone())
+                    })
+                    .unwrap_or_else(|| managed_model.id.clone())
+            });
+            for lora_adapter_id in &lora_variants {
+                let variant = lora_adapter_id.as_deref().unwrap_or("baseline");
+                entries.push(RuntimeMatrixEntryRequest {
+                    label: format!("{backend_id}:{variant}"),
+                    model: managed_model.clone(),
+                    backend_id: Some(backend_id.clone()),
+                    model_name: runtime_model_name.clone(),
+                    lora_adapter_id: lora_adapter_id.clone(),
+                    max_tokens: *max_tokens,
+                });
+            }
+        }
+        let matrix = ModelRuntimeMatrixProbe::new(inference);
+        let report = matrix
+            .probe(
+                &device,
+                &runtime,
+                ModelRuntimeMatrixRequest {
+                    trace_id: trace_id.clone(),
+                    entries,
+                },
+            )
+            .await;
+        let json = unwrap_or_exit!(
+            serde_json::to_string_pretty(&report),
+            "Failed to serialize runtime matrix"
+        );
+        let report_dir = report_dir
+            .clone()
+            .unwrap_or_else(|| config.paths.data_dir.join("reports").join("runtime-matrix"));
+        let report_path = unwrap_or_exit!(
+            RuntimeMatrixReportWriter::write_pretty_json(&report, report_dir),
+            "Failed to write runtime matrix report"
+        );
+        println!("{}", json);
+        eprintln!("Runtime matrix report written to {}", report_path.display());
+        if !report.passed {
+            std::process::exit(2);
+        }
+        return;
+    }
 
     let storage = Arc::new(
         Storage::new(&config.paths.db_path.to_string_lossy())
@@ -704,7 +1007,7 @@ async fn main() {
     let vector_store = create_vector_store(&config, Some(metrics_service.clone()));
     let embedder = create_embedder(&config, inference.clone(), Some(metrics_service.clone())).await;
     let sparse_embedder = create_sparse_embedder(&config);
-    let _reranker = create_reranker(&config);
+    let reranker = create_reranker(&config);
 
     let storage = Arc::new(
         (*storage)
@@ -744,7 +1047,9 @@ async fn main() {
     let mut tool_registry = TypedToolRegistry::new()
         .with_default_coding_tools()
         .with_semantic_search(embedder.clone(), vector_store.clone());
-    if vector_store.supports_sparse().await && let Some(sparse) = sparse_embedder.clone() {
+    if vector_store.supports_sparse().await
+        && let Some(sparse) = sparse_embedder.clone()
+    {
         tool_registry = tool_registry.with_sparse_search(sparse, vector_store.clone());
     }
     let tool_registry = tool_registry.build();
@@ -785,12 +1090,20 @@ async fn main() {
         })
     };
 
-    let hybrid_retriever =
-        create_hybrid_retriever(&config, embedder.clone(), vector_store.clone(), sparse_embedder.clone());
-    let context_assembler: Option<Arc<crytex_core::services::ContextAssembler>> = Some(Arc::new(
+    let hybrid_retriever = create_hybrid_retriever(
+        &config,
+        embedder.clone(),
+        vector_store.clone(),
+        sparse_embedder.clone(),
+    );
+    let mut context_assembler =
         crytex_core::services::ContextAssembler::new(embedder.clone(), vector_store.clone())
-            .with_hybrid_retriever(hybrid_retriever),
-    ));
+            .with_hybrid_retriever(hybrid_retriever);
+    if let Some(reranker) = reranker {
+        context_assembler = context_assembler.with_reranker(reranker);
+    }
+    let context_assembler: Option<Arc<crytex_core::services::ContextAssembler>> =
+        Some(Arc::new(context_assembler));
     let agent_service = create_agent_service(
         audit_service.clone(),
         storage.clone(),
@@ -841,6 +1154,61 @@ async fn main() {
         .default_backend_config()
         .map(|b| b.model.clone())
         .unwrap_or_default();
+    let lora_benchmark_gate = {
+        let golden_set_path = config
+            .benchmark
+            .golden_sets_dir
+            .join("lora_evolution.jsonl");
+        if !golden_set_path.exists() {
+            warn!(
+                "LoRA benchmark gate disabled: held-out golden set not found at {}",
+                golden_set_path.display()
+            );
+            None
+        } else {
+            match project_service.list().await {
+                Ok(projects) => {
+                    if let Some(project) = projects.first() {
+                        let project_id = project.id.clone();
+                        let task_service = task_service.clone();
+                        let agent_service = agent_service.clone();
+                        let inference = inference.clone();
+                        let tool_service = tool_service.clone();
+                        let runner_factory = Arc::new(move |task_kind: &str| {
+                            Arc::new(AgentBenchmarkRunner::new(
+                                project_id.clone(),
+                                task_kind.to_string(),
+                                task_service.clone(),
+                                agent_service.clone(),
+                                inference.clone(),
+                                tool_service.clone(),
+                            )) as Arc<dyn crytex_bench::BenchmarkRunner>
+                        });
+                        Some(Arc::new(
+                            BenchLoraBenchmarkGate::new_with_runner_factory(
+                                benchmark_harness.clone(),
+                                benchmark_repo.clone(),
+                                golden_set_path,
+                                runner_factory,
+                                Arc::new(ExactMatchScorer),
+                            )
+                            .with_max_concurrency(config.benchmark.default_concurrency),
+                        )
+                            as Arc<dyn crytex_core::services::LoraBenchmarkGate>)
+                    } else {
+                        warn!(
+                            "LoRA benchmark gate disabled: no project exists for benchmark tasks"
+                        );
+                        None
+                    }
+                }
+                Err(e) => {
+                    warn!("LoRA benchmark gate disabled: failed to list projects: {e}");
+                    None
+                }
+            }
+        }
+    };
     let lora_evolution = create_lora_evolution_service(
         storage.clone(),
         task_service.clone(),
@@ -851,6 +1219,7 @@ async fn main() {
         Some(vector_store.clone()),
         adapters_dir,
         base_model,
+        lora_benchmark_gate,
     );
     let lora_router = create_lora_router(
         lora_evolution.clone(),
@@ -1443,6 +1812,12 @@ async fn main() {
             );
             println!("{}", json);
         }
+        Commands::ProbeModel { .. } => {
+            unreachable!("probe-model is handled before AppContext initialization")
+        }
+        Commands::ProbeRuntimeMatrix { .. } => {
+            unreachable!("probe-runtime-matrix is handled before AppContext initialization")
+        }
         Commands::SwitchBackend { id } => {
             if ctx
                 .inference_service
@@ -1558,18 +1933,12 @@ async fn main() {
                                 vector_store.clone(),
                                 sparse_embedder.clone(),
                             );
-                            let watcher = ProjectWatcher::new(
-                                indexer,
-                                ctx.event_service.clone(),
-                            )
-                            .with_debounce(ctx.config.indexing.debounce_ms);
+                            let watcher = ProjectWatcher::new(indexer, ctx.event_service.clone())
+                                .with_debounce(ctx.config.indexing.debounce_ms);
                             let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
                             _watcher_shutdowns.push(shutdown_tx);
-                            let _handle = tokio::spawn(watcher.watch(
-                                project.id.clone(),
-                                root,
-                                shutdown_rx,
-                            ));
+                            let _handle =
+                                tokio::spawn(watcher.watch(project.id.clone(), root, shutdown_rx));
                             info!(%project.id, %project.root_path, "incremental file watcher started");
                         }
                     }

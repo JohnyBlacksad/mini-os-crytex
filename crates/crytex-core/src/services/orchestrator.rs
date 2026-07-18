@@ -88,6 +88,52 @@ fn default_codegen_workflow() -> WorkflowDefinition {
     }
 }
 
+/// Built-in workflow for remediation after a critic rejection.
+fn default_debug_workflow() -> WorkflowDefinition {
+    WorkflowDefinition {
+        id: "debug".to_string(),
+        name: "Reviewer rejection remediation pipeline".to_string(),
+        version: "1.0.0".to_string(),
+        entry: "debug".to_string(),
+        max_concurrency: 1,
+        nodes: vec![
+            WorkflowNode::Agent {
+                id: "debug".to_string(),
+                agent: "coder".to_string(),
+                task_kind: Some("debug".to_string()),
+                input: "task".to_string(),
+                output: "result".to_string(),
+                timeout_seconds: None,
+                retry: crate::services::WorkflowRetryPolicy::default(),
+            },
+            agent_node("fix", "coder"),
+            agent_node("qa", "qa"),
+            agent_node("critic", "critic"),
+            WorkflowNode::End {
+                id: "end".to_string(),
+            },
+        ],
+        edges: vec![
+            WorkflowEdge {
+                from: "debug".to_string(),
+                to: "fix".to_string(),
+            },
+            WorkflowEdge {
+                from: "fix".to_string(),
+                to: "qa".to_string(),
+            },
+            WorkflowEdge {
+                from: "qa".to_string(),
+                to: "critic".to_string(),
+            },
+            WorkflowEdge {
+                from: "critic".to_string(),
+                to: "end".to_string(),
+            },
+        ],
+    }
+}
+
 /// Default orchestrator implementation.
 pub struct OrchestratorImpl {
     task_service: Arc<dyn TaskService>,
@@ -107,6 +153,7 @@ impl OrchestratorImpl {
     pub fn new(task_service: Arc<dyn TaskService>) -> Self {
         let repo = Arc::new(MemoryWorkflowRepository::default());
         repo.insert(default_codegen_workflow());
+        repo.insert(default_debug_workflow());
         Self {
             task_service,
             planning_agent: None,
@@ -428,6 +475,10 @@ impl Orchestrator for OrchestratorImpl {
     async fn orchestrate(&self, task: &Task) -> Result<Vec<Task>, OrchestratorError> {
         match task.kind.as_str() {
             "codegen" => self.decompose_codegen(task).await,
+            "debug" => {
+                let workflow = self.load_workflow(&task.kind).await?;
+                self.materialize_workflow_subtasks(task, &workflow).await
+            }
             _ => Ok(vec![]),
         }
     }

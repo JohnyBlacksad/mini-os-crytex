@@ -2,17 +2,17 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crytex_core::config::{BackendConfig, BackendKind, CrytexConfig, SearchConfig};
+use crytex_core::indexer::ProjectIndexer;
 use crytex_core::metrics::MetricsService;
 use crytex_core::persistence::Persistence;
 use crytex_core::services::RetryRateLimitBackend;
 use crytex_core::services::caching::{CachedEmbedder, CachedVectorStore};
-use crytex_core::indexer::ProjectIndexer;
-use crytex_core::services::{
-    Embedder, EventService, FusionStrategy, InferenceService, LoraEvolutionService,
-    LoraEvolutionServiceImpl, LoraRouter, LoraRouterImpl, LoraTrainer, MemoryBankService,
-    MemoryBankServiceImpl, Reranker, SparseEmbedder, VectorStore,
-};
 use crytex_core::services::hybrid::{HybridRetriever, build_fusion_strategy};
+use crytex_core::services::{
+    Embedder, EventService, FusionStrategy, InferenceService, LoraBenchmarkGate,
+    LoraEvolutionService, LoraEvolutionServiceImpl, LoraRouter, LoraRouterImpl, LoraTrainer,
+    MemoryBankService, MemoryBankServiceImpl, Reranker, SparseEmbedder, VectorStore,
+};
 use crytex_inference::{InferenceError, InferenceManager};
 use crytex_storage::vector::{
     edge::EdgeVectorStore, memory::MemoryVectorStore, qdrant::QdrantVectorStore,
@@ -86,7 +86,9 @@ pub fn create_backend(config: &BackendConfig) -> Result<Arc<dyn InferenceManager
         }
         BackendKind::Onnx => {
             let backend = crytex_inference_onnx::OnnxBackend::from_name(&config.model)?;
-            Ok(Arc::new(RetryRateLimitBackend::default_for(Arc::new(backend))))
+            Ok(Arc::new(RetryRateLimitBackend::default_for(Arc::new(
+                backend,
+            ))))
         }
     }
 }
@@ -215,7 +217,12 @@ pub fn create_hybrid_retriever(
     sparse_embedder: Option<Arc<dyn SparseEmbedder>>,
 ) -> Arc<HybridRetriever> {
     let fusion = create_fusion_strategy(&config.search);
-    Arc::new(HybridRetriever::new(embedder, vector_store, sparse_embedder, fusion))
+    Arc::new(HybridRetriever::new(
+        embedder,
+        vector_store,
+        sparse_embedder,
+        fusion,
+    ))
 }
 
 /// Creates a reranker from configuration.
@@ -282,6 +289,41 @@ pub fn create_lora_evolution_service(
     vector_store: Option<Arc<dyn VectorStore>>,
     adapters_dir: PathBuf,
     base_model: String,
+    benchmark_gate: Option<Arc<dyn LoraBenchmarkGate>>,
+) -> Arc<dyn LoraEvolutionService> {
+    create_lora_evolution_service_with_trainer(
+        persistence,
+        task_service,
+        prompt_version_repo,
+        inference_service,
+        event_service,
+        embedder,
+        vector_store,
+        adapters_dir,
+        base_model,
+        create_lora_trainer(),
+        benchmark_gate,
+    )
+}
+
+/// Creates the LoRA evolution service with injectable trainer and benchmark gate.
+///
+/// Production uses [`create_lora_evolution_service`]; tests and alternate runtimes
+/// can inject deterministic trainer/gate implementations without changing the
+/// domain service.
+#[allow(clippy::too_many_arguments)]
+pub fn create_lora_evolution_service_with_trainer(
+    persistence: Arc<dyn Persistence>,
+    task_service: Arc<dyn crytex_core::services::TaskService>,
+    prompt_version_repo: Arc<dyn crytex_core::persistence::PromptVersionRepository>,
+    inference_service: Arc<dyn InferenceService>,
+    event_service: Arc<dyn EventService>,
+    embedder: Option<Arc<dyn Embedder>>,
+    vector_store: Option<Arc<dyn VectorStore>>,
+    adapters_dir: PathBuf,
+    base_model: String,
+    trainer: Arc<dyn LoraTrainer>,
+    benchmark_gate: Option<Arc<dyn LoraBenchmarkGate>>,
 ) -> Arc<dyn LoraEvolutionService> {
     let mut service = LoraEvolutionServiceImpl::new(
         task_service,
@@ -290,7 +332,7 @@ pub fn create_lora_evolution_service(
         persistence.clone(),
         inference_service,
         event_service,
-        create_lora_trainer(),
+        trainer,
         adapters_dir,
         base_model,
     )
@@ -299,6 +341,9 @@ pub fn create_lora_evolution_service(
     .with_training_job_repo(persistence.clone());
     if let (Some(embedder), Some(vector_store)) = (embedder, vector_store) {
         service = service.with_vector_index(embedder, vector_store);
+    }
+    if let Some(gate) = benchmark_gate {
+        service = service.with_benchmark_gate(gate);
     }
     Arc::new(service)
 }
@@ -332,6 +377,204 @@ pub fn create_memory_bank_service(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use crytex_core::bus::EventBus;
+    use crytex_core::models::{AgentLog, LoraAdapter, Project, Task, TaskStatus, TrainingExample};
+    use crytex_core::persistence::{
+        LoraAdapterRepository, ProjectRepository, TaskRepository, TrainingExampleRepository,
+    };
+    use crytex_core::services::{
+        AuditLogEntry, AuditLogService, EventServiceImpl, InferenceServiceError,
+        LoraBenchmarkDecision, LoraBenchmarkGate, LoraBenchmarkRequest, LoraTrainer,
+        LoraTrainingConfig, LoraTrainingError, LoraTrainingResult, TaskServiceImpl,
+    };
+    use crytex_inference::{
+        BackendInfo, InferenceRequest, InferenceResponse, LoRAAdapter as InferenceLoRAAdapter,
+        ModelInfo, TokenUsage,
+    };
+    use std::path::Path;
+
+    struct RejectingBenchmarkGate;
+
+    #[async_trait]
+    impl LoraBenchmarkGate for RejectingBenchmarkGate {
+        async fn evaluate(
+            &self,
+            _request: LoraBenchmarkRequest,
+        ) -> Result<LoraBenchmarkDecision, crytex_core::services::LoraEvolutionError> {
+            Ok(LoraBenchmarkDecision {
+                accepted: false,
+                reason: "challenger failed held-out benchmark".into(),
+                metadata: serde_json::json!({ "winner": "Baseline" }),
+            })
+        }
+    }
+
+    struct MockTrainer;
+
+    #[async_trait]
+    impl LoraTrainer for MockTrainer {
+        async fn train(
+            &self,
+            _examples: Vec<TrainingExample>,
+            _config: LoraTrainingConfig,
+            output_dir: &Path,
+        ) -> Result<LoraTrainingResult, LoraTrainingError> {
+            tokio::fs::create_dir_all(output_dir).await?;
+            let adapter_path = output_dir.join("candidate.safetensors");
+            tokio::fs::write(&adapter_path, b"small lora adapter").await?;
+            Ok(LoraTrainingResult {
+                adapter_id: "candidate".into(),
+                adapter_path,
+                metrics: crytex_core::services::LoraMetrics {
+                    train_loss: 0.10,
+                    validation_loss: 0.12,
+                    average_reward: 5.0,
+                },
+            })
+        }
+    }
+
+    struct NoopInference;
+
+    #[async_trait]
+    impl InferenceService for NoopInference {
+        async fn generate(
+            &self,
+            _request: InferenceRequest,
+        ) -> Result<InferenceResponse, InferenceServiceError> {
+            Ok(InferenceResponse {
+                content: "ok".into(),
+                usage: TokenUsage {
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    total_tokens: 2,
+                },
+                finish_reason: "stop".into(),
+            })
+        }
+
+        async fn embed(&self, _text: &str) -> Result<Vec<f32>, InferenceServiceError> {
+            Ok(vec![0.0])
+        }
+
+        fn available_backends(&self) -> Vec<BackendInfo> {
+            vec![]
+        }
+
+        async fn register_lora(
+            &self,
+            _lora: InferenceLoRAAdapter,
+        ) -> Result<(), InferenceServiceError> {
+            Ok(())
+        }
+
+        async fn swap_lora(&self, _lora_id: &str) -> Result<(), InferenceServiceError> {
+            Ok(())
+        }
+
+        async fn list_models(
+            &self,
+            _backend_id: Option<&str>,
+        ) -> Result<Vec<ModelInfo>, InferenceServiceError> {
+            Ok(vec![])
+        }
+    }
+
+    struct NoopAudit;
+
+    #[async_trait]
+    impl AuditLogService for NoopAudit {
+        async fn log(
+            &self,
+            _entry: AuditLogEntry,
+        ) -> Result<(), crytex_core::services::AuditError> {
+            Ok(())
+        }
+
+        async fn list_by_task(
+            &self,
+            _task_id: &str,
+        ) -> Result<Vec<AgentLog>, crytex_core::services::AuditError> {
+            Ok(vec![])
+        }
+
+        async fn list_by_project(
+            &self,
+            _project_id: &str,
+        ) -> Result<Vec<AgentLog>, crytex_core::services::AuditError> {
+            Ok(vec![])
+        }
+    }
+
+    fn temp_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("crytex-kernel-{name}-{}", ulid::Ulid::new()))
+    }
+
+    async fn seed_examples(repo: Arc<crytex_storage::Storage>, kind: &str) {
+        repo.insert_project(&Project {
+            id: "project-1".into(),
+            name: "Kernel Factory Test".into(),
+            root_path: ".".into(),
+            created_at: 0,
+            updated_at: 0,
+            metadata: serde_json::Value::Null,
+        })
+        .await
+        .unwrap();
+
+        for idx in 0..50 {
+            let task_id = format!("task-{idx}");
+            repo.insert_task(&Task {
+                id: task_id.clone(),
+                project_id: "project-1".into(),
+                parent_id: None,
+                title: format!("Training task {idx}"),
+                description: None,
+                kind: kind.into(),
+                status: TaskStatus::Completed,
+                assigned_agent: Some("coder".into()),
+                priority: 0,
+                created_at: idx,
+                started_at: Some(idx),
+                finished_at: Some(idx + 1),
+                payload: serde_json::json!({
+                    "prompt": format!("Implement robust parser branch for realistic held-out example {idx}")
+                }),
+                result: Some(serde_json::json!({
+                    "answer": format!("Parser branch implementation with validation and test coverage {idx}")
+                })),
+                iteration_count: 1,
+                priority_score: 0.0,
+                critic_score: Some(5.0),
+                human_score: Some(5.0),
+                prompt_version_id: None,
+                lora_adapter_id: None,
+                trace_id: format!("trace-{idx}"),
+            })
+            .await
+            .unwrap();
+
+            repo.insert_training_example(&TrainingExample {
+                id: format!("example-{idx}"),
+                task_id,
+                project_id: Some("project-1".into()),
+                prompt_version_id: None,
+                task_kind: kind.into(),
+                agent_role: None,
+                input_text: format!(
+                    "Implement robust parser branch for realistic held-out example {idx}"
+                ),
+                output_text: format!(
+                    "Parser branch implementation with validation and test coverage {idx}"
+                ),
+                reward: 5.0,
+                created_at: idx,
+            })
+            .await
+            .unwrap();
+        }
+    }
 
     #[test]
     fn create_sparse_embedder_returns_some_when_enabled() {
@@ -340,7 +583,10 @@ mod tests {
         config.inference.sparse_embedding_language = Some("english".into());
 
         let embedder = create_sparse_embedder(&config);
-        assert!(embedder.is_some(), "expected BM25 sparse embedder to be created");
+        assert!(
+            embedder.is_some(),
+            "expected BM25 sparse embedder to be created"
+        );
     }
 
     #[test]
@@ -349,6 +595,63 @@ mod tests {
         config.inference.sparse_embedding_enabled = false;
 
         let embedder = create_sparse_embedder(&config);
-        assert!(embedder.is_none(), "expected no sparse embedder when disabled");
+        assert!(
+            embedder.is_none(),
+            "expected no sparse embedder when disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_lora_evolution_service_wires_benchmark_gate_before_promotion() {
+        let db_path = temp_path("gate.sqlite");
+        let adapters_dir = temp_path("adapters");
+        let storage = Arc::new(
+            crytex_storage::Storage::new(&db_path.to_string_lossy())
+                .await
+                .unwrap(),
+        );
+        let event_service: Arc<dyn EventService> =
+            Arc::new(EventServiceImpl::new(Arc::new(EventBus::new())));
+        let task_service: Arc<dyn crytex_core::services::TaskService> = Arc::new(
+            TaskServiceImpl::new(storage.clone(), event_service.clone(), Arc::new(NoopAudit)),
+        );
+        seed_examples(storage.clone(), "codegen").await;
+
+        let service = create_lora_evolution_service_with_trainer(
+            storage.clone(),
+            task_service,
+            storage.clone(),
+            Arc::new(NoopInference),
+            event_service,
+            None,
+            None,
+            adapters_dir.clone(),
+            "mock-base".into(),
+            Arc::new(MockTrainer),
+            Some(Arc::new(RejectingBenchmarkGate)),
+        );
+
+        let result = service.train_and_register("codegen").await;
+
+        assert!(
+            matches!(
+            result,
+            Err(crytex_core::services::LoraEvolutionError::ValidationFailed(_, ref reason))
+                if reason.contains("benchmark gate rejected")
+            ),
+            "expected benchmark rejection, got {result:?}"
+        );
+        let adapters: Vec<LoraAdapter> =
+            storage.list_lora_adapters_by_kind("codegen").await.unwrap();
+        assert!(adapters.is_empty(), "rejected LoRA must not be registered");
+        assert!(
+            !adapters_dir
+                .join("codegen")
+                .join("candidate.safetensors")
+                .exists(),
+            "rejected LoRA artifact must be removed"
+        );
+        let _ = tokio::fs::remove_file(db_path).await;
+        let _ = tokio::fs::remove_dir_all(adapters_dir).await;
     }
 }

@@ -555,7 +555,10 @@ supports_lora = false
     #[test]
     fn onnx_backend_config_roundtrips() {
         let mut config = InferenceConfig::default();
-        config.backends.push(BackendConfig::onnx("local-embed", "nomic-ai/nomic-embed-text-v1.5"));
+        config.backends.push(BackendConfig::onnx(
+            "local-embed",
+            "nomic-ai/nomic-embed-text-v1.5",
+        ));
         config.rerank_backend = Some("local-rerank".to_string());
 
         let serialized = toml::to_string(&config).unwrap();

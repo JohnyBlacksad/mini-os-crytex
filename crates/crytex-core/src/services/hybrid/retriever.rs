@@ -78,17 +78,27 @@ impl HybridRetriever {
                 score_threshold: None,
             };
 
-            let dense_results = self
+            let dense_results = match self
                 .vector_store
                 .search(collection, &query_vector, options.clone())
-                .await?;
+                .await
+            {
+                Ok(results) => results,
+                Err(VectorStoreError::Collection(_)) => Vec::new(),
+                Err(error) => return Err(error.into()),
+            };
             all_lists.push(to_ranked_list(dense_results, RetrieverSource::Dense));
 
             if let Some(ref sv) = sparse_vector {
-                let sparse_results = self
+                let sparse_results = match self
                     .vector_store
                     .search_sparse(collection, sv, options)
-                    .await?;
+                    .await
+                {
+                    Ok(results) => results,
+                    Err(VectorStoreError::Collection(_)) => Vec::new(),
+                    Err(error) => return Err(error.into()),
+                };
                 all_lists.push(to_ranked_list(sparse_results, RetrieverSource::Sparse));
             }
         }
@@ -135,7 +145,11 @@ mod tests {
             collection: &str,
             _dim: usize,
         ) -> Result<(), VectorStoreError> {
-            self.data.lock().unwrap().entry(collection.into()).or_default();
+            self.data
+                .lock()
+                .unwrap()
+                .entry(collection.into())
+                .or_default();
             Ok(())
         }
 
@@ -165,7 +179,9 @@ mod tests {
             options: SearchOptions,
         ) -> Result<Vec<SearchResult>, VectorStoreError> {
             let cols = self.data.lock().unwrap();
-            let points = cols.get(collection).cloned().unwrap_or_default();
+            let points = cols.get(collection).cloned().ok_or_else(|| {
+                VectorStoreError::Collection(format!("collection {collection} does not exist"))
+            })?;
             let mut results: Vec<SearchResult> = points
                 .iter()
                 .map(|p| SearchResult {
@@ -189,7 +205,9 @@ mod tests {
             options: SearchOptions,
         ) -> Result<Vec<SearchResult>, VectorStoreError> {
             let cols = self.data.lock().unwrap();
-            let points = cols.get(collection).cloned().unwrap_or_default();
+            let points = cols.get(collection).cloned().ok_or_else(|| {
+                VectorStoreError::Collection(format!("collection {collection} does not exist"))
+            })?;
             let mut results: Vec<SearchResult> = points
                 .iter()
                 .map(|p| SearchResult {
@@ -302,5 +320,48 @@ mod tests {
         let lists = fusion.lists.lock().unwrap();
         assert_eq!(lists.len(), 1);
         assert_eq!(lists[0][0].source, RetrieverSource::Dense);
+    }
+
+    #[tokio::test]
+    async fn hybrid_retriever_ignores_missing_collections() {
+        let store = Arc::new(StubVectorStore {
+            sparse_supported: true,
+            ..Default::default()
+        });
+        store
+            .upsert(
+                "doc_chunks",
+                vec![VectorPoint {
+                    id: "doc-1".into(),
+                    vector: vec![1.0, 0.0],
+                    payload: serde_json::json!({
+                        "project_id": "proj-1",
+                        "text": "RAG_ONLY_SECRET_CONTEXT",
+                    }),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let retriever = HybridRetriever::new(
+            Arc::new(MockEmbedder::new(2)),
+            store,
+            Some(Arc::new(MockSparseEmbedder)),
+            Arc::new(super::super::ReciprocalRankFusion::default()),
+        );
+
+        let result = retriever
+            .search(
+                "payment retry adapter",
+                "proj-1",
+                &["code_chunks", "doc_chunks", "experience"],
+                5,
+                5,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id, "doc-1");
     }
 }

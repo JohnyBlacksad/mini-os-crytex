@@ -56,6 +56,7 @@ impl OllamaBackend {
             model: request.model.clone(),
             messages,
             stream: false,
+            think: Some(false),
             options: json!({
                 "temperature": request.temperature.unwrap_or(0.7),
                 "num_predict": request.max_tokens.unwrap_or(4096),
@@ -170,12 +171,15 @@ impl InferenceManager for OllamaBackend {
     }
 
     async fn register_lora(&self, _lora: LoRAAdapter) -> Result<(), InferenceError> {
-        // Ollama does not support LoRA adapters in the same way as local engines.
-        Ok(())
+        Err(InferenceError::UnsupportedOperation(
+            "Ollama does not support runtime LoRA adapters".to_string(),
+        ))
     }
 
     async fn swap_lora(&self, _lora_id: &str) -> Result<(), InferenceError> {
-        Ok(())
+        Err(InferenceError::UnsupportedOperation(
+            "Ollama does not support runtime LoRA adapters".to_string(),
+        ))
     }
 
     fn available_backends(&self) -> Vec<BackendInfo> {
@@ -204,6 +208,8 @@ struct ChatRequest {
     model: String,
     messages: Vec<OllamaMessage>,
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    think: Option<bool>,
     options: serde_json::Value,
 }
 
@@ -251,5 +257,22 @@ mod tests {
         let backend = OllamaBackend::with_default_model("qwen2.5-coder:14b");
         assert_eq!(backend.model(), "qwen2.5-coder:14b");
         assert_eq!(backend.url(), "http://localhost:11434");
+    }
+
+    #[tokio::test]
+    async fn lora_is_unsupported() {
+        let backend = OllamaBackend::with_default_model("qwen2.5-coder:14b");
+        let err = backend
+            .register_lora(LoRAAdapter {
+                id: "1".to_string(),
+                path: "/tmp".to_string(),
+                base_model: "base".to_string(),
+            })
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, InferenceError::UnsupportedOperation(message) if message.contains("Ollama"))
+        );
     }
 }

@@ -4,6 +4,7 @@ pub mod architect;
 pub mod coder;
 pub mod critic;
 pub mod critics;
+mod json;
 pub mod prompts;
 pub mod qa;
 pub mod researcher;

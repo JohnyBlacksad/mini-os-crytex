@@ -14,3 +14,14 @@ idea.md
 /trash
 /docs
 .playwright-mcp
+.crytex-smoke-logs/
+*.onnx
+*.bin
+*.safetensors
+*.gguf
+*.pt
+.fastembed_cache/
+.huggingface/
+node_modules/
+dist/
+crates/crytex-tauri/gen/

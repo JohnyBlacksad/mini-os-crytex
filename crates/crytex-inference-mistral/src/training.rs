@@ -1,7 +1,7 @@
 //! LoRA training implementations for the mistral.rs backend.
 //!
 //! Currently this module provides a mock trainer that writes a minimal
-//! `.safetensors` adapter file and returns deterministic metrics.  It exists
+//! PEFT-like adapter directory and returns deterministic metrics.  It exists
 //! so the rest of the system (collection, triggering, routing, and selection)
 //! can be built and tested before a real fine-tuning backend is integrated.
 
@@ -17,8 +17,8 @@ use ulid::Ulid;
 
 /// Mock trainer for integration tests.
 ///
-/// Writes a minimal (empty tensor map) `.safetensors` file to `output_dir`
-/// and returns metrics derived from the input examples.
+/// Writes a minimal PEFT-like adapter directory to `output_dir` and returns
+/// metrics derived from the input examples.
 pub struct MockLoraTrainer;
 
 impl MockLoraTrainer {
@@ -50,14 +50,39 @@ impl LoraTrainer for MockLoraTrainer {
 
         let average_reward = examples.iter().map(|e| e.reward).sum::<f64>() / examples.len() as f64;
         let adapter_id = format!("mock-lora-{}", Ulid::new());
-        let adapter_path = output_dir.join(format!("{adapter_id}.safetensors"));
+        let adapter_path = output_dir.join(&adapter_id);
+        tokio::fs::create_dir_all(&adapter_path).await?;
+        let base_model = _config
+            .base_model_path
+            .as_ref()
+            .map(|path| {
+                path.to_string_lossy()
+                    .replace('\\', "\\\\")
+                    .replace('"', "\\\"")
+            })
+            .unwrap_or_else(|| "unknown".to_string());
+        let target_modules = _config
+            .target_modules
+            .iter()
+            .map(|module| format!("\"{}\"", module.replace('"', "\\\"")))
+            .collect::<Vec<_>>()
+            .join(",");
+        let adapter_config = format!(
+            "{{\"peft_type\":\"LORA\",\"base_model_name_or_path\":\"{base_model}\",\"r\":{},\"lora_alpha\":{},\"target_modules\":[{target_modules}]}}",
+            _config.rank, _config.alpha
+        );
+        tokio::fs::write(adapter_path.join("adapter_config.json"), adapter_config).await?;
 
         let data: HashMap<String, TensorView> = HashMap::new();
         let metadata: HashMap<String, String> = [("format".to_string(), "pt".to_string())]
             .into_iter()
             .collect();
-        serialize_to_file(&data, Some(metadata), &adapter_path)
-            .map_err(|e| LoraTrainingError::AdapterSerialization(e.to_string()))?;
+        serialize_to_file(
+            &data,
+            Some(metadata),
+            &adapter_path.join("adapter_model.safetensors"),
+        )
+        .map_err(|e| LoraTrainingError::AdapterSerialization(e.to_string()))?;
 
         Ok(LoraTrainingResult {
             adapter_id,
@@ -110,14 +135,13 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(result.adapter_path.exists());
+        assert!(result.adapter_path.is_dir());
+        assert!(result.adapter_path.join("adapter_config.json").exists());
         assert!(
             result
                 .adapter_path
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .ends_with(".safetensors")
+                .join("adapter_model.safetensors")
+                .exists()
         );
 
         let _ = tokio::fs::remove_dir_all(&output).await;

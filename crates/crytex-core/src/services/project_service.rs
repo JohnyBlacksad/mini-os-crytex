@@ -260,6 +260,10 @@ mod tests {
         async fn add_dependency(&self, _dep: &TaskDependency) -> Result<(), PersistenceError> {
             Ok(())
         }
+
+        async fn list_dependencies(&self) -> Result<Vec<TaskDependency>, PersistenceError> {
+            Ok(vec![])
+        }
     }
 
     fn service() -> ProjectServiceImpl<MockRepo> {

@@ -57,7 +57,7 @@ impl DefaultBenchmarkHarness {
 impl BenchmarkHarness for DefaultBenchmarkHarness {
     async fn run(&self, request: BenchmarkRunRequest) -> Result<BenchmarkRun, BenchError> {
         let started_at = Utc::now();
-        let cases = GoldenSet::load(&request.golden_set_path).await?;
+        let cases = GoldenSet::load_validated(&request.golden_set_path).await?;
         if cases.is_empty() {
             return Err(BenchError::Harness("golden set contains no cases".into()));
         }
@@ -197,8 +197,8 @@ mod tests {
     async fn harness_runs_and_persists_results() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("gs.jsonl");
-        let data = r#"{"id":"a","input":{"answer":42},"expected":{"answer":42}}
-{"id":"b","input":{"answer":1},"expected":{"answer":2}}"#;
+        let data = r#"{"id":"a","input":{"answer":"compute add forty two"},"expected":{"answer":"compute add forty two"}}
+{"id":"b","input":{"answer":"compute subtract one"},"expected":{"answer":"compute subtract two"}}"#;
         tokio::fs::write(&path, data).await.unwrap();
 
         let repo: Arc<dyn BenchmarkResultRepository> =

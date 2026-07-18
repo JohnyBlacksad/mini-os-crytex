@@ -560,6 +560,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn candle_lora_adapter_contains_only_lora_tensors() {
+        let trainer = CandleLoraTrainer::new();
+        let output = PathBuf::from(format!(
+            "{}/candle-lora-adapter-only",
+            std::env::temp_dir().to_string_lossy()
+        ));
+        let _ = tokio::fs::remove_dir_all(&output).await;
+
+        let examples = vec![
+            example(
+                "Write add function",
+                "fn add(a: i32, b: i32) -> i32 { a + b }",
+                4.0,
+            ),
+            example(
+                "Write sub function",
+                "fn sub(a: i32, b: i32) -> i32 { a - b }",
+                4.0,
+            ),
+            example(
+                "Write mul function",
+                "fn mul(a: i32, b: i32) -> i32 { a * b }",
+                4.0,
+            ),
+            example(
+                "Write div function",
+                "fn div(a: i32, b: i32) -> i32 { a / b }",
+                4.0,
+            ),
+        ];
+        let config = LoraTrainingConfig {
+            rank: 4,
+            alpha: 8,
+            epochs: 2,
+            learning_rate: 1e-2,
+            max_seq_len: 32,
+            ..Default::default()
+        };
+
+        let result = trainer.train(examples, config, &output).await.unwrap();
+        let adapter_bytes = std::fs::read(&result.adapter_path).unwrap();
+        let tensors = safetensors::SafeTensors::deserialize(&adapter_bytes).unwrap();
+        let names = tensors.names();
+
+        assert!(!names.is_empty());
+        assert!(
+            names
+                .iter()
+                .all(|name| { name.ends_with(".lora_a") || name.ends_with(".lora_b") })
+        );
+        assert!(!names.iter().any(|name| {
+            name.contains("embed_tokens")
+                || name.contains("lm_head")
+                || name.ends_with(".q_proj.weight")
+                || name.ends_with(".v_proj.weight")
+        }));
+
+        let _ = tokio::fs::remove_dir_all(&output).await;
+    }
+
+    #[tokio::test]
     async fn candle_lora_trains_quantized_base() {
         let trainer = CandleLoraTrainer::new();
         let base_dir = PathBuf::from(format!(

@@ -203,13 +203,13 @@ impl InferenceManager for OnnxBackend {
     }
 
     async fn register_lora(&self, _lora: LoRAAdapter) -> Result<(), InferenceError> {
-        Err(InferenceError::LoRALoadFailed(
+        Err(InferenceError::UnsupportedOperation(
             "ONNX embedding backend does not support LoRA".into(),
         ))
     }
 
     async fn swap_lora(&self, _lora_id: &str) -> Result<(), InferenceError> {
-        Err(InferenceError::LoRALoadFailed(
+        Err(InferenceError::UnsupportedOperation(
             "ONNX embedding backend does not support LoRA".into(),
         ))
     }
@@ -265,10 +265,7 @@ fn find_onnx_file(dir: &Path) -> Result<PathBuf, InferenceError> {
         .collect();
     onnx_files.sort();
     onnx_files.into_iter().next().ok_or_else(|| {
-        InferenceError::EmbeddingFailed(format!(
-            "no .onnx model file found in {}",
-            dir.display()
-        ))
+        InferenceError::EmbeddingFailed(format!("no .onnx model file found in {}", dir.display()))
     })
 }
 
@@ -279,8 +276,9 @@ struct LocalEmbeddingFiles {
 
 fn read_local_embedding_model(dir: &Path) -> Result<LocalEmbeddingFiles, InferenceError> {
     let onnx_path = find_onnx_file(dir)?;
-    let onnx_bytes = std::fs::read(&onnx_path)
-        .map_err(|e| InferenceError::EmbeddingFailed(format!("cannot read {}: {}", onnx_path.display(), e)))?;
+    let onnx_bytes = std::fs::read(&onnx_path).map_err(|e| {
+        InferenceError::EmbeddingFailed(format!("cannot read {}: {}", onnx_path.display(), e))
+    })?;
 
     let mut external_data = Vec::new();
     let data_path = onnx_path.with_extension("onnx.data");
@@ -304,8 +302,9 @@ fn read_local_embedding_model(dir: &Path) -> Result<LocalEmbeddingFiles, Inferen
 fn read_tokenizer_files(dir: &Path) -> Result<TokenizerFiles, InferenceError> {
     fn read(dir: &Path, name: &str) -> Result<Vec<u8>, InferenceError> {
         let path = dir.join(name);
-        std::fs::read(&path)
-            .map_err(|e| InferenceError::EmbeddingFailed(format!("cannot read {}: {}", path.display(), e)))
+        std::fs::read(&path).map_err(|e| {
+            InferenceError::EmbeddingFailed(format!("cannot read {}: {}", path.display(), e))
+        })
     }
     Ok(TokenizerFiles {
         tokenizer_file: read(dir, "tokenizer.json")?,
@@ -384,6 +383,23 @@ mod tests {
         let backend = OnnxBackend::from_name("local:C:\\models\\my-embed").unwrap();
         assert!(matches!(backend.source, EmbeddingSource::Local(_)));
         assert_eq!(backend.model_id, "my-embed");
+    }
+
+    #[tokio::test]
+    async fn lora_is_unsupported() {
+        let backend = OnnxBackend::new();
+        let err = backend
+            .register_lora(LoRAAdapter {
+                id: "1".to_string(),
+                path: "/tmp".to_string(),
+                base_model: "base".to_string(),
+            })
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, InferenceError::UnsupportedOperation(message) if message.contains("ONNX"))
+        );
     }
 
     #[tokio::test]

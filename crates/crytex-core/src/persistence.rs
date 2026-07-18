@@ -39,6 +39,7 @@ pub trait TaskRepository: Send + Sync {
     async fn list_all_tasks(&self) -> Result<Vec<Task>, PersistenceError>;
     async fn list_ready_tasks(&self) -> Result<Vec<Task>, PersistenceError>;
     async fn add_dependency(&self, dep: &TaskDependency) -> Result<(), PersistenceError>;
+    async fn list_dependencies(&self) -> Result<Vec<TaskDependency>, PersistenceError>;
 }
 
 #[async_trait]
@@ -305,6 +306,10 @@ impl TaskRepository for MemoryTaskRepository {
     async fn add_dependency(&self, dep: &TaskDependency) -> Result<(), PersistenceError> {
         Self::lock_guard(&self.deps)?.push(dep.clone());
         Ok(())
+    }
+
+    async fn list_dependencies(&self) -> Result<Vec<TaskDependency>, PersistenceError> {
+        Ok(Self::lock_guard(&self.deps)?.clone())
     }
 }
 

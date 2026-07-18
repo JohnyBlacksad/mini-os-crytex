@@ -5,8 +5,8 @@ use crytex_inference::{
 };
 use mistralrs::core::{DeviceLayerMapMetadata, DeviceMapMetadata};
 use mistralrs::{
-    AutoDeviceMapParams, DeviceMapSetting, GgufModelBuilder, IsqBits, Model, ModelBuilder,
-    RequestBuilder, TextMessageRole,
+    AutoDeviceMapParams, DeviceMapSetting, GgufModelBuilder, IsqBits, LoraModelBuilder, Model,
+    RequestBuilder, TextMessageRole, TextModelBuilder,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -31,6 +31,18 @@ struct Inner {
     state: AsyncMutex<Option<Arc<Model>>>,
     loras: Mutex<HashMap<String, LoRAAdapter>>,
     active_lora: Mutex<Option<String>>,
+}
+
+#[derive(Debug, PartialEq)]
+enum MistralLoadPlan {
+    Plain {
+        model_id: String,
+        lora_adapter_paths: Vec<String>,
+    },
+    Gguf {
+        model_id: String,
+        files: Vec<String>,
+    },
 }
 
 impl MistralRsBackend {
@@ -58,6 +70,10 @@ impl MistralRsBackend {
         }
     }
 
+    pub fn cuda_gdn_kernel_available() -> bool {
+        option_env!("MISTRALRS_SKIP_GDN_CUDA").is_none_or(|value| value != "1")
+    }
+
     async fn ensure_loaded(&self) -> Result<Arc<Model>, InferenceError> {
         let mut guard = self.inner.state.lock().await;
         if let Some(model) = guard.as_ref() {
@@ -70,17 +86,56 @@ impl MistralRsBackend {
     }
 
     async fn load_model(&self) -> Result<Model, InferenceError> {
-        let path = PathBuf::from(&self.inner.model_path);
-
-        if looks_like_gguf(&path) {
-            self.load_gguf_model(&path).await
-        } else {
-            self.load_plain_model(&path).await
+        match self.load_plan()? {
+            MistralLoadPlan::Plain {
+                model_id,
+                lora_adapter_paths,
+            } => self.load_plain_model(&model_id, lora_adapter_paths).await,
+            MistralLoadPlan::Gguf { model_id, files } => {
+                self.load_gguf_model(model_id, files).await
+            }
         }
     }
 
-    async fn load_gguf_model(&self, path: &Path) -> Result<Model, InferenceError> {
-        let (model_id, files) = resolve_gguf_paths(path)?;
+    fn load_plan(&self) -> Result<MistralLoadPlan, InferenceError> {
+        let path = PathBuf::from(&self.inner.model_path);
+        let lora_adapter_paths = self.registered_lora_adapter_paths()?;
+
+        if looks_like_gguf(&path) {
+            if !lora_adapter_paths.is_empty() {
+                return Err(InferenceError::UnsupportedOperation(
+                    "GGUF LoRA adapter loading is not yet wired for local registered adapters"
+                        .to_string(),
+                ));
+            }
+
+            let (model_id, files) = resolve_gguf_paths(&path)?;
+            return Ok(MistralLoadPlan::Gguf { model_id, files });
+        }
+
+        Ok(MistralLoadPlan::Plain {
+            model_id: path.to_string_lossy().to_string(),
+            lora_adapter_paths,
+        })
+    }
+
+    fn registered_lora_adapter_paths(&self) -> Result<Vec<String>, InferenceError> {
+        let loras = self.inner.loras.lock().map_err(|e| {
+            InferenceError::LoRALoadFailed(format!("failed to lock LoRA registry: {e}"))
+        })?;
+        let mut adapters = loras.values().collect::<Vec<_>>();
+        adapters.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(adapters
+            .into_iter()
+            .map(|adapter| adapter.path.clone())
+            .collect())
+    }
+
+    async fn load_gguf_model(
+        &self,
+        model_id: String,
+        files: Vec<String>,
+    ) -> Result<Model, InferenceError> {
         info!(
             "Loading mistral.rs GGUF model from {} with files {:?}",
             model_id, files
@@ -96,20 +151,30 @@ impl MistralRsBackend {
             .map_err(|e| InferenceError::GenerationFailed(format!("model load failed: {e}")))
     }
 
-    async fn load_plain_model(&self, path: &Path) -> Result<Model, InferenceError> {
-        let model_id = path.to_string_lossy().to_string();
+    async fn load_plain_model(
+        &self,
+        model_id: &str,
+        lora_adapter_paths: Vec<String>,
+    ) -> Result<Model, InferenceError> {
         info!("Loading mistral.rs plain model from {}", model_id);
 
-        let mut builder = ModelBuilder::new(&model_id)
+        let mut builder = TextModelBuilder::new(model_id)
             .with_auto_isq(IsqBits::Four)
             .with_logging();
         builder =
             apply_plain_device_settings(builder, self.inner.gpu_layers, self.inner.context_size);
 
-        builder
-            .build()
-            .await
-            .map_err(|e| InferenceError::GenerationFailed(format!("model load failed: {e}")))
+        if lora_adapter_paths.is_empty() {
+            builder
+                .build()
+                .await
+                .map_err(|e| InferenceError::GenerationFailed(format!("model load failed: {e}")))
+        } else {
+            LoraModelBuilder::from_text_model_builder(builder, lora_adapter_paths)
+                .build()
+                .await
+                .map_err(|e| InferenceError::GenerationFailed(format!("model load failed: {e}")))
+        }
     }
 
     fn active_adapter_name(&self) -> Option<String> {
@@ -121,6 +186,116 @@ impl MistralRsBackend {
             .lora_adapter_id
             .clone()
             .or_else(|| self.active_adapter_name())
+    }
+
+    fn ensure_registered_adapter(&self, adapter_id: &str) -> Result<(), InferenceError> {
+        let loras = self.inner.loras.lock().map_err(|e| {
+            InferenceError::LoRALoadFailed(format!("failed to lock LoRA registry: {e}"))
+        })?;
+        if loras.contains_key(adapter_id) {
+            return Ok(());
+        }
+
+        Err(InferenceError::LoRALoadFailed(format!(
+            "LoRA adapter {adapter_id} is not registered"
+        )))
+    }
+
+    fn resolve_registered_adapter(
+        &self,
+        request: &InferenceRequest,
+    ) -> Result<Option<String>, InferenceError> {
+        let adapter = self.resolve_adapter(request);
+        if let Some(adapter_id) = adapter.as_deref() {
+            self.ensure_registered_adapter(adapter_id)?;
+        }
+        Ok(adapter)
+    }
+
+    async fn validate_lora_adapter_layout(lora: &LoRAAdapter) -> Result<(), InferenceError> {
+        let adapter_path = Path::new(&lora.path);
+        let metadata = tokio::fs::metadata(adapter_path).await.map_err(|e| {
+            InferenceError::LoRALoadFailed(format!(
+                "LoRA adapter {} metadata is unreadable at {}: {e}",
+                lora.id,
+                adapter_path.display()
+            ))
+        })?;
+        if !metadata.is_dir() {
+            return Err(InferenceError::LoRALoadFailed(format!(
+                "LoRA adapter {} must be a directory containing adapter_config.json and adapter_model.safetensors",
+                lora.id
+            )));
+        }
+
+        let config_path = adapter_path.join("adapter_config.json");
+        let weights_path = adapter_path.join("adapter_model.safetensors");
+        let config = tokio::fs::read_to_string(&config_path).await.map_err(|e| {
+            InferenceError::LoRALoadFailed(format!(
+                "LoRA adapter {} adapter_config.json is unreadable at {}: {e}",
+                lora.id,
+                config_path.display()
+            ))
+        })?;
+        let config: serde_json::Value = serde_json::from_str(&config).map_err(|e| {
+            InferenceError::LoRALoadFailed(format!(
+                "LoRA adapter {} adapter_config.json must be valid JSON at {}: {e}",
+                lora.id,
+                config_path.display()
+            ))
+        })?;
+        if config
+            .get("peft_type")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(|peft_type| !peft_type.eq_ignore_ascii_case("LORA"))
+        {
+            return Err(InferenceError::LoRALoadFailed(format!(
+                "LoRA adapter {} adapter_config.json must declare peft_type=LORA",
+                lora.id
+            )));
+        }
+
+        let weights_metadata = tokio::fs::metadata(&weights_path).await.map_err(|e| {
+            InferenceError::LoRALoadFailed(format!(
+                "LoRA adapter {} adapter_model.safetensors is unreadable at {}: {e}",
+                lora.id,
+                weights_path.display()
+            ))
+        })?;
+        if !weights_metadata.is_file() || weights_metadata.len() == 0 {
+            return Err(InferenceError::LoRALoadFailed(format!(
+                "LoRA adapter {} adapter_model.safetensors must be a non-empty file",
+                lora.id
+            )));
+        }
+
+        Ok(())
+    }
+
+    fn supports_lora_capability(&self) -> bool {
+        !Self::is_gguf_model_path(Path::new(&self.inner.model_path))
+    }
+
+    fn is_gguf_model_path(path: &Path) -> bool {
+        if path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+        {
+            return true;
+        }
+
+        path.is_dir()
+            && std::fs::read_dir(path)
+                .ok()
+                .into_iter()
+                .flatten()
+                .filter_map(Result::ok)
+                .any(|entry| {
+                    entry
+                        .path()
+                        .extension()
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+                })
     }
 }
 
@@ -216,10 +391,10 @@ fn apply_gguf_device_settings(
 }
 
 fn apply_plain_device_settings(
-    builder: ModelBuilder,
+    builder: TextModelBuilder,
     gpu_layers: Option<usize>,
     context_size: usize,
-) -> ModelBuilder {
+) -> TextModelBuilder {
     match gpu_layers {
         Some(0) => builder.with_force_cpu(),
         Some(layers) => builder.with_device_mapping(DeviceMapSetting::Map(
@@ -241,7 +416,7 @@ impl InferenceManager for MistralRsBackend {
         &self,
         request: InferenceRequest,
     ) -> Result<InferenceResponse, InferenceError> {
-        let adapter = self.resolve_adapter(&request);
+        let adapter = self.resolve_registered_adapter(&request)?;
         let model = self.ensure_loaded().await?;
 
         let mut messages = RequestBuilder::new();
@@ -298,6 +473,8 @@ impl InferenceManager for MistralRsBackend {
     }
 
     async fn register_lora(&self, lora: LoRAAdapter) -> Result<(), InferenceError> {
+        Self::validate_lora_adapter_layout(&lora).await?;
+
         {
             let mut loras = self.inner.loras.lock().map_err(|e| {
                 InferenceError::LoRALoadFailed(format!("failed to lock LoRA registry: {e}"))
@@ -332,15 +509,19 @@ impl InferenceManager for MistralRsBackend {
     }
 
     fn available_backends(&self) -> Vec<BackendInfo> {
+        let mut capabilities = vec![
+            "generate".to_string(),
+            "chat".to_string(),
+            "gguf".to_string(),
+        ];
+        if self.supports_lora_capability() {
+            capabilities.push("lora".to_string());
+        }
+
         vec![BackendInfo {
             id: "mistralrs".to_string(),
             name: "mistral.rs".to_string(),
-            capabilities: vec![
-                "generate".to_string(),
-                "chat".to_string(),
-                "gguf".to_string(),
-                "lora".to_string(),
-            ],
+            capabilities,
         }]
     }
 
@@ -355,6 +536,100 @@ impl InferenceManager for MistralRsBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use crytex_core::bus::Event;
+    use crytex_core::config::BackendKind;
+    use crytex_core::services::hardware::{DeviceKind, HardwareDetector};
+    use crytex_core::services::{
+        EventHandler, EventService, ManagedModel, ManifestEntry, ModelManager, ModelManagerError,
+        ModelManagerImpl, SystemHardwareDetector,
+    };
+    use std::sync::Arc;
+    use std::time::Duration;
+    use ulid::Ulid;
+
+    struct FixedDetector(DeviceKind);
+
+    impl HardwareDetector for FixedDetector {
+        fn detect(&self) -> DeviceKind {
+            self.0.clone()
+        }
+    }
+
+    #[derive(Default)]
+    struct SilentEventService;
+
+    #[async_trait]
+    impl EventService for SilentEventService {
+        fn publish(&self, _event: Event) {}
+
+        fn subscribe(&self) -> tokio::sync::broadcast::Receiver<Event> {
+            let (tx, _) = tokio::sync::broadcast::channel(1);
+            tx.subscribe()
+        }
+
+        async fn start_handler(&self, _handler: Arc<dyn EventHandler>) {}
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct MistralSmokeRuntime {
+        gpu_layers: Option<usize>,
+        requires_cuda_feature: bool,
+        reason: String,
+    }
+
+    fn mistral_smoke_runtime(
+        detector: &dyn HardwareDetector,
+        mode: Option<&str>,
+        gpu_layers_override: Option<usize>,
+    ) -> MistralSmokeRuntime {
+        if let Some(layers) = gpu_layers_override {
+            return MistralSmokeRuntime {
+                gpu_layers: Some(layers),
+                requires_cuda_feature: layers > 0,
+                reason: format!("user override: gpu_layers={layers}"),
+            };
+        }
+
+        match mode.unwrap_or("auto").to_ascii_lowercase().as_str() {
+            "cpu" => MistralSmokeRuntime {
+                gpu_layers: Some(0),
+                requires_cuda_feature: false,
+                reason: "forced CPU by CRYTEX_MISTRAL_SMOKE_DEVICE=cpu".into(),
+            },
+            "gpu" => {
+                let device = detector.detect();
+                MistralSmokeRuntime {
+                    gpu_layers: None,
+                    requires_cuda_feature: matches!(device, DeviceKind::Cuda { .. }),
+                    reason: format!("forced GPU by CRYTEX_MISTRAL_SMOKE_DEVICE=gpu: {device:?}"),
+                }
+            }
+            _ => match detector.detect() {
+                DeviceKind::Cpu => MistralSmokeRuntime {
+                    gpu_layers: Some(0),
+                    requires_cuda_feature: false,
+                    reason: "auto selected CPU: no usable GPU detected".into(),
+                },
+                device @ DeviceKind::Cuda { .. } => MistralSmokeRuntime {
+                    gpu_layers: None,
+                    requires_cuda_feature: true,
+                    reason: format!("auto selected CUDA GPU: {device:?}"),
+                },
+                device @ DeviceKind::Metal { .. } => MistralSmokeRuntime {
+                    gpu_layers: None,
+                    requires_cuda_feature: false,
+                    reason: format!("auto selected Metal GPU: {device:?}"),
+                },
+            },
+        }
+    }
+
+    fn env_usize(name: &str) -> Option<usize> {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+    }
 
     #[test]
     fn backend_reports_capabilities() {
@@ -362,6 +637,84 @@ mod tests {
         let info = backend.available_backends();
         assert_eq!(info.len(), 1);
         assert!(info[0].capabilities.contains(&"generate".to_string()));
+    }
+
+    #[test]
+    fn gguf_backend_does_not_advertise_lora_until_supported() {
+        let backend = MistralRsBackend::new("/tmp/model.gguf", 4096, None);
+        let info = backend.available_backends();
+
+        assert!(!info[0].capabilities.contains(&"lora".to_string()));
+    }
+
+    #[test]
+    fn smoke_runtime_auto_uses_cuda_gpu_without_forcing_cpu() {
+        let runtime = mistral_smoke_runtime(
+            &FixedDetector(DeviceKind::Cuda {
+                name: "RTX".into(),
+                vram_mb: 16_303,
+                driver_version: "596.36".into(),
+            }),
+            None,
+            None,
+        );
+
+        assert_eq!(runtime.gpu_layers, None);
+        assert!(runtime.requires_cuda_feature);
+        assert!(runtime.reason.contains("CUDA"));
+    }
+
+    #[test]
+    fn smoke_runtime_cpu_mode_forces_zero_gpu_layers() {
+        let runtime = mistral_smoke_runtime(
+            &FixedDetector(DeviceKind::Cuda {
+                name: "RTX".into(),
+                vram_mb: 16_303,
+                driver_version: "596.36".into(),
+            }),
+            Some("cpu"),
+            None,
+        );
+
+        assert_eq!(runtime.gpu_layers, Some(0));
+        assert!(!runtime.requires_cuda_feature);
+    }
+
+    #[test]
+    fn smoke_runtime_gpu_layers_override_is_respected() {
+        let runtime = mistral_smoke_runtime(
+            &FixedDetector(DeviceKind::Cuda {
+                name: "RTX".into(),
+                vram_mb: 16_303,
+                driver_version: "596.36".into(),
+            }),
+            Some("auto"),
+            Some(12),
+        );
+
+        assert_eq!(runtime.gpu_layers, Some(12));
+        assert!(runtime.requires_cuda_feature);
+    }
+
+    #[test]
+    fn plain_backend_advertises_lora_capability() {
+        let backend = MistralRsBackend::new("hf-model", 4096, None);
+        let info = backend.available_backends();
+
+        assert!(info[0].capabilities.contains(&"lora".to_string()));
+    }
+
+    #[test]
+    fn gguf_directory_backend_does_not_advertise_lora_until_supported() {
+        let dir = std::env::temp_dir().join(format!("crytex-gguf-dir-{}", Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("model.gguf"), b"not a real model").unwrap();
+        let backend = MistralRsBackend::new(dir.to_string_lossy(), 4096, None);
+        let info = backend.available_backends();
+
+        assert!(!info[0].capabilities.contains(&"lora".to_string()));
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -389,10 +742,11 @@ mod tests {
     #[tokio::test]
     async fn generate_uses_request_lora_adapter() {
         let backend = MistralRsBackend::new("/tmp/model.gguf", 4096, None);
+        let active_path = valid_lora_adapter_path("active").await;
         backend
             .register_lora(LoRAAdapter {
                 id: "active".to_string(),
-                path: "/tmp/active.safetensors".to_string(),
+                path: active_path.to_string_lossy().to_string(),
                 base_model: "mistral".to_string(),
             })
             .await
@@ -406,15 +760,132 @@ mod tests {
             backend.resolve_adapter(&request),
             Some("request-lora".to_string())
         );
+
+        let _ = tokio::fs::remove_dir_all(active_path).await;
+    }
+
+    #[tokio::test]
+    async fn generate_rejects_unregistered_request_lora_adapter_before_model_load() {
+        let backend = MistralRsBackend::new("/tmp/model.gguf", 4096, None);
+        let mut request = empty_request();
+        request.lora_adapter_id = Some("missing".to_string());
+
+        let err = backend.generate(request).await.unwrap_err();
+
+        assert!(
+            matches!(err, InferenceError::LoRALoadFailed(message) if message.contains("missing"))
+        );
+    }
+
+    #[tokio::test]
+    async fn register_lora_rejects_single_file_adapter_layout() {
+        let backend = MistralRsBackend::new("hf-model", 4096, None);
+        let adapter_file = std::env::temp_dir().join(format!("{}.safetensors", Ulid::new()));
+        tokio::fs::write(&adapter_file, b"not a peft adapter")
+            .await
+            .unwrap();
+
+        let err = backend
+            .register_lora(LoRAAdapter {
+                id: "coder".to_string(),
+                path: adapter_file.to_string_lossy().to_string(),
+                base_model: "hf-model".to_string(),
+            })
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, InferenceError::LoRALoadFailed(message) if message.contains("adapter_config.json"))
+        );
+        assert!(backend.registered_lora_adapter_paths().unwrap().is_empty());
+
+        let _ = tokio::fs::remove_file(adapter_file).await;
+    }
+
+    #[tokio::test]
+    async fn register_lora_rejects_malformed_adapter_config() {
+        let backend = MistralRsBackend::new("hf-model", 4096, None);
+        let adapter_path = valid_lora_adapter_path("malformed").await;
+        tokio::fs::write(
+            adapter_path.join("adapter_config.json"),
+            "{\"peft_type\":\"LORA\"",
+        )
+        .await
+        .unwrap();
+
+        let err = backend
+            .register_lora(LoRAAdapter {
+                id: "coder".to_string(),
+                path: adapter_path.to_string_lossy().to_string(),
+                base_model: "hf-model".to_string(),
+            })
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, InferenceError::LoRALoadFailed(message) if message.contains("valid JSON"))
+        );
+        assert!(backend.registered_lora_adapter_paths().unwrap().is_empty());
+
+        let _ = tokio::fs::remove_dir_all(adapter_path).await;
+    }
+
+    #[tokio::test]
+    async fn plain_model_load_plan_uses_registered_lora_paths() {
+        let backend = MistralRsBackend::new("hf-model", 4096, None);
+        let adapter_path = valid_lora_adapter_path("coder").await;
+        backend
+            .register_lora(LoRAAdapter {
+                id: "coder".to_string(),
+                path: adapter_path.to_string_lossy().to_string(),
+                base_model: "hf-model".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let plan = backend.load_plan().unwrap();
+
+        assert_eq!(
+            plan,
+            MistralLoadPlan::Plain {
+                model_id: "hf-model".to_string(),
+                lora_adapter_paths: vec![adapter_path.to_string_lossy().to_string()],
+            }
+        );
+
+        let _ = tokio::fs::remove_dir_all(adapter_path).await;
+    }
+
+    #[tokio::test]
+    async fn gguf_model_load_plan_rejects_registered_lora_until_supported() {
+        let backend = MistralRsBackend::new("/tmp/model.gguf", 4096, None);
+        let adapter_path = valid_lora_adapter_path("coder").await;
+        backend
+            .register_lora(LoRAAdapter {
+                id: "coder".to_string(),
+                path: adapter_path.to_string_lossy().to_string(),
+                base_model: "hf-model".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let err = backend.load_plan().unwrap_err();
+
+        assert!(
+            matches!(err, InferenceError::UnsupportedOperation(message) if message.contains("GGUF LoRA"))
+        );
+
+        let _ = tokio::fs::remove_dir_all(adapter_path).await;
     }
 
     #[tokio::test]
     async fn generate_uses_active_lora_when_request_has_none() {
         let backend = MistralRsBackend::new("/tmp/model.gguf", 4096, None);
+        let active_path = valid_lora_adapter_path("active").await;
         backend
             .register_lora(LoRAAdapter {
                 id: "active".to_string(),
-                path: "/tmp/active.safetensors".to_string(),
+                path: active_path.to_string_lossy().to_string(),
                 base_model: "mistral".to_string(),
             })
             .await
@@ -426,6 +897,144 @@ mod tests {
             backend.resolve_adapter(&request),
             Some("active".to_string())
         );
+
+        let _ = tokio::fs::remove_dir_all(active_path).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "slow manual smoke: set CRYTEX_RUN_SLOW_MISTRAL_SMOKE=1 to download/load a 483 MB TinyLlama GGUF"]
+    async fn real_hf_tiny_gguf_downloaded_model_generates_with_mistralrs() {
+        if std::env::var("CRYTEX_RUN_SLOW_MISTRAL_SMOKE").as_deref() != Ok("1") {
+            eprintln!(
+                "skipping slow mistral.rs smoke; set CRYTEX_RUN_SLOW_MISTRAL_SMOKE=1 to run it"
+            );
+            return;
+        }
+
+        let runtime = mistral_smoke_runtime(
+            &SystemHardwareDetector::new(),
+            std::env::var("CRYTEX_MISTRAL_SMOKE_DEVICE").ok().as_deref(),
+            env_usize("CRYTEX_MISTRAL_SMOKE_GPU_LAYERS"),
+        );
+        eprintln!("mistral.rs smoke runtime: {}", runtime.reason);
+        if runtime.requires_cuda_feature && !cfg!(feature = "cuda") {
+            eprintln!(
+                "skipping CUDA smoke because crytex-inference-mistral was built without --features cuda"
+            );
+            return;
+        }
+
+        let config_dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let manager = ModelManagerImpl::new_standard(
+            config_dir.path(),
+            cache_dir.path(),
+            Arc::new(SilentEventService),
+            Arc::new(FixedDetector(DeviceKind::Cpu)),
+        );
+
+        manager
+            .add_model(ManifestEntry {
+                id: Some("hf-tinyllama-chat-q2-gguf".into()),
+                name: Some("HF TinyLlama Chat Q2 GGUF".into()),
+                repo: Some("TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF".into()),
+                filename: Some("tinyllama-1.1b-chat-v1.0.Q2_K.gguf".into()),
+                quantization: Some("Q2_K".into()),
+                backend: Some("mistral_rs".into()),
+                params_b: Some(1.1),
+            })
+            .unwrap();
+
+        let model = manager
+            .download_model("hf-tinyllama-chat-q2-gguf")
+            .await
+            .unwrap();
+        let local_path = downloaded_mistral_path(model).unwrap();
+        let backend = MistralRsBackend::new(local_path.to_string_lossy(), 64, runtime.gpu_layers);
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(180),
+            backend.generate(InferenceRequest {
+                backend_id: Some("mistralrs".into()),
+                model: local_path.to_string_lossy().to_string(),
+                messages: vec![Message {
+                    role: "user".into(),
+                    content: "Reply with the single word: ok".into(),
+                }],
+                system_prompt: Some("You are a concise test assistant.".into()),
+                temperature: Some(0.0),
+                max_tokens: Some(1),
+                lora_adapter_id: None,
+            }),
+        )
+        .await
+        .expect("mistral.rs TinyLlama smoke timed out")
+        .unwrap();
+
+        assert!(
+            !response.content.trim().is_empty(),
+            "mistral.rs should return non-empty text for the downloaded GGUF"
+        );
+        assert!(response.usage.total_tokens > 0);
+    }
+
+    #[tokio::test]
+    #[ignore = "slow manual smoke: set CRYTEX_RUN_SLOW_MISTRAL_GDN_SMOKE=1 to download/load a tiny Qwen3 Next GDN model"]
+    async fn real_hf_tiny_qwen3_next_gdn_generates_with_mistralrs() {
+        if std::env::var("CRYTEX_RUN_SLOW_MISTRAL_GDN_SMOKE").as_deref() != Ok("1") {
+            eprintln!(
+                "skipping slow mistral.rs GDN smoke; set CRYTEX_RUN_SLOW_MISTRAL_GDN_SMOKE=1 to run it"
+            );
+            return;
+        }
+
+        let runtime = mistral_smoke_runtime(
+            &SystemHardwareDetector::new(),
+            std::env::var("CRYTEX_MISTRAL_SMOKE_DEVICE").ok().as_deref(),
+            env_usize("CRYTEX_MISTRAL_SMOKE_GPU_LAYERS"),
+        );
+        eprintln!("mistral.rs GDN smoke runtime: {}", runtime.reason);
+        if runtime.requires_cuda_feature && !cfg!(feature = "cuda") {
+            eprintln!(
+                "skipping CUDA GDN smoke because crytex-inference-mistral was built without --features cuda"
+            );
+            return;
+        }
+
+        let model_id = "tiny-random/qwen3-next-moe";
+        let backend = MistralRsBackend::new(model_id, 64, runtime.gpu_layers);
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(240),
+            backend.generate(InferenceRequest {
+                backend_id: Some("mistralrs".into()),
+                model: model_id.into(),
+                messages: vec![Message {
+                    role: "user".into(),
+                    content: "Reply with the single word: ok".into(),
+                }],
+                system_prompt: Some("You are a concise test assistant.".into()),
+                temperature: Some(0.0),
+                max_tokens: Some(1),
+                lora_adapter_id: None,
+            }),
+        )
+        .await
+        .expect("mistral.rs Qwen3 Next GDN smoke timed out")
+        .unwrap();
+
+        assert!(
+            !response.content.trim().is_empty(),
+            "mistral.rs should return non-empty text for the tiny Qwen3 Next GDN model"
+        );
+        assert!(response.usage.total_tokens > 0);
+    }
+
+    fn downloaded_mistral_path(model: ManagedModel) -> Result<PathBuf, ModelManagerError> {
+        assert_eq!(model.preferred_backend, BackendKind::MistralRs);
+        model
+            .local_path
+            .ok_or_else(|| ModelManagerError::Download("downloaded model has no path".into()))
     }
 
     fn empty_request() -> InferenceRequest {
@@ -438,5 +1047,17 @@ mod tests {
             max_tokens: None,
             lora_adapter_id: None,
         }
+    }
+
+    async fn valid_lora_adapter_path(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("crytex-{name}-{}", Ulid::new()));
+        tokio::fs::create_dir_all(&path).await.unwrap();
+        tokio::fs::write(path.join("adapter_config.json"), "{\"peft_type\":\"LORA\"}")
+            .await
+            .unwrap();
+        tokio::fs::write(path.join("adapter_model.safetensors"), b"adapter")
+            .await
+            .unwrap();
+        path
     }
 }

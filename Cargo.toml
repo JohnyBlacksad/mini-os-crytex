@@ -4,6 +4,7 @@ members = [
     "crates/crytex-bench",
     "crates/crytex-compress",
     "crates/crytex-core",
+    "crates/crytex-diag",
     "crates/crytex-doc",
     "crates/crytex-ide",
     "crates/crytex-inference",
@@ -20,6 +21,10 @@ members = [
     "crates/crytex-tauri",
     "crates/crytex-tools",
 ]
+exclude = [
+    "patches/mistralrs-core",
+    "patches/mistralrs-quant",
+]
 resolver = "2"
 
 # Patch esaxx-rs to avoid mixing /MT (static CRT) with /MD (dynamic CRT) on Windows.
@@ -28,6 +33,8 @@ resolver = "2"
 # the dynamic CRT to match the rest of the workspace.
 [patch.crates-io]
 esaxx-rs = { path = "patches/esaxx-rs" }
+mistralrs-core = { path = "patches/mistralrs-core" }
+mistralrs-quant = { path = "patches/mistralrs-quant" }
 
 [profile.test.package.crytex-bench]
 debug = false

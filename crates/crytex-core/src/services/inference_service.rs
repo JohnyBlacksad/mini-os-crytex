@@ -4,8 +4,8 @@ use async_trait::async_trait;
 use crytex_compress::compress::CompressionError;
 use crytex_compress::pipeline::CompressionPipeline;
 use crytex_inference::{
-    BackendInfo, BackendRegistry, InferenceError, InferenceManager, InferenceRequest,
-    InferenceResponse, LoRAAdapter, ModelInfo,
+    BackendCapabilityReport, BackendInfo, BackendRegistry, InferenceError, InferenceManager,
+    InferenceRequest, InferenceResponse, LoRAAdapter, ModelInfo,
 };
 use thiserror::Error;
 
@@ -30,6 +30,7 @@ impl From<InferenceError> for InferenceServiceError {
     fn from(e: InferenceError) -> Self {
         match e {
             InferenceError::RateLimited { .. } => Self::RateLimited,
+            InferenceError::UnsupportedOperation(message) => Self::UnsupportedOperation(message),
             other => Self::Inference(other),
         }
     }
@@ -49,6 +50,14 @@ pub trait InferenceService: Send + Sync {
 
     /// List available backends.
     fn available_backends(&self) -> Vec<BackendInfo>;
+
+    /// List typed capability reports for available backends.
+    fn backend_capability_reports(&self) -> Vec<BackendCapabilityReport> {
+        self.available_backends()
+            .into_iter()
+            .map(|backend| backend.capability_report())
+            .collect()
+    }
 
     /// Register a LoRA adapter with the default backend.
     async fn register_lora(&self, lora: LoRAAdapter) -> Result<(), InferenceServiceError>;
@@ -450,10 +459,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn backend_capability_reports_are_typed() {
+        let svc = service();
+        let reports = svc.backend_capability_reports();
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].id, "mock");
+        assert!(reports[0].generate);
+        assert!(reports[0].embed);
+        assert!(!reports[0].rerank);
+        assert!(!reports[0].lora);
+        assert!(!reports[0].hot_swap);
+    }
+
+    #[tokio::test]
     async fn swap_lora_propagates_errors() {
         let svc = service();
         let err = svc.swap_lora("missing").await.unwrap_err();
         assert!(matches!(err, InferenceServiceError::Inference(_)));
+    }
+
+    #[test]
+    fn unsupported_inference_error_maps_to_unsupported_service_error() {
+        let err = InferenceServiceError::from(InferenceError::UnsupportedOperation(
+            "GGUF LoRA is not wired".into(),
+        ));
+
+        assert!(
+            matches!(err, InferenceServiceError::UnsupportedOperation(message) if message.contains("GGUF LoRA"))
+        );
     }
 
     #[tokio::test]

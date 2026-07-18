@@ -1,5 +1,6 @@
 use crate::{
     extract_backend_id, extract_model,
+    json::{parse_llm_json_value, strip_markdown_json_fence},
     prompts::{critic_system_prompt, critic_user_prompt, system_prompt_override},
     tooling::generate_with_tools,
 };
@@ -26,19 +27,42 @@ impl Default for CriticAgent {
 }
 
 fn parse_critic_output(content: &str, usage: &TokenUsage) -> Result<Value, serde_json::Error> {
-    let trimmed = content.trim();
-    let cleaned = if let Some(inner) = trimmed.strip_prefix("```json") {
-        inner.trim().trim_end_matches("```").trim()
-    } else if let Some(inner) = trimmed.strip_prefix("```") {
-        inner.trim().trim_end_matches("```").trim()
-    } else {
-        trimmed
-    };
-
-    let mut value: Value = serde_json::from_str(cleaned)?;
+    let cleaned = strip_markdown_json_fence(content);
+    let mut value = parse_llm_json_value(cleaned)
+        .or_else(|_| parse_llm_json_value(&strip_invalid_escapes(cleaned)))?;
 
     if value.get("comments").is_none() {
         value["comments"] = Value::Array(Vec::new());
+    }
+
+    if value.get("review_decision").is_none() {
+        let decision = value
+            .get("approved")
+            .and_then(|approved| approved.as_bool())
+            .map(|approved| if approved { "pass" } else { "reject" })
+            .unwrap_or_else(|| {
+                let score = value.get("score").and_then(|score| score.as_f64());
+                if score.is_some_and(|score| score >= 3.0) {
+                    "pass"
+                } else {
+                    "reject"
+                }
+            });
+        value["review_decision"] = Value::String(decision.to_string());
+    }
+
+    if value.get("blocking_issues").is_none() {
+        value["blocking_issues"] = Value::Array(Vec::new());
+    }
+
+    if value.get("feedback").is_none() {
+        let feedback = value
+            .get("comments")
+            .and_then(|comments| comments.as_array())
+            .and_then(|comments| comments.first())
+            .and_then(|comment| comment.as_str())
+            .unwrap_or("No reviewer feedback provided.");
+        value["feedback"] = Value::String(feedback.to_string());
     }
 
     if value.get("usage").is_none() {
@@ -50,6 +74,26 @@ fn parse_critic_output(content: &str, usage: &TokenUsage) -> Result<Value, serde
     }
 
     Ok(value)
+}
+
+fn strip_invalid_escapes(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            output.push(ch);
+            continue;
+        }
+
+        match chars.peek().copied() {
+            Some('"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't' | 'u') => {
+                output.push(ch);
+            }
+            Some(_) => {}
+            None => output.push(ch),
+        }
+    }
+    output
 }
 
 #[async_trait]
@@ -221,6 +265,7 @@ mod tests {
 
         assert_eq!(result["score"], 4.2);
         assert_eq!(result["approved"], true);
+        assert_eq!(result["review_decision"], "pass");
         assert_eq!(result["comments"], serde_json::json!(["looks good"]));
         assert_eq!(result["usage"]["prompt_tokens"], 10);
     }
@@ -236,6 +281,7 @@ mod tests {
         let value = parse_critic_output(content, &usage).unwrap();
         assert_eq!(value["score"], 3.0);
         assert_eq!(value["approved"], false);
+        assert_eq!(value["review_decision"], "reject");
         assert_eq!(value["comments"], Value::Array(Vec::new()));
     }
 
@@ -249,5 +295,61 @@ mod tests {
         };
         let value = parse_critic_output(content, &usage).unwrap();
         assert_eq!(value["comments"], Value::Array(Vec::new()));
+        assert_eq!(value["review_decision"], "pass");
+        assert_eq!(
+            value["feedback"],
+            Value::String("No reviewer feedback provided.".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_critic_output_keeps_structured_rejection_feedback() {
+        let content = r#"{
+            "score": 1.0,
+            "review_decision": "reject",
+            "target_task_id": "task-coder",
+            "failure_type": "missing_requirement",
+            "blocking_issues": [
+                {
+                    "severity": "high",
+                    "reason": "Missing required output",
+                    "evidence": "No report was created",
+                    "expected": "Create the report"
+                }
+            ],
+            "feedback": "Create the missing report.",
+            "comments": ["blocking"]
+        }"#;
+        let usage = TokenUsage {
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            total_tokens: 2,
+        };
+        let value = parse_critic_output(content, &usage).unwrap();
+        assert_eq!(value["review_decision"], "reject");
+        assert_eq!(value["target_task_id"], "task-coder");
+        assert_eq!(value["failure_type"], "missing_requirement");
+        assert_eq!(value["feedback"], "Create the missing report.");
+    }
+
+    #[test]
+    fn parse_critic_output_recovers_from_invalid_llm_escapes() {
+        let content = r#"{
+            "score": 1.0,
+            "review_decision": "reject",
+            "target_task_id": "manual\-coder\-task",
+            "failure_type": "missing_requirement",
+            "blocking_issues": [],
+            "feedback": "Fix the missing report\.",
+            "comments": []
+        }"#;
+        let usage = TokenUsage {
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            total_tokens: 2,
+        };
+        let value = parse_critic_output(content, &usage).unwrap();
+        assert_eq!(value["target_task_id"], "manual-coder-task");
+        assert_eq!(value["feedback"], "Fix the missing report.");
     }
 }

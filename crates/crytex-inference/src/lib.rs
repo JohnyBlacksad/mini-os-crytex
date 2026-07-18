@@ -40,6 +40,37 @@ pub struct BackendInfo {
     pub capabilities: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BackendCapabilityReport {
+    pub id: String,
+    pub name: String,
+    pub generate: bool,
+    pub chat: bool,
+    pub embed: bool,
+    pub rerank: bool,
+    pub lora: bool,
+    pub hot_swap: bool,
+}
+
+impl BackendInfo {
+    pub fn capability_report(&self) -> BackendCapabilityReport {
+        BackendCapabilityReport {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            generate: self.has_capability("generate"),
+            chat: self.has_capability("chat"),
+            embed: self.has_capability("embed"),
+            rerank: self.has_capability("rerank"),
+            lora: self.has_capability("lora"),
+            hot_swap: self.has_capability("hot_swap") || self.has_capability("lora_hot_swap"),
+        }
+    }
+
+    fn has_capability(&self, capability: &str) -> bool {
+        self.capabilities.iter().any(|item| item == capability)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TokenUsage {
     pub prompt_tokens: usize,
@@ -72,6 +103,8 @@ pub enum InferenceError {
     EmbeddingFailed(String),
     #[error("backend not available: {0}")]
     BackendNotAvailable(String),
+    #[error("unsupported operation: {0}")]
+    UnsupportedOperation(String),
     /// The backend reported a rate limit. The caller may retry after the
     /// suggested delay (in milliseconds) has elapsed.
     #[error("rate limited")]
@@ -139,4 +172,49 @@ pub trait InferenceManager: Send + Sync {
     fn available_backends(&self) -> Vec<BackendInfo>;
     /// Lists models available through this backend.
     async fn list_models(&self) -> Result<Vec<ModelInfo>, InferenceError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backend_info_builds_typed_capability_report() {
+        let info = BackendInfo {
+            id: "mistralrs".into(),
+            name: "mistral.rs".into(),
+            capabilities: vec![
+                "generate".into(),
+                "chat".into(),
+                "embed".into(),
+                "rerank".into(),
+                "lora".into(),
+                "hot_swap".into(),
+            ],
+        };
+
+        let report = info.capability_report();
+
+        assert_eq!(report.id, "mistralrs");
+        assert!(report.generate);
+        assert!(report.chat);
+        assert!(report.embed);
+        assert!(report.rerank);
+        assert!(report.lora);
+        assert!(report.hot_swap);
+    }
+
+    #[test]
+    fn backend_info_does_not_infer_hot_swap_from_lora() {
+        let info = BackendInfo {
+            id: "mistralrs".into(),
+            name: "mistral.rs".into(),
+            capabilities: vec!["generate".into(), "lora".into()],
+        };
+
+        let report = info.capability_report();
+
+        assert!(report.lora);
+        assert!(!report.hot_swap);
+    }
 }

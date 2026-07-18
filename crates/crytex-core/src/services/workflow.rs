@@ -736,9 +736,19 @@ impl AgentWorkflowNodeExecutor {
             .map(|s| s.to_string())
             .unwrap_or_else(|| TraceContext::new().trace_id);
 
-        let mut payload = state.clone();
+        let session_id = ulid::Ulid::new().to_string();
         let prompt = state.get(input).cloned().unwrap_or_default();
-        payload["prompt"] = prompt;
+        let payload = serde_json::json!({
+            "prompt": prompt,
+            "upstream_artifact": state.get(input).cloned().unwrap_or_default(),
+            "agent_session": {
+                "session_id": session_id,
+                "role": agent,
+                "node_id": id,
+                "input_key": input,
+                "clean_context": true
+            }
+        });
 
         let kind = node.task_kind().unwrap_or(agent).to_string();
 
@@ -985,6 +995,206 @@ task_kind = "codegen"
         let wf = WorkflowDefinition::from_toml(toml).unwrap();
         let node = wf.node("coder").unwrap();
         assert_eq!(node.task_kind(), Some("codegen"));
+    }
+
+    #[test]
+    fn agent_workflow_task_payload_is_clean_session_with_explicit_artifact() {
+        let node = WorkflowNode::Agent {
+            id: "coder".to_string(),
+            agent: "coder".to_string(),
+            task_kind: Some("codegen".to_string()),
+            input: "design_artifact".to_string(),
+            output: "patch".to_string(),
+            timeout_seconds: None,
+            retry: WorkflowRetryPolicy::default(),
+        };
+        let state = serde_json::json!({
+            "project_id": "p1",
+            "trace_id": "trace-clean",
+            "task": "original user goal",
+            "design_artifact": {
+                "summary": "Use a focused service",
+                "files": ["src/lib.rs"]
+            },
+            "secret_internal_context": "previous agent scratchpad that must not leak",
+            "unrelated_previous_output": "do not pass this unless explicitly selected"
+        });
+
+        let task = AgentWorkflowNodeExecutor::build_task(&node, &state).unwrap();
+
+        assert_eq!(task.trace_id, "trace-clean");
+        assert_eq!(task.assigned_agent.as_deref(), Some("coder"));
+        assert_eq!(task.kind, "codegen");
+        assert_eq!(task.payload["prompt"], state["design_artifact"]);
+        assert_eq!(task.payload["upstream_artifact"], state["design_artifact"]);
+        assert_eq!(task.payload["agent_session"]["role"], "coder");
+        assert_eq!(
+            task.payload["agent_session"]["input_key"],
+            "design_artifact"
+        );
+        assert!(task.payload["agent_session"]["session_id"].is_string());
+        assert!(task.payload.get("secret_internal_context").is_none());
+        assert!(task.payload.get("unrelated_previous_output").is_none());
+        assert!(task.payload.get("task").is_none());
+    }
+
+    struct CapturingAgentService {
+        seen: Mutex<Option<Task>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentService for CapturingAgentService {
+        async fn register(&self, _agent: Arc<dyn crate::services::Agent>) {}
+
+        async fn find(&self, _name: &str) -> Option<Arc<dyn crate::services::Agent>> {
+            None
+        }
+
+        async fn list(&self) -> Vec<String> {
+            vec![]
+        }
+
+        fn route(&self, task: &Task) -> Option<String> {
+            task.assigned_agent.clone()
+        }
+
+        async fn execute(
+            &self,
+            task: &Task,
+            _inference: Arc<dyn InferenceService>,
+            _tools: Arc<dyn ToolService>,
+        ) -> Result<serde_json::Value, crate::services::AgentServiceError> {
+            *self.seen.lock().unwrap() = Some(task.clone());
+            Ok(serde_json::json!({ "ok": true }))
+        }
+    }
+
+    struct RoleOnlyLoraRouter;
+
+    #[async_trait::async_trait]
+    impl LoraRouter for RoleOnlyLoraRouter {
+        async fn resolve(
+            &self,
+            _task: &Task,
+            _project_id: &str,
+        ) -> Result<Option<String>, crate::services::LoraRouterError> {
+            Ok(None)
+        }
+
+        async fn resolve_for_role(
+            &self,
+            role: AgentRole,
+            _project_id: &str,
+        ) -> Result<Option<String>, crate::services::LoraRouterError> {
+            Ok((role == AgentRole::Coder).then_some("coder-lora-v1".to_string()))
+        }
+    }
+
+    struct NoopInference;
+
+    #[async_trait::async_trait]
+    impl InferenceService for NoopInference {
+        async fn generate(
+            &self,
+            _request: crytex_inference::InferenceRequest,
+        ) -> Result<crytex_inference::InferenceResponse, crate::services::InferenceServiceError>
+        {
+            unimplemented!()
+        }
+
+        async fn embed(
+            &self,
+            _text: &str,
+        ) -> Result<Vec<f32>, crate::services::InferenceServiceError> {
+            unimplemented!()
+        }
+
+        async fn register_lora(
+            &self,
+            _lora: crytex_inference::LoRAAdapter,
+        ) -> Result<(), crate::services::InferenceServiceError> {
+            Ok(())
+        }
+
+        async fn swap_lora(
+            &self,
+            _lora_id: &str,
+        ) -> Result<(), crate::services::InferenceServiceError> {
+            Ok(())
+        }
+
+        fn available_backends(&self) -> Vec<crytex_inference::BackendInfo> {
+            vec![]
+        }
+
+        async fn list_models(
+            &self,
+            _backend_id: Option<&str>,
+        ) -> Result<Vec<crytex_inference::ModelInfo>, crate::services::InferenceServiceError>
+        {
+            Ok(vec![])
+        }
+    }
+
+    struct NoopToolService;
+
+    #[async_trait::async_trait]
+    impl ToolService for NoopToolService {
+        async fn invoke(
+            &self,
+            _name: &str,
+            _args: serde_json::Value,
+        ) -> Result<serde_json::Value, crate::services::ToolServiceError> {
+            Ok(serde_json::Value::Null)
+        }
+
+        fn list_tools(&self) -> Vec<crate::services::ToolDescription> {
+            vec![]
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_workflow_executor_selects_role_lora_for_clean_session() {
+        let agent_service = Arc::new(CapturingAgentService {
+            seen: Mutex::new(None),
+        });
+        let executor = AgentWorkflowNodeExecutor::new(
+            agent_service.clone(),
+            Arc::new(NoopInference),
+            Arc::new(NoopToolService),
+        )
+        .with_lora_router(Arc::new(RoleOnlyLoraRouter));
+        let node = WorkflowNode::Agent {
+            id: "coder".to_string(),
+            agent: "coder".to_string(),
+            task_kind: Some("codegen".to_string()),
+            input: "design".to_string(),
+            output: "patch".to_string(),
+            timeout_seconds: None,
+            retry: WorkflowRetryPolicy::default(),
+        };
+
+        let output = executor
+            .execute(
+                &node,
+                &serde_json::json!({
+                    "project_id": "p1",
+                    "trace_id": "trace-role-lora",
+                    "design": { "artifact": "write minimal patch" },
+                    "scratchpad": "must not leak"
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(output, serde_json::json!({ "ok": true }));
+        let task = agent_service.seen.lock().unwrap().clone().unwrap();
+        assert_eq!(task.lora_adapter_id.as_deref(), Some("coder-lora-v1"));
+        assert_eq!(
+            task.payload["upstream_artifact"]["artifact"],
+            "write minimal patch"
+        );
+        assert!(task.payload.get("scratchpad").is_none());
     }
 
     #[derive(Default)]

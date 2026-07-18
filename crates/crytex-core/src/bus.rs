@@ -69,6 +69,22 @@ pub enum Event {
         model_id: String,
         progress: f32,
     },
+    RuntimeSelected {
+        backend: String,
+        model_id: String,
+        model_path: Option<String>,
+        endpoint_url: Option<String>,
+        context_size: Option<usize>,
+        gpu_layers: Option<usize>,
+        quantization: Option<String>,
+    },
+    RunObserved {
+        project_id: String,
+        task_id: Option<String>,
+        trace_id: String,
+        action: String,
+        metadata: serde_json::Value,
+    },
     Alert {
         severity: crate::services::AlertSeverity,
         message: String,
