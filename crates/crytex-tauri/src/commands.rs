@@ -2099,6 +2099,28 @@ async fn create_artifact_handoff_remediation_task(
     target_task: &Task,
     rejection: &ArtifactHandoffRejection,
 ) -> Result<Task, TauriCommandError> {
+    if let Some(existing) =
+        find_existing_artifact_handoff_remediation(task_service.as_ref(), target_task, rejection)
+            .await?
+    {
+        log_run_event(
+            audit_service,
+            event_service,
+            "artifact_handoff_remediation_task_reused",
+            Some(target_task),
+            &target_task.project_id,
+            Some(&target_task.trace_id),
+            serde_json::json!({
+                "run_id": run_id,
+                "source_task_id": rejection.source_task_id,
+                "target_task_id": target_task.id,
+                "remediation_task_id": existing.id,
+            }),
+        )
+        .await;
+        return Ok(existing);
+    }
+
     let remediation = task_service
         .submit(CreateTaskRequest {
             project_id: target_task.project_id.clone(),
@@ -2154,6 +2176,23 @@ async fn create_artifact_handoff_remediation_task(
     )
     .await;
     Ok(remediation)
+}
+
+async fn find_existing_artifact_handoff_remediation(
+    task_service: &dyn TaskService,
+    target_task: &Task,
+    rejection: &ArtifactHandoffRejection,
+) -> Result<Option<Task>, TauriCommandError> {
+    Ok(task_service
+        .list_by_project(&target_task.project_id)
+        .await?
+        .into_iter()
+        .find(|task| {
+            !task.status.is_terminal()
+                && task.payload["source"] == "artifact_handoff_rejection"
+                && task.payload["source_task_id"] == rejection.source_task_id
+                && task.payload["target_task_id"] == target_task.id
+        }))
 }
 
 fn build_agent_artifact_envelope(task: &Task) -> Option<AgentArtifactEnvelope> {
@@ -4066,6 +4105,72 @@ mod tests {
                 && dep.depends_on == remediation.id
                 && dep.dep_type == "artifact_handoff_recovery"
         }));
+    }
+
+    #[tokio::test]
+    async fn artifact_handoff_remediation_creation_is_idempotent() {
+        let target = Task {
+            id: "task-critic".into(),
+            project_id: "project-1".into(),
+            parent_id: Some("goal-1".into()),
+            title: "Review artifacts".into(),
+            description: None,
+            kind: "review".into(),
+            status: TaskStatus::Pending,
+            assigned_agent: Some("critic".into()),
+            priority: 5,
+            payload: json!({}),
+            result: None,
+            created_at: 20,
+            started_at: None,
+            finished_at: None,
+            iteration_count: 0,
+            priority_score: 5.0,
+            critic_score: None,
+            human_score: None,
+            prompt_version_id: None,
+            lora_adapter_id: None,
+            trace_id: "trace-invalid-handoff".into(),
+        };
+        let task_service = Arc::new(SiblingTaskService::new(vec![target.clone()]));
+        let rejection = ArtifactHandoffRejection {
+            source_task_id: "task-coder-invalid".into(),
+            source_agent: Some("coder".into()),
+            artifact_kind: "patch_artifact".into(),
+            reason: "artifact content requires non-empty array field `files_changed`".into(),
+        };
+
+        let first = create_artifact_handoff_remediation_task(
+            task_service.clone(),
+            None,
+            None,
+            "run-1",
+            &target,
+            &rejection,
+        )
+        .await
+        .unwrap();
+        let second = create_artifact_handoff_remediation_task(
+            task_service.clone(),
+            None,
+            None,
+            "run-1",
+            &target,
+            &rejection,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(first.id, second.id);
+        assert_eq!(
+            task_service
+                .tasks()
+                .iter()
+                .filter(|task| task.payload["source"] == "artifact_handoff_rejection")
+                .count(),
+            1,
+            "same rejected handoff must create only one remediation task"
+        );
     }
 
     #[test]
