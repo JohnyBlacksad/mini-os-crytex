@@ -309,7 +309,6 @@ async fn run_real_runtime_smoke_report() -> RealRuntimeSmokeReport {
 }
 
 #[tokio::test]
-#[ignore = "requires local Ollama and a cached/downloadable model"]
 async fn start_run_executes_ready_task_with_real_ollama_model() {
     let ollama_url =
         std::env::var("CRYTEX_E2E_OLLAMA_URL").unwrap_or_else(|_| DEFAULT_OLLAMA_URL.to_string());
