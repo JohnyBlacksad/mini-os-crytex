@@ -1906,6 +1906,7 @@ async fn attach_upstream_artifacts(
 
 fn build_agent_artifact_handoff(task: &Task) -> Option<Value> {
     let envelope = build_agent_artifact_envelope(task)?;
+    validate_agent_artifact_envelope(&envelope).ok()?;
     Some(serde_json::json!({
         "schema_version": envelope.schema_version,
         "artifact_id": envelope.artifact_id,
@@ -1951,6 +1952,83 @@ fn artifact_content_from_result(result: &Value) -> Value {
         .or_else(|| result.pointer("/artifact"))
         .cloned()
         .unwrap_or_else(|| result.clone())
+}
+
+fn validate_agent_artifact_envelope(envelope: &AgentArtifactEnvelope) -> Result<(), String> {
+    if envelope.schema_version != 1 {
+        return Err(format!(
+            "unsupported artifact schema_version {}",
+            envelope.schema_version
+        ));
+    }
+    require_non_empty(&envelope.artifact_id, "artifact_id")?;
+    require_non_empty(&envelope.source_task_id, "source_task_id")?;
+    require_object(&envelope.content, "content")?;
+    match envelope.artifact_kind.as_str() {
+        "design_artifact" => validate_design_artifact(&envelope.content),
+        "patch_artifact" => validate_patch_artifact(&envelope.content),
+        "test_report_artifact" => validate_test_report_artifact(&envelope.content),
+        "security_report_artifact" => validate_security_report_artifact(&envelope.content),
+        "review_decision" => validate_review_decision_artifact(&envelope.content),
+        _ => Ok(()),
+    }
+}
+
+fn validate_design_artifact(content: &Value) -> Result<(), String> {
+    require_text_field(content, "summary")
+        .or_else(|_| require_text_field(content, "content"))
+        .map(|_| ())
+}
+
+fn validate_patch_artifact(content: &Value) -> Result<(), String> {
+    require_array_field(content, "files_changed")?;
+    require_text_field(content, "summary")?;
+    Ok(())
+}
+
+fn validate_test_report_artifact(content: &Value) -> Result<(), String> {
+    require_text_field(content, "summary")
+        .or_else(|_| require_text_field(content, "test_results"))
+        .map(|_| ())
+}
+
+fn validate_security_report_artifact(content: &Value) -> Result<(), String> {
+    require_text_field(content, "summary")
+        .or_else(|_| require_text_field(content, "risk"))
+        .map(|_| ())
+}
+
+fn validate_review_decision_artifact(content: &Value) -> Result<(), String> {
+    require_text_field(content, "review_decision").map(|_| ())
+}
+
+fn require_object(value: &Value, field: &str) -> Result<(), String> {
+    value
+        .as_object()
+        .map(|_| ())
+        .ok_or_else(|| format!("{field} must be an object"))
+}
+
+fn require_non_empty(value: &str, field: &str) -> Result<(), String> {
+    (!value.trim().is_empty())
+        .then_some(())
+        .ok_or_else(|| format!("{field} must be non-empty"))
+}
+
+fn require_text_field<'a>(content: &'a Value, field: &str) -> Result<&'a str, String> {
+    content
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| format!("artifact content requires non-empty string field `{field}`"))
+}
+
+fn require_array_field<'a>(content: &'a Value, field: &str) -> Result<&'a Vec<Value>, String> {
+    content
+        .get(field)
+        .and_then(Value::as_array)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("artifact content requires non-empty array field `{field}`"))
 }
 
 fn is_generated_chain_task(task: &Task) -> bool {
@@ -2218,6 +2296,54 @@ mod tests {
             timestamp: 0,
             metadata,
         }
+    }
+
+    #[test]
+    fn build_agent_artifact_handoff_rejects_invalid_patch_artifact() {
+        let task = diagnostic_task(
+            "task-coder",
+            "coder",
+            TaskStatus::Completed,
+            json!({
+                "source": "agent_service",
+                "agent_result": {
+                    "artifact": {
+                        "summary": "changed files but omitted files_changed"
+                    }
+                }
+            }),
+        );
+
+        let handoff = build_agent_artifact_handoff(&task);
+
+        assert!(
+            handoff.is_none(),
+            "invalid patch artifact must not be handed to downstream agents"
+        );
+    }
+
+    #[test]
+    fn build_agent_artifact_handoff_accepts_valid_patch_artifact() {
+        let task = diagnostic_task(
+            "task-coder",
+            "coder",
+            TaskStatus::Completed,
+            json!({
+                "source": "agent_service",
+                "agent_result": {
+                    "artifact": {
+                        "files_changed": ["src/lib.rs"],
+                        "summary": "implemented the requested behavior",
+                        "test_results": "cargo test passed"
+                    }
+                }
+            }),
+        );
+
+        let handoff = build_agent_artifact_handoff(&task).expect("valid patch should pass");
+
+        assert_eq!(handoff["artifact_kind"], "patch_artifact");
+        assert_eq!(handoff["content"]["files_changed"][0], "src/lib.rs");
     }
 
     struct DummyProjectService {

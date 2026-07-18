@@ -1697,12 +1697,7 @@ mod tests {
                 })
             } else {
                 serde_json::json!({
-                    "artifact": {
-                        "producer": task.assigned_agent,
-                        "kind": task.kind,
-                        "upstream_count": upstream.len(),
-                        "content": format!("{} artifact", task.kind)
-                    }
+                    "artifact": valid_role_artifact(task, upstream.len())
                 })
             };
             Ok(serde_json::json!({
@@ -1763,11 +1758,7 @@ mod tests {
                 })
             } else {
                 json!({
-                    "artifact": {
-                        "producer": task.assigned_agent,
-                        "iteration": task.iteration_count,
-                        "upstream_count": upstream.len()
-                    }
+                    "artifact": valid_role_artifact(task, upstream.len())
                 })
             };
             Ok(json!({
@@ -1778,6 +1769,41 @@ mod tests {
                 "upstream_artifacts_seen": upstream,
                 "agent_result": agent_result
             }))
+        }
+    }
+
+    fn valid_role_artifact(task: &Task, upstream_count: usize) -> serde_json::Value {
+        match task.assigned_agent.as_deref() {
+            Some("coder") => json!({
+                "producer": "coder",
+                "files_changed": ["src/lib.rs"],
+                "summary": "implemented the requested behavior",
+                "test_results": "cargo test passed",
+                "upstream_count": upstream_count
+            }),
+            Some("qa") => json!({
+                "producer": "qa",
+                "summary": "verified the patch against acceptance criteria",
+                "test_results": "targeted tests passed",
+                "upstream_count": upstream_count
+            }),
+            Some("security") => json!({
+                "producer": "security",
+                "summary": "reviewed the patch for unsafe behavior",
+                "risk": "low",
+                "upstream_count": upstream_count
+            }),
+            Some("architect") => json!({
+                "producer": "architect",
+                "summary": "designed an atomic implementation plan",
+                "content": "architecture artifact",
+                "upstream_count": upstream_count
+            }),
+            _ => json!({
+                "producer": task.assigned_agent,
+                "summary": format!("{} artifact", task.kind),
+                "upstream_count": upstream_count
+            }),
         }
     }
 
