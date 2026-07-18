@@ -516,6 +516,7 @@ impl InferenceManager for MistralRsBackend {
         ];
         if self.supports_lora_capability() {
             capabilities.push("lora".to_string());
+            capabilities.push("hot_swap".to_string());
         }
 
         vec![BackendInfo {
@@ -702,6 +703,15 @@ mod tests {
         let info = backend.available_backends();
 
         assert!(info[0].capabilities.contains(&"lora".to_string()));
+    }
+
+    #[test]
+    fn plain_backend_advertises_lora_hot_swap_capability() {
+        let backend = MistralRsBackend::new("hf-model", 4096, None);
+        let report = backend.available_backends()[0].capability_report();
+
+        assert!(report.lora);
+        assert!(report.hot_swap);
     }
 
     #[test]
