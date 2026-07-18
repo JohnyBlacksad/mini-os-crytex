@@ -801,7 +801,6 @@ async fn real_ollama_agent_run_receives_indexed_rag_context() {
 }
 
 #[tokio::test]
-#[ignore = "requires local Ollama and a cached/downloadable model"]
 async fn critic_rejection_from_real_ollama_creates_remediation_chain() {
     let state = ollama_critic_state().await;
     let project_root = state.temp_dir.path().join("project-critic-remediation");
@@ -860,7 +859,39 @@ Otherwise return:
         .get_project_state(&project.id)
         .await
         .expect("project state should export remediation chain");
-    assert_eq!(run.review_tasks.len(), 1);
+    let task_diagnostics = exported
+        .tasks
+        .iter()
+        .map(|task| {
+            json!({
+                "id": task.id,
+                "parent_id": task.parent_id,
+                "kind": task.kind,
+                "agent": task.assigned_agent,
+                "status": task.status.as_str(),
+                "source": task.payload.get("source"),
+                "review_decision": task
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.pointer("/agent_result/review_decision"))
+                    .or_else(|| task
+                        .result
+                        .as_ref()
+                        .and_then(|result| result.pointer("/agent_result/agent_result/review_decision")))
+                    .or_else(|| task.result.as_ref().and_then(|result| result.pointer("/review_decision"))),
+            })
+        })
+        .collect::<Vec<_>>();
+    if run.review_tasks.len() != 1 {
+        state.app.shutdown_project_watchers().await;
+    }
+    assert_eq!(
+        run.review_tasks.len(),
+        1,
+        "expected final human review after remediation; remaining_ready={}; tasks={}",
+        run.remaining_ready_tasks.len(),
+        serde_json::to_string_pretty(&task_diagnostics).unwrap()
+    );
     assert_eq!(
         run.review_tasks[0].assigned_agent.as_deref(),
         Some("critic")
@@ -1656,15 +1687,25 @@ impl TaskExecutor for RealCriticDeterministicWorkerExecutor {
             .and_then(|value| value.as_array())
             .map(Vec::len)
             .unwrap_or_default();
+        let agent_result = if task.assigned_agent.as_deref() == Some("coder") {
+            json!({
+                "summary": format!("{} completed remediation step", task.kind),
+                "files_changed": ["crytex-remediation-report.md"],
+                "test_results": "deterministic remediation worker passed",
+                "upstream_count": upstream_count
+            })
+        } else {
+            json!({
+                "summary": format!("{} completed remediation step", task.kind),
+                "upstream_count": upstream_count
+            })
+        };
         Ok(json!({
             "source": "deterministic_remediation_worker",
             "run_id": run_id,
             "task_id": task.id,
             "agent": task.assigned_agent,
-            "agent_result": {
-                "summary": format!("{} completed remediation step", task.kind),
-                "upstream_count": upstream_count
-            }
+            "agent_result": agent_result
         }))
     }
 }
