@@ -276,7 +276,7 @@ impl ProjectIndexer {
             "text": chunk.text,
             "start_line": chunk.start_line,
             "end_line": chunk.end_line,
-            "symbol_id": chunk.symbol_id.as_ref().map(|id| id.as_str()),
+            "symbol_id": chunk.symbol_id.as_deref(),
             "related_symbols": chunk
                 .related_symbols
                 .iter()

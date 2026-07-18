@@ -174,6 +174,7 @@ impl CrytexAppState {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn new_sqlite_with_executor_factory_and_planning(
         db_path: impl AsRef<Path>,
         task_executor_factory: TaskExecutorFactory,
@@ -2453,7 +2454,7 @@ mod tests {
         let project = state
             .project_service
             .create(crytex_core::services::CreateProjectRequest {
-                name: "Promoted LoRA Agent Request".into(),
+                name: "Promoted LoRA Agent Request",
                 root_path: &project_root,
             })
             .await
@@ -2523,17 +2524,19 @@ mod tests {
         assert_eq!(run.review_tasks.len(), 1);
         assert_eq!(run.review_tasks[0].id, next_task.id);
 
-        let requests = captured_requests.lock().unwrap();
-        assert!(
-            requests
-                .iter()
-                .any(|request| request.lora_adapter_id.as_deref() == Some("codegen-v1")),
-            "expected promoted codegen-v1 adapter in next inference request, got: {:?}",
-            requests
-                .iter()
-                .map(|request| request.lora_adapter_id.clone())
-                .collect::<Vec<_>>()
-        );
+        {
+            let requests = captured_requests.lock().unwrap();
+            assert!(
+                requests
+                    .iter()
+                    .any(|request| request.lora_adapter_id.as_deref() == Some("codegen-v1")),
+                "expected promoted codegen-v1 adapter in next inference request, got: {:?}",
+                requests
+                    .iter()
+                    .map(|request| request.lora_adapter_id.clone())
+                    .collect::<Vec<_>>()
+            );
+        }
         state.shutdown_project_watchers().await;
     }
 
@@ -3144,7 +3147,7 @@ mod tests {
         let project = state
             .project_service
             .create(crytex_core::services::CreateProjectRequest {
-                name: "Run Observed Bridge".into(),
+                name: "Run Observed Bridge",
                 root_path: &project_root,
             })
             .await
@@ -3221,7 +3224,7 @@ mod tests {
         let project = state
             .project_service
             .create(crytex_core::services::CreateProjectRequest {
-                name: "Approval Triggered LoRA Diagnostics".into(),
+                name: "Approval Triggered LoRA Diagnostics",
                 root_path: &project_root,
             })
             .await
@@ -3333,7 +3336,7 @@ mod tests {
         let project = state
             .project_service
             .create(crytex_core::services::CreateProjectRequest {
-                name: "Approval Triggered LoRA Benchmark".into(),
+                name: "Approval Triggered LoRA Benchmark",
                 root_path: &project_root,
             })
             .await
@@ -3386,11 +3389,12 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        let gate_requests = gate.requests.lock().unwrap();
-        assert_eq!(gate_requests.len(), 1);
-        assert_eq!(gate_requests[0].task_kind, "codegen");
-        assert_eq!(gate_requests[0].challenger_adapter_id, "codegen-v1");
-        drop(gate_requests);
+        {
+            let gate_requests = gate.requests.lock().unwrap();
+            assert_eq!(gate_requests.len(), 1);
+            assert_eq!(gate_requests[0].task_kind, "codegen");
+            assert_eq!(gate_requests[0].challenger_adapter_id, "codegen-v1");
+        }
 
         let report = state
             .export_run_diagnostics(ExportRunDiagnosticsCommand {
@@ -3477,7 +3481,7 @@ mod tests {
         let project = state
             .project_service
             .create(crytex_core::services::CreateProjectRequest {
-                name: "Real Bench Gate LoRA Product Path".into(),
+                name: "Real Bench Gate LoRA Product Path",
                 root_path: &project_root,
             })
             .await

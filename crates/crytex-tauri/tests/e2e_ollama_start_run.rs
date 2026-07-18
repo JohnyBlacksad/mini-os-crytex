@@ -115,10 +115,10 @@ async fn run_real_runtime_smoke_report() -> RealRuntimeSmokeReport {
     let plan = state
         .submit_goal(SubmitGoalCommand {
             project_id: project.id.clone(),
-            goal: "Use the payment retry smoke context and run the generated agent chain to critic human review.".into(),
+            goal: "Use the payment retry smoke context, make the coder create docs/real-runtime-smoke-report.md with fs_write, and run the generated agent chain to critic human review. The coder final JSON must include files_changed with docs/real-runtime-smoke-report.md.".into(),
             context: json!({
                 "smoke": "real_runtime_smoke_reports_production_agent_chain",
-                "expected": "orchestrator creates tasks, agents execute, critic gates, human approval records reward"
+                "expected": "orchestrator creates tasks, coder writes docs/real-runtime-smoke-report.md, agents execute, critic gates, human approval records reward"
             }),
             trace_id: Some("trace-real-runtime-smoke".into()),
         })
@@ -147,7 +147,20 @@ async fn run_real_runtime_smoke_report() -> RealRuntimeSmokeReport {
         .await
         .expect("real runtime smoke should execute generated chain");
 
-    assert_eq!(run.review_tasks.len(), 1);
+    let run_diagnostics = state
+        .export_run_diagnostics(ExportRunDiagnosticsCommand {
+            project_id: project.id.clone(),
+            run_id: run.run_id.clone(),
+            trace_id: Some("trace-real-runtime-smoke".into()),
+        })
+        .await
+        .expect("real runtime smoke diagnostics should export");
+    assert_eq!(
+        run.review_tasks.len(),
+        1,
+        "artifact handoff rejections: {:?}",
+        run_diagnostics.artifact_handoff_rejections
+    );
     assert!(run.remaining_ready_tasks.is_empty());
     let review_task = run.review_tasks[0].clone();
     assert_eq!(review_task.assigned_agent.as_deref(), Some("critic"));

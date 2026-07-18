@@ -5,7 +5,7 @@ use crytex_core::bus::Event;
 use crytex_core::config::{BackendKind, SecurityConfig};
 use crytex_core::indexer::{IndexerError, search_chunks};
 use crytex_core::metrics::MetricsService;
-use crytex_core::models::{KanbanState, Project, Task, TaskStatus};
+use crytex_core::models::{KanbanState, Project, Task, TaskDependency, TaskStatus};
 use crytex_core::persistence::ProjectSnapshotRepository;
 use crytex_core::services::agent_service::capabilities_for_task;
 use crytex_core::services::{
@@ -400,8 +400,39 @@ impl TaskExecutor for StubTaskExecutor {
             "agent": task.assigned_agent,
             "kind": task.kind,
             "status": "review",
-            "note": "stub run did not execute real agent work"
+            "note": "stub run did not execute real agent work",
+            "agent_result": {
+                "artifact": stub_artifact_for_task(task)
+            }
         }))
+    }
+}
+
+fn stub_artifact_for_task(task: &Task) -> Value {
+    match task.assigned_agent.as_deref() {
+        Some("architect") => serde_json::json!({
+            "summary": format!("Stub architecture artifact for {}", task.title),
+            "content": "deterministic architecture placeholder"
+        }),
+        Some("coder") => serde_json::json!({
+            "summary": format!("Stub patch artifact for {}", task.title),
+            "files_changed": ["stub://unexecuted-task"]
+        }),
+        Some("qa") => serde_json::json!({
+            "summary": format!("Stub QA artifact for {}", task.title),
+            "test_results": "not executed by stub runtime"
+        }),
+        Some("security") => serde_json::json!({
+            "summary": format!("Stub security artifact for {}", task.title),
+            "risk": "not assessed by stub runtime"
+        }),
+        Some("critic") => serde_json::json!({
+            "review_decision": "pass",
+            "summary": format!("Stub critic review for {}", task.title)
+        }),
+        _ => serde_json::json!({
+            "summary": format!("Stub artifact for {}", task.title)
+        }),
     }
 }
 
@@ -1009,7 +1040,7 @@ fn diagnostic_lora_evolution(events: &[RunDiagnosticEvent]) -> Vec<RunDiagnostic
                 accepted: gate
                     .and_then(|gate| gate.get("accepted"))
                     .and_then(Value::as_bool)
-                    .or_else(|| match event.action.as_str() {
+                    .or(match event.action.as_str() {
                         "lora_evolution_promoted" => Some(true),
                         "lora_evolution_rejected" => Some(false),
                         _ => None,
@@ -1630,7 +1661,7 @@ pub async fn start_run_with_orchestrator(
             run_started_logged = true;
         }
 
-        attach_upstream_artifacts(
+        let handoff_result = attach_upstream_artifacts(
             task_service.clone(),
             audit_service.as_ref(),
             event_service.as_ref(),
@@ -1639,6 +1670,9 @@ pub async fn start_run_with_orchestrator(
         )
         .await?;
         task_service.update_task(&task).await?;
+        if handoff_result.rejected_count > 0 {
+            continue;
+        }
         let running = task_service
             .set_status(&task.id, TaskStatus::InProgress)
             .await?;
@@ -1933,9 +1967,9 @@ async fn attach_upstream_artifacts(
     event_service: Option<&Arc<dyn EventService>>,
     run_id: &str,
     task: &mut Task,
-) -> Result<(), TauriCommandError> {
+) -> Result<ArtifactHandoffAttachResult, TauriCommandError> {
     let Some(parent_id) = task.parent_id.clone() else {
-        return Ok(());
+        return Ok(ArtifactHandoffAttachResult::default());
     };
     let mut upstream = task_service
         .list_by_project(&task.project_id)
@@ -1951,10 +1985,12 @@ async fn attach_upstream_artifacts(
     upstream.sort_by_key(|candidate| candidate.created_at);
 
     let mut upstream_artifacts = Vec::new();
+    let mut rejected_count = 0;
     for artifact in upstream {
         match build_agent_artifact_handoff_result(&artifact) {
             Ok(handoff) => upstream_artifacts.push(handoff),
             Err(rejection) => {
+                rejected_count += 1;
                 log_artifact_handoff_rejection(
                     audit_service,
                     event_service,
@@ -1979,7 +2015,12 @@ async fn attach_upstream_artifacts(
         task.payload["parent_result"] = Value::Array(upstream_artifacts.clone());
     }
     task.payload["upstream_artifacts"] = Value::Array(upstream_artifacts);
-    Ok(())
+    Ok(ArtifactHandoffAttachResult { rejected_count })
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ArtifactHandoffAttachResult {
+    rejected_count: usize,
 }
 
 #[cfg(test)]
@@ -2088,6 +2129,13 @@ async fn create_artifact_handoff_remediation_task(
             trace_id: Some(target_task.trace_id.clone()),
         })
         .await?;
+    task_service
+        .add_dependency(TaskDependency {
+            task_id: target_task.id.clone(),
+            depends_on: remediation.id.clone(),
+            dep_type: "artifact_handoff_recovery".to_string(),
+        })
+        .await?;
     log_run_event(
         audit_service,
         event_service,
@@ -2136,6 +2184,7 @@ fn artifact_content_from_result(result: &Value) -> Value {
     result
         .pointer("/agent_result/artifact")
         .or_else(|| result.pointer("/artifact"))
+        .or_else(|| result.pointer("/agent_result"))
         .cloned()
         .unwrap_or_else(|| result.clone())
 }
@@ -2527,6 +2576,29 @@ mod tests {
         );
 
         let handoff = build_agent_artifact_handoff(&task).expect("valid patch should pass");
+
+        assert_eq!(handoff["artifact_kind"], "patch_artifact");
+        assert_eq!(handoff["content"]["files_changed"][0], "src/lib.rs");
+    }
+
+    #[test]
+    fn build_agent_artifact_handoff_accepts_agent_result_as_artifact_content() {
+        let task = diagnostic_task(
+            "task-coder",
+            "coder",
+            TaskStatus::Completed,
+            json!({
+                "source": "agent_service",
+                "agent_result": {
+                    "files_changed": ["src/lib.rs"],
+                    "summary": "implemented the requested behavior",
+                    "test_results": "cargo test passed"
+                }
+            }),
+        );
+
+        let handoff = build_agent_artifact_handoff(&task)
+            .expect("agent_result artifact fields should pass handoff validation");
 
         assert_eq!(handoff["artifact_kind"], "patch_artifact");
         assert_eq!(handoff["content"]["files_changed"][0], "src/lib.rs");
@@ -3059,17 +3131,23 @@ mod tests {
 
     struct SiblingTaskService {
         tasks: Mutex<Vec<Task>>,
+        deps: Mutex<Vec<TaskDependency>>,
     }
 
     impl SiblingTaskService {
         fn new(tasks: Vec<Task>) -> Self {
             Self {
                 tasks: Mutex::new(tasks),
+                deps: Mutex::new(Vec::new()),
             }
         }
 
         fn tasks(&self) -> Vec<Task> {
             self.tasks.lock().unwrap().clone()
+        }
+
+        fn deps(&self) -> Vec<TaskDependency> {
+            self.deps.lock().unwrap().clone()
         }
     }
 
@@ -3103,7 +3181,8 @@ mod tests {
             tasks.push(task.clone());
             Ok(task)
         }
-        async fn add_dependency(&self, _dep: TaskDependency) -> Result<(), TaskError> {
+        async fn add_dependency(&self, dep: TaskDependency) -> Result<(), TaskError> {
+            self.deps.lock().unwrap().push(dep);
             Ok(())
         }
         async fn get(&self, id: &str) -> Result<Option<Task>, TaskError> {
@@ -3933,7 +4012,11 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(response.review_tasks.len(), 1);
+        assert_eq!(
+            response.review_tasks.len(),
+            0,
+            "critic must not reach human review until rejected handoff is remediated"
+        );
         assert!(events.events().iter().any(|event| {
             matches!(
                 event,
@@ -3977,6 +4060,12 @@ mod tests {
                 .as_str()
                 .is_some_and(|reason| reason.contains("files_changed"))
         );
+        let deps = task_service.deps();
+        assert!(deps.iter().any(|dep| {
+            dep.task_id == "task-critic"
+                && dep.depends_on == remediation.id
+                && dep.dep_type == "artifact_handoff_recovery"
+        }));
     }
 
     #[test]

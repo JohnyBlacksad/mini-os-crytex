@@ -214,7 +214,7 @@ fn smoke_request(request: &ModelRuntimeProbeRequest) -> InferenceRequest {
         }],
         system_prompt: Some("You are running a short runtime smoke test.".into()),
         temperature: Some(0.0),
-        max_tokens: Some(request.max_tokens.min(32).max(1)),
+        max_tokens: Some(request.max_tokens.clamp(1, 32)),
         lora_adapter_id: request.lora_adapter_id.clone(),
     }
 }

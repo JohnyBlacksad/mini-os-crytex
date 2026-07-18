@@ -23,6 +23,14 @@ impl QaAgent {
 fn parse_qa_output(content: &str, usage: &TokenUsage) -> Result<Value, serde_json::Error> {
     let mut value = parse_llm_json_value(content)?;
 
+    if value
+        .get("summary")
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+    {
+        value["summary"] = Value::String(default_qa_summary(&value));
+    }
+
     if value.get("usage").is_none() {
         value["usage"] = serde_json::json!({
             "prompt_tokens": usage.prompt_tokens,
@@ -32,6 +40,22 @@ fn parse_qa_output(content: &str, usage: &TokenUsage) -> Result<Value, serde_jso
     }
 
     Ok(value)
+}
+
+fn default_qa_summary(value: &Value) -> String {
+    let passed = value.get("passed").and_then(Value::as_bool).unwrap_or(false);
+    let failure_count = value
+        .get("failures")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or_default();
+    if passed {
+        "QA completed successfully.".to_string()
+    } else if failure_count > 0 {
+        format!("QA found {failure_count} failure(s).")
+    } else {
+        "QA completed without a model-provided summary.".to_string()
+    }
 }
 
 impl Default for QaAgent {
@@ -279,5 +303,17 @@ mod tests {
         assert_eq!(value["usage"]["prompt_tokens"], 7);
         assert_eq!(value["usage"]["completion_tokens"], 8);
         assert_eq!(value["usage"]["total_tokens"], 15);
+    }
+
+    #[test]
+    fn parse_qa_output_injects_summary_when_missing() {
+        let content = "{\"passed\":true,\"failures\":[]}";
+        let usage = TokenUsage {
+            prompt_tokens: 1,
+            completion_tokens: 2,
+            total_tokens: 3,
+        };
+        let value = parse_qa_output(content, &usage).unwrap();
+        assert_eq!(value["summary"], "QA completed successfully.");
     }
 }
