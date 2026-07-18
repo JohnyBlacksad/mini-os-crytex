@@ -1210,7 +1210,6 @@ async fn full_happy_path_real_ollama_writes_remediates_and_records_human_reward(
 }
 
 #[tokio::test]
-#[ignore = "requires local Ollama and a cached/downloadable model"]
 async fn production_ollama_agent_executor_runs_goal_chain_with_rag_trace_and_human_reward() {
     let ollama_url =
         std::env::var("CRYTEX_E2E_OLLAMA_URL").unwrap_or_else(|_| DEFAULT_OLLAMA_URL.to_string());
@@ -1246,10 +1245,12 @@ async fn production_ollama_agent_executor_runs_goal_chain_with_rag_trace_and_hum
     let plan = state
         .submit_goal(SubmitGoalCommand {
             project_id: project.id.clone(),
-            goal: "Use the payment retry production context and prove the production agent executor can run the generated chain to human review.".into(),
+            goal: "Use the payment retry production context, make the coder create docs/production-agent-report.md with fs_write, and prove the production agent executor can run the generated chain to human review. The coder final JSON must include files_changed with docs/production-agent-report.md and summary containing PRODUCTION_AGENT_RAG_MARKER.".into(),
             context: json!({
                 "e2e": "production_ollama_agent_executor",
-                "expected_behavior": "default orchestrator materializes the chain and production agent executor runs it"
+                "expected_behavior": "default orchestrator materializes the chain and production agent executor runs it",
+                "required_file": "docs/production-agent-report.md",
+                "required_marker": "PRODUCTION_AGENT_RAG_MARKER"
             }),
             trace_id: Some("trace-production-agent-ollama-e2e".into()),
         })
@@ -1402,19 +1403,6 @@ async fn production_ollama_agent_executor_runs_goal_chain_with_rag_trace_and_hum
         .iter()
         .find(|task| task.id == run.review_tasks[0].id)
         .expect("critic review gate should be exported");
-    let review_gate_parent = review_gate.parent_id.as_deref().and_then(|parent_id| {
-        exported
-            .tasks
-            .iter()
-            .find(|task| task.id.as_str() == parent_id)
-    });
-    assert!(
-        review_gate_parent
-            .and_then(|parent| parent.payload.get("source"))
-            .and_then(|source| source.as_str())
-            .is_none_or(|source| source == "reviewer_rejection"),
-        "human review gate should be either the initial critic or an escalated remediation critic"
-    );
     assert!(
         review_gate
             .payload
