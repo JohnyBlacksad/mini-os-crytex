@@ -526,7 +526,6 @@ async fn goal_plan_approval_starts_first_generated_task_with_real_ollama_model()
 }
 
 #[tokio::test]
-#[ignore = "requires local Ollama and a cached/downloadable model"]
 async fn agent_executor_uses_real_ollama_tool_loop_to_read_requirements_write_report_and_audit_trace()
  {
     let ollama_url =

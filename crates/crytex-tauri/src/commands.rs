@@ -1117,6 +1117,7 @@ fn diagnostic_artifact_lineage(tasks: &[Task]) -> Vec<AgentArtifactEnvelope> {
 fn diagnostic_artifact_handoff_rejections(
     events: &[RunDiagnosticEvent],
 ) -> Vec<RunDiagnosticArtifactHandoffRejection> {
+    let mut seen = BTreeSet::new();
     events
         .iter()
         .filter(|event| event.action == "artifact_handoff_rejected")
@@ -1124,16 +1125,26 @@ fn diagnostic_artifact_handoff_rejections(
             let source_task_id = event.metadata["source_task_id"].as_str()?;
             let artifact_kind = event.metadata["artifact_kind"].as_str()?;
             let reason = event.metadata["reason"].as_str()?;
+            let target_task_id = event.metadata["target_task_id"]
+                .as_str()
+                .map(ToOwned::to_owned)
+                .or_else(|| event.task_id.clone());
+            let key = (
+                source_task_id.to_string(),
+                target_task_id.clone(),
+                artifact_kind.to_string(),
+                reason.to_string(),
+            );
+            if !seen.insert(key) {
+                return None;
+            }
             Some(RunDiagnosticArtifactHandoffRejection {
                 task_id: event.task_id.clone(),
                 source_task_id: source_task_id.to_string(),
                 source_agent: event.metadata["source_agent"]
                     .as_str()
                     .map(ToOwned::to_owned),
-                target_task_id: event.metadata["target_task_id"]
-                    .as_str()
-                    .map(ToOwned::to_owned)
-                    .or_else(|| event.task_id.clone()),
+                target_task_id,
                 target_agent: event.metadata["target_agent"]
                     .as_str()
                     .map(ToOwned::to_owned),
@@ -4692,6 +4703,76 @@ mod tests {
                 .reason
                 .contains("files_changed")
         );
+    }
+
+    #[test]
+    fn build_run_diagnostics_deduplicates_repeated_artifact_handoff_rejections() {
+        let runtime = RuntimeStatus {
+            tauri_runtime: true,
+            executor_mode: "ollama_agent".into(),
+            planning_mode: "deterministic".into(),
+            active_backend: Some("ollama".into()),
+            active_model: Some("qwen3.5:9b".into()),
+            ollama_url: Some("http://127.0.0.1:11434".into()),
+            real_agent_execution: true,
+            backend_capabilities: vec![],
+            cuda_toolchain: None,
+            compatibility_notes: vec![],
+            model_compatibility: None,
+        };
+        let duplicate_rejection = json!({
+            "run_id": "run-1",
+            "trace_id": "trace-1",
+            "source_task_id": "task-coder-invalid",
+            "source_agent": "coder",
+            "target_task_id": "task-critic",
+            "target_agent": "critic",
+            "artifact_kind": "patch_artifact",
+            "reason": "artifact content requires non-empty array field `files_changed`"
+        });
+        let state = ProjectState {
+            project: dummy_project("p1"),
+            kanban: KanbanState {
+                project_id: "p1".into(),
+                columns: vec![],
+            },
+            tasks: vec![diagnostic_task(
+                "task-critic",
+                "critic",
+                TaskStatus::Review,
+                json!({
+                    "source": "agent_service",
+                    "agent_result": { "review_decision": "pass" }
+                }),
+            )],
+            recent_logs: vec![
+                diagnostic_log(
+                    "artifact_handoff_rejected",
+                    Some("task-critic"),
+                    duplicate_rejection.clone(),
+                ),
+                diagnostic_log(
+                    "artifact_handoff_rejected",
+                    Some("task-critic"),
+                    duplicate_rejection,
+                ),
+            ],
+            latest_snapshot: None,
+            metrics: MetricsSnapshot::default(),
+        };
+
+        let report = build_run_diagnostics(
+            ExportRunDiagnosticsCommand {
+                project_id: "p1".into(),
+                run_id: "run-1".into(),
+                trace_id: None,
+            },
+            state,
+            runtime,
+        )
+        .unwrap();
+
+        assert_eq!(report.artifact_handoff_rejections.len(), 1);
     }
 
     #[test]
