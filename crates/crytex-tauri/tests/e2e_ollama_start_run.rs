@@ -388,13 +388,26 @@ async fn start_run_executes_ready_task_with_real_ollama_model() {
 }
 
 #[tokio::test]
-#[ignore = "requires local Ollama and a cached/downloadable model"]
 async fn goal_plan_approval_starts_first_generated_task_with_real_ollama_model() {
-    let state = ollama_state().await;
-    let project_root = state.temp_dir.path().join("project-goal");
-    std::fs::create_dir_all(&project_root).expect("project root should be created");
+    let ollama_url =
+        std::env::var("CRYTEX_E2E_OLLAMA_URL").unwrap_or_else(|_| DEFAULT_OLLAMA_URL.to_string());
+    let model =
+        std::env::var("CRYTEX_E2E_OLLAMA_MODEL").unwrap_or_else(|_| DEFAULT_E2E_MODEL.to_string());
+    ensure_model_available(&ollama_url, &model).await;
+
+    let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+    let db_path = temp_dir.path().join("crytex-tauri-goal-agent-e2e.db");
+    let state = CrytexAppState::new_sqlite_with_ollama_agent_executor(
+        &db_path,
+        ollama_url,
+        model.clone(),
+    )
+    .await
+    .expect("state should initialize with Ollama agent executor");
+
+    let project_root = temp_dir.path().join("project-goal");
+    std::fs::create_dir_all(project_root.join("docs")).expect("project docs should be created");
     let project = state
-        .app
         .create_project(CreateProjectCommand {
             name: "Goal Ollama E2E".into(),
             root_path: project_root.display().to_string(),
@@ -403,13 +416,14 @@ async fn goal_plan_approval_starts_first_generated_task_with_real_ollama_model()
         .expect("project should be created");
 
     let plan = state
-        .app
         .submit_goal(SubmitGoalCommand {
             project_id: project.id.clone(),
-            goal: "Prove the goal-first Crytex run path with one short model response".into(),
+            goal: "Prove the goal-first Crytex run path. The coder final JSON must include files_changed with docs/goal-agent-report.md and summary containing CRYTEX_GOAL_AGENT_REPORT_OK. Run the generated chain to critic human review.".into(),
             context: json!({
                 "e2e": "goal_plan_approval_start_run",
-                "expected_behavior": "generated task result goes to human review"
+                "expected_behavior": "generated task result goes to human review",
+                "required_file": "docs/goal-agent-report.md",
+                "required_marker": "CRYTEX_GOAL_AGENT_REPORT_OK"
             }),
             trace_id: Some("trace-goal-ollama-e2e".into()),
         })
@@ -425,7 +439,6 @@ async fn goal_plan_approval_starts_first_generated_task_with_real_ollama_model()
     );
 
     let approved = state
-        .app
         .approve_plan(PlanDecisionCommand {
             goal_task_id: plan.goal.id.clone(),
             comment: Some("approved for real Ollama e2e".into()),
@@ -442,7 +455,6 @@ async fn goal_plan_approval_starts_first_generated_task_with_real_ollama_model()
     );
 
     let run = state
-        .app
         .start_run(StartRunCommand {
             project_id: project.id.clone(),
             max_steps: 10,
@@ -450,6 +462,34 @@ async fn goal_plan_approval_starts_first_generated_task_with_real_ollama_model()
         .await
         .expect("run should execute generated chain through Ollama");
 
+    let exported_after_run = state
+        .get_project_state(&project.id)
+        .await
+        .expect("project state should export generated chain after run");
+    if run.review_tasks.len() != 1 {
+        let task_statuses = exported_after_run
+            .tasks
+            .iter()
+            .map(|task| {
+                json!({
+                    "id": task.id,
+                    "parent_id": task.parent_id,
+                    "agent": task.assigned_agent,
+                    "kind": task.kind,
+                    "status": task.status.as_str(),
+                    "source": task.result.as_ref().and_then(|result| result["source"].as_str()),
+                    "priority_score": task.priority_score,
+                    "payload_source": task.payload["source"],
+                })
+            })
+            .collect::<Vec<_>>();
+        panic!(
+            "expected exactly one review task, got {}. remaining_ready_tasks={}, tasks={}",
+            run.review_tasks.len(),
+            run.remaining_ready_tasks.len(),
+            serde_json::to_string_pretty(&task_statuses).unwrap()
+        );
+    }
     assert_eq!(run.review_tasks.len(), 1);
     assert_eq!(run.review_tasks[0].status.as_str(), "review");
     assert_eq!(
@@ -458,28 +498,25 @@ async fn goal_plan_approval_starts_first_generated_task_with_real_ollama_model()
     );
     assert_eq!(
         run.review_tasks[0].result.as_ref().unwrap()["source"],
-        "ollama_inference"
+        "agent_service"
     );
+    let review_agent_result = &run.review_tasks[0].result.as_ref().unwrap()["agent_result"];
     assert!(
-        !run.review_tasks[0].result.as_ref().unwrap()["content"]
+        !review_agent_result["review_decision"]
             .as_str()
+            .or_else(|| review_agent_result["summary"].as_str())
             .unwrap_or_default()
             .trim()
             .is_empty(),
-        "model output must be non-empty"
+        "critic agent result must include a non-empty review decision or summary"
     );
     assert!(
         run.remaining_ready_tasks.is_empty(),
         "the run should stop at the critic human-review gate"
     );
 
-    let exported = state
-        .app
-        .get_project_state(&project.id)
-        .await
-        .expect("project state should export generated chain");
     for agent in ["architect", "coder", "qa", "security"] {
-        let task = exported
+        let task = exported_after_run
             .tasks
             .iter()
             .find(|task| {
@@ -494,13 +531,12 @@ async fn goal_plan_approval_starts_first_generated_task_with_real_ollama_model()
         );
         assert_eq!(
             task.result.as_ref().unwrap()["source"],
-            "ollama_inference",
+            "agent_service",
             "{agent} should have real Ollama output"
         );
     }
 
     let review_decision = state
-        .app
         .approve_task_review(TaskReviewDecisionCommand {
             task_id: run.review_tasks[0].id.clone(),
             comment: Some("critic result accepted by e2e".into()),
@@ -511,17 +547,14 @@ async fn goal_plan_approval_starts_first_generated_task_with_real_ollama_model()
     assert!(review_decision.ready_tasks.is_empty());
 
     println!(
-        "CRYTEX_TAURI_GOAL_E2E_RESULT model={} goal_id={} critic_task_id={} critic_content={}",
-        state.model,
+        "CRYTEX_TAURI_GOAL_E2E_RESULT model={} goal_id={} critic_task_id={} critic_result={}",
+        model,
         plan.goal.id,
         run.review_tasks[0].id,
-        run.review_tasks[0].result.as_ref().unwrap()["content"]
-            .as_str()
-            .unwrap_or_default()
-            .trim()
+        review_agent_result
     );
 
-    state.app.shutdown_project_watchers().await;
+    state.shutdown_project_watchers().await;
 }
 
 #[tokio::test]
@@ -1464,28 +1497,6 @@ struct OllamaState {
     app: CrytexAppState,
     model: String,
     temp_dir: tempfile::TempDir,
-}
-
-async fn ollama_state() -> OllamaState {
-    let ollama_url =
-        std::env::var("CRYTEX_E2E_OLLAMA_URL").unwrap_or_else(|_| DEFAULT_OLLAMA_URL.to_string());
-    let model =
-        std::env::var("CRYTEX_E2E_OLLAMA_MODEL").unwrap_or_else(|_| DEFAULT_E2E_MODEL.to_string());
-    ensure_model_available(&ollama_url, &model).await;
-
-    let backend = Arc::new(OllamaBackend::new(&ollama_url, &model));
-    let executor = Arc::new(InferenceTaskExecutor::new(backend, model.clone()));
-    let temp_dir = tempfile::tempdir().expect("temp dir should be created");
-    let db_path = temp_dir.path().join("crytex-tauri-e2e.db");
-    let app = CrytexAppState::new_sqlite_with_executor(&db_path, executor)
-        .await
-        .expect("state should initialize");
-
-    OllamaState {
-        app,
-        model,
-        temp_dir,
-    }
 }
 
 async fn ollama_critic_state() -> OllamaState {
