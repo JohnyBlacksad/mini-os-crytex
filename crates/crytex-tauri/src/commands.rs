@@ -1583,7 +1583,14 @@ pub async fn start_run_with_orchestrator(
             run_started_logged = true;
         }
 
-        attach_upstream_artifacts(task_service.clone(), &mut task).await?;
+        attach_upstream_artifacts(
+            task_service.clone(),
+            audit_service.as_ref(),
+            event_service.as_ref(),
+            &run_id,
+            &mut task,
+        )
+        .await?;
         task_service.update_task(&task).await?;
         let running = task_service
             .set_status(&task.id, TaskStatus::InProgress)
@@ -1875,6 +1882,9 @@ async fn log_run_event(
 
 async fn attach_upstream_artifacts(
     task_service: Arc<dyn TaskService>,
+    audit_service: Option<&Arc<dyn AuditLogService>>,
+    event_service: Option<&Arc<dyn EventService>>,
+    run_id: &str,
     task: &mut Task,
 ) -> Result<(), TauriCommandError> {
     let Some(parent_id) = task.parent_id.clone() else {
@@ -1893,10 +1903,22 @@ async fn attach_upstream_artifacts(
         .collect::<Vec<_>>();
     upstream.sort_by_key(|candidate| candidate.created_at);
 
-    let upstream_artifacts = upstream
-        .into_iter()
-        .filter_map(|artifact| build_agent_artifact_handoff(&artifact))
-        .collect::<Vec<_>>();
+    let mut upstream_artifacts = Vec::new();
+    for artifact in upstream {
+        match build_agent_artifact_handoff_result(&artifact) {
+            Ok(handoff) => upstream_artifacts.push(handoff),
+            Err(rejection) => {
+                log_artifact_handoff_rejection(
+                    audit_service,
+                    event_service,
+                    run_id,
+                    task,
+                    &rejection,
+                )
+                .await;
+            }
+        }
+    }
     if is_reviewer_task(task) && task.payload.get("parent_result").is_none() {
         task.payload["parent_result"] = Value::Array(upstream_artifacts.clone());
     }
@@ -1904,10 +1926,25 @@ async fn attach_upstream_artifacts(
     Ok(())
 }
 
+#[cfg(test)]
 fn build_agent_artifact_handoff(task: &Task) -> Option<Value> {
-    let envelope = build_agent_artifact_envelope(task)?;
-    validate_agent_artifact_envelope(&envelope).ok()?;
-    Some(serde_json::json!({
+    build_agent_artifact_handoff_result(task).ok()
+}
+
+fn build_agent_artifact_handoff_result(task: &Task) -> Result<Value, ArtifactHandoffRejection> {
+    let envelope = build_agent_artifact_envelope(task).ok_or_else(|| ArtifactHandoffRejection {
+        source_task_id: task.id.clone(),
+        source_agent: task.assigned_agent.clone(),
+        artifact_kind: artifact_kind_for_task(task),
+        reason: "task has no result artifact".to_string(),
+    })?;
+    validate_agent_artifact_envelope(&envelope).map_err(|reason| ArtifactHandoffRejection {
+        source_task_id: task.id.clone(),
+        source_agent: task.assigned_agent.clone(),
+        artifact_kind: envelope.artifact_kind.clone(),
+        reason,
+    })?;
+    Ok(serde_json::json!({
         "schema_version": envelope.schema_version,
         "artifact_id": envelope.artifact_id,
         "source_task_id": envelope.source_task_id,
@@ -1920,6 +1957,41 @@ fn build_agent_artifact_handoff(task: &Task) -> Option<Value> {
         "agent": task.assigned_agent,
         "result": task.result,
     }))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ArtifactHandoffRejection {
+    source_task_id: String,
+    source_agent: Option<String>,
+    artifact_kind: String,
+    reason: String,
+}
+
+async fn log_artifact_handoff_rejection(
+    audit_service: Option<&Arc<dyn AuditLogService>>,
+    event_service: Option<&Arc<dyn EventService>>,
+    run_id: &str,
+    target_task: &Task,
+    rejection: &ArtifactHandoffRejection,
+) {
+    log_run_event(
+        audit_service,
+        event_service,
+        "artifact_handoff_rejected",
+        Some(target_task),
+        &target_task.project_id,
+        Some(&target_task.trace_id),
+        serde_json::json!({
+            "run_id": run_id,
+            "source_task_id": rejection.source_task_id,
+            "source_agent": rejection.source_agent,
+            "target_task_id": target_task.id,
+            "target_agent": target_task.assigned_agent,
+            "artifact_kind": rejection.artifact_kind,
+            "reason": rejection.reason,
+        }),
+    )
+    .await;
 }
 
 fn build_agent_artifact_envelope(task: &Task) -> Option<AgentArtifactEnvelope> {
@@ -2871,6 +2943,93 @@ mod tests {
         }
     }
 
+    struct SiblingTaskService {
+        tasks: Mutex<Vec<Task>>,
+    }
+
+    impl SiblingTaskService {
+        fn new(tasks: Vec<Task>) -> Self {
+            Self {
+                tasks: Mutex::new(tasks),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl TaskService for SiblingTaskService {
+        async fn submit(&self, _request: CreateTaskRequest) -> Result<Task, TaskError> {
+            Err(TaskError::NotFound("not used".into()))
+        }
+        async fn add_dependency(&self, _dep: TaskDependency) -> Result<(), TaskError> {
+            Ok(())
+        }
+        async fn get(&self, id: &str) -> Result<Option<Task>, TaskError> {
+            Ok(self
+                .tasks
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|task| task.id == id)
+                .cloned())
+        }
+        async fn list_by_project(&self, project_id: &str) -> Result<Vec<Task>, TaskError> {
+            Ok(self
+                .tasks
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|task| task.project_id == project_id)
+                .cloned()
+                .collect())
+        }
+        async fn list_ready(&self) -> Result<Vec<Task>, TaskError> {
+            Ok(self
+                .tasks
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|task| task.status == TaskStatus::Pending)
+                .cloned()
+                .collect())
+        }
+        async fn set_status(&self, id: &str, status: TaskStatus) -> Result<Task, TaskError> {
+            let mut tasks = self.tasks.lock().unwrap();
+            let task = tasks
+                .iter_mut()
+                .find(|task| task.id == id)
+                .ok_or_else(|| TaskError::NotFound(id.into()))?;
+            task.status = status;
+            Ok(task.clone())
+        }
+        async fn cancel(&self, id: &str) -> Result<Task, TaskError> {
+            Err(TaskError::NotFound(id.into()))
+        }
+        async fn set_result(&self, id: &str, _result: Value) -> Result<Task, TaskError> {
+            Err(TaskError::NotFound(id.into()))
+        }
+        async fn set_critic_score(&self, id: &str, _score: f64) -> Result<Task, TaskError> {
+            Err(TaskError::NotFound(id.into()))
+        }
+        async fn set_human_score(&self, id: &str, _score: f64) -> Result<Task, TaskError> {
+            Err(TaskError::NotFound(id.into()))
+        }
+        async fn retry(&self, id: &str, _feedback: Option<&str>) -> Result<Task, TaskError> {
+            Err(TaskError::NotFound(id.into()))
+        }
+        async fn load_all_tasks(&self) -> Result<Vec<Task>, TaskError> {
+            Ok(self.tasks.lock().unwrap().clone())
+        }
+        async fn update_task(&self, updated: &Task) -> Result<(), TaskError> {
+            let mut tasks = self.tasks.lock().unwrap();
+            let task = tasks
+                .iter_mut()
+                .find(|task| task.id == updated.id)
+                .ok_or_else(|| TaskError::NotFound(updated.id.clone()))?;
+            *task = updated.clone();
+            Ok(())
+        }
+    }
+
     struct RecordingExecutor;
 
     #[async_trait]
@@ -3555,6 +3714,108 @@ mod tests {
                     && trace_id == "trace-live-run"
                     && action == "run_started"
             )
+        }));
+    }
+
+    #[tokio::test]
+    async fn start_run_observes_rejected_upstream_artifact_handoff() {
+        let upstream = Task {
+            id: "task-coder-invalid".into(),
+            project_id: "project-1".into(),
+            parent_id: Some("goal-1".into()),
+            title: "Invalid coder artifact".into(),
+            description: None,
+            kind: "codegen".into(),
+            status: TaskStatus::Completed,
+            assigned_agent: Some("coder".into()),
+            priority: 5,
+            payload: json!({}),
+            result: Some(json!({
+                "source": "agent_service",
+                "agent_result": {
+                    "artifact": {
+                        "summary": "forgot files_changed"
+                    }
+                }
+            })),
+            created_at: 10,
+            started_at: None,
+            finished_at: None,
+            iteration_count: 0,
+            priority_score: 5.0,
+            critic_score: None,
+            human_score: None,
+            prompt_version_id: None,
+            lora_adapter_id: None,
+            trace_id: "trace-invalid-handoff".into(),
+        };
+        let downstream = Task {
+            id: "task-critic".into(),
+            project_id: "project-1".into(),
+            parent_id: Some("goal-1".into()),
+            title: "Review artifacts".into(),
+            description: None,
+            kind: "review".into(),
+            status: TaskStatus::Pending,
+            assigned_agent: Some("critic".into()),
+            priority: 5,
+            payload: json!({}),
+            result: None,
+            created_at: 20,
+            started_at: None,
+            finished_at: None,
+            iteration_count: 0,
+            priority_score: 5.0,
+            critic_score: None,
+            human_score: None,
+            prompt_version_id: None,
+            lora_adapter_id: None,
+            trace_id: "trace-invalid-handoff".into(),
+        };
+        let task_service = Arc::new(SiblingTaskService::new(vec![upstream, downstream]));
+        let audit = Arc::new(CapturingAuditService::default());
+        let events = Arc::new(CapturingEventService::default());
+
+        let response = start_run_with_orchestrator(
+            task_service,
+            None,
+            Some(audit.clone()),
+            Some(events.clone()),
+            Arc::new(RecordingExecutor),
+            StartRunCommand {
+                project_id: "project-1".into(),
+                max_steps: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.review_tasks.len(), 1);
+        assert!(events.events().iter().any(|event| {
+            matches!(
+                event,
+                Event::RunObserved {
+                    project_id,
+                    task_id,
+                    trace_id,
+                    action,
+                    metadata,
+                } if project_id == "project-1"
+                    && task_id.as_deref() == Some("task-critic")
+                    && trace_id == "trace-invalid-handoff"
+                    && action == "artifact_handoff_rejected"
+                    && metadata["source_task_id"] == "task-coder-invalid"
+                    && metadata["artifact_kind"] == "patch_artifact"
+                    && metadata["reason"]
+                        .as_str()
+                        .is_some_and(|reason| reason.contains("files_changed"))
+            )
+        }));
+        assert!(audit.entries().iter().any(|entry| {
+            entry.action == "artifact_handoff_rejected"
+                && entry.task_id.as_deref() == Some("task-critic")
+                && entry.trace_id == "trace-invalid-handoff"
+                && entry.metadata["source_task_id"] == "task-coder-invalid"
         }));
     }
 
