@@ -417,7 +417,12 @@ impl CrytexConfig {
     /// If the file does not exist or cannot be parsed, falls back to the default
     /// configuration so the application can still start.
     pub fn load() -> Self {
-        Self::load_from_path(Self::config_path()).unwrap_or_default()
+        Self::load_from_path_or_default(Self::config_path())
+    }
+
+    /// Loads configuration from `path`, falling back to defaults when unavailable.
+    pub fn load_from_path_or_default(path: impl AsRef<std::path::Path>) -> Self {
+        Self::load_from_path(path).unwrap_or_default()
     }
 
     /// Returns the default path for the user configuration file.
@@ -526,7 +531,10 @@ supports_lora = false
 
     #[test]
     fn load_uses_default_when_config_file_missing() {
-        let config = CrytexConfig::load();
+        let missing_path =
+            std::env::temp_dir().join(format!("crytex-missing-config-{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&missing_path);
+        let config = CrytexConfig::load_from_path_or_default(&missing_path);
         assert_eq!(
             config.max_concurrent_tasks,
             CrytexConfig::default().max_concurrent_tasks
