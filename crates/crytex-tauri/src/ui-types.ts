@@ -328,6 +328,17 @@ export type AgentArtifactEnvelope = {
   content: unknown;
 };
 
+export type RunDiagnosticArtifactHandoffRejection = {
+  task_id: string | null;
+  source_task_id: string;
+  source_agent: string | null;
+  target_task_id: string | null;
+  target_agent: string | null;
+  artifact_kind: string;
+  reason: string;
+  metadata: unknown;
+};
+
 export type RunDiagnosticsReport = {
   project_id: string;
   run_id: string;
@@ -338,6 +349,7 @@ export type RunDiagnosticsReport = {
   review_task_ids: string[];
   critic_feedback: string[];
   artifact_lineage: AgentArtifactEnvelope[];
+  artifact_handoff_rejections: RunDiagnosticArtifactHandoffRejection[];
   remediation_events: RunDiagnosticEvent[];
   lora_evolution: RunDiagnosticLoraEvolution[];
   rag_context_sent_to_model: boolean;

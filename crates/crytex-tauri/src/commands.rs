@@ -206,6 +206,19 @@ pub struct RunDiagnosticLoraEvolution {
     pub metadata: Value,
 }
 
+/// One rejected artifact handoff included in a run diagnostic report.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RunDiagnosticArtifactHandoffRejection {
+    pub task_id: Option<String>,
+    pub source_task_id: String,
+    pub source_agent: Option<String>,
+    pub target_task_id: Option<String>,
+    pub target_agent: Option<String>,
+    pub artifact_kind: String,
+    pub reason: String,
+    pub metadata: Value,
+}
+
 /// Typed artifact envelope passed between generated agent-chain tasks.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AgentArtifactEnvelope {
@@ -229,6 +242,7 @@ pub struct RunDiagnosticsReport {
     pub review_task_ids: Vec<String>,
     pub critic_feedback: Vec<String>,
     pub artifact_lineage: Vec<AgentArtifactEnvelope>,
+    pub artifact_handoff_rejections: Vec<RunDiagnosticArtifactHandoffRejection>,
     pub remediation_events: Vec<RunDiagnosticEvent>,
     pub lora_evolution: Vec<RunDiagnosticLoraEvolution>,
     pub rag_context_sent_to_model: bool,
@@ -886,6 +900,7 @@ pub fn build_run_diagnostics(
     let review_task_ids = diagnostic_review_task_ids(&tasks, &events);
     let critic_feedback = diagnostic_critic_feedback(&tasks, &events);
     let artifact_lineage = diagnostic_artifact_lineage(&state.tasks);
+    let artifact_handoff_rejections = diagnostic_artifact_handoff_rejections(&events);
     let remediation_events = events
         .iter()
         .filter(|event| event.action.contains("remediation"))
@@ -909,6 +924,7 @@ pub fn build_run_diagnostics(
         review_task_ids,
         critic_feedback,
         artifact_lineage,
+        artifact_handoff_rejections,
         remediation_events,
         lora_evolution,
         rag_context_sent_to_model,
@@ -1064,6 +1080,37 @@ fn diagnostic_artifact_lineage(tasks: &[Task]) -> Vec<AgentArtifactEnvelope> {
         })
         .filter_map(|value| serde_json::from_value::<AgentArtifactEnvelope>(value.clone()).ok())
         .filter(|envelope| seen.insert(envelope.artifact_id.clone()))
+        .collect()
+}
+
+fn diagnostic_artifact_handoff_rejections(
+    events: &[RunDiagnosticEvent],
+) -> Vec<RunDiagnosticArtifactHandoffRejection> {
+    events
+        .iter()
+        .filter(|event| event.action == "artifact_handoff_rejected")
+        .filter_map(|event| {
+            let source_task_id = event.metadata["source_task_id"].as_str()?;
+            let artifact_kind = event.metadata["artifact_kind"].as_str()?;
+            let reason = event.metadata["reason"].as_str()?;
+            Some(RunDiagnosticArtifactHandoffRejection {
+                task_id: event.task_id.clone(),
+                source_task_id: source_task_id.to_string(),
+                source_agent: event.metadata["source_agent"]
+                    .as_str()
+                    .map(ToOwned::to_owned),
+                target_task_id: event.metadata["target_task_id"]
+                    .as_str()
+                    .map(ToOwned::to_owned)
+                    .or_else(|| event.task_id.clone()),
+                target_agent: event.metadata["target_agent"]
+                    .as_str()
+                    .map(ToOwned::to_owned),
+                artifact_kind: artifact_kind.to_string(),
+                reason: reason.to_string(),
+                metadata: event.metadata.clone(),
+            })
+        })
         .collect()
 }
 
@@ -3938,6 +3985,81 @@ mod tests {
         assert_eq!(report.remediation_events.len(), 1);
         assert!(report.rag_context_sent_to_model);
         assert!(report.human_reward_recorded);
+    }
+
+    #[test]
+    fn build_run_diagnostics_exports_artifact_handoff_rejections() {
+        let runtime = RuntimeStatus {
+            tauri_runtime: true,
+            executor_mode: "ollama_agent".into(),
+            planning_mode: "deterministic".into(),
+            active_backend: Some("ollama".into()),
+            active_model: Some("qwen3.5:9b".into()),
+            ollama_url: Some("http://127.0.0.1:11434".into()),
+            real_agent_execution: true,
+            backend_capabilities: vec![],
+            cuda_toolchain: None,
+            compatibility_notes: vec![],
+            model_compatibility: None,
+        };
+        let state = ProjectState {
+            project: dummy_project("p1"),
+            kanban: KanbanState {
+                project_id: "p1".into(),
+                columns: vec![],
+            },
+            tasks: vec![diagnostic_task(
+                "task-critic",
+                "critic",
+                TaskStatus::Review,
+                json!({
+                    "source": "agent_service",
+                    "agent_result": { "review_decision": "pass" }
+                }),
+            )],
+            recent_logs: vec![diagnostic_log(
+                "artifact_handoff_rejected",
+                Some("task-critic"),
+                json!({
+                    "run_id": "run-1",
+                    "trace_id": "trace-1",
+                    "source_task_id": "task-coder-invalid",
+                    "source_agent": "coder",
+                    "target_task_id": "task-critic",
+                    "target_agent": "critic",
+                    "artifact_kind": "patch_artifact",
+                    "reason": "artifact content requires non-empty array field `files_changed`"
+                }),
+            )],
+            latest_snapshot: None,
+            metrics: MetricsSnapshot::default(),
+        };
+
+        let report = build_run_diagnostics(
+            ExportRunDiagnosticsCommand {
+                project_id: "p1".into(),
+                run_id: "run-1".into(),
+                trace_id: None,
+            },
+            state,
+            runtime,
+        )
+        .unwrap();
+
+        assert_eq!(report.artifact_handoff_rejections.len(), 1);
+        assert_eq!(
+            report.artifact_handoff_rejections[0].source_task_id,
+            "task-coder-invalid"
+        );
+        assert_eq!(
+            report.artifact_handoff_rejections[0].artifact_kind,
+            "patch_artifact"
+        );
+        assert!(
+            report.artifact_handoff_rejections[0]
+                .reason
+                .contains("files_changed")
+        );
     }
 
     #[test]
