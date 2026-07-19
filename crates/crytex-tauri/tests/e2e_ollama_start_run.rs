@@ -397,13 +397,10 @@ async fn goal_plan_approval_starts_first_generated_task_with_real_ollama_model()
 
     let temp_dir = tempfile::tempdir().expect("temp dir should be created");
     let db_path = temp_dir.path().join("crytex-tauri-goal-agent-e2e.db");
-    let state = CrytexAppState::new_sqlite_with_ollama_agent_executor(
-        &db_path,
-        ollama_url,
-        model.clone(),
-    )
-    .await
-    .expect("state should initialize with Ollama agent executor");
+    let state =
+        CrytexAppState::new_sqlite_with_ollama_agent_executor(&db_path, ollama_url, model.clone())
+            .await
+            .expect("state should initialize with Ollama agent executor");
 
     let project_root = temp_dir.path().join("project-goal");
     std::fs::create_dir_all(project_root.join("docs")).expect("project docs should be created");
@@ -548,10 +545,7 @@ async fn goal_plan_approval_starts_first_generated_task_with_real_ollama_model()
 
     println!(
         "CRYTEX_TAURI_GOAL_E2E_RESULT model={} goal_id={} critic_task_id={} critic_result={}",
-        model,
-        plan.goal.id,
-        run.review_tasks[0].id,
-        review_agent_result
+        model, plan.goal.id, run.review_tasks[0].id, review_agent_result
     );
 
     state.shutdown_project_watchers().await;
@@ -809,6 +803,37 @@ async fn real_ollama_agent_run_receives_indexed_rag_context() {
         rag_request.is_some(),
         "llm_request trace should contain indexed RAG marker in sent messages"
     );
+    let diagnostics = state
+        .export_run_diagnostics(ExportRunDiagnosticsCommand {
+            project_id: project.id.clone(),
+            run_id: run.run_id.clone(),
+            trace_id: Some("trace-real-ollama-rag-e2e".into()),
+        })
+        .await
+        .expect("run diagnostics should export RAG evidence");
+    let rag_evidence = diagnostics
+        .events
+        .iter()
+        .find(|event| event.action == "rag_context_assembled")
+        .expect("diagnostics should include RAG context evidence event");
+    assert_eq!(
+        rag_evidence.metadata["trace_id"],
+        "trace-real-ollama-rag-e2e"
+    );
+    assert_eq!(rag_evidence.metadata["rerank_applied"], false);
+    assert!(
+        rag_evidence.metadata["chunks"]
+            .as_array()
+            .is_some_and(|chunks| chunks.iter().any(|chunk| {
+                chunk["relative_path"] == "docs/payment-retry.md"
+                    && chunk["text_preview"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("RAG_REAL_OLLAMA_CONTEXT_MARKER"))
+                    && chunk["score"].as_f64().is_some_and(|score| score > 0.0)
+            })),
+        "diagnostics should expose retrieved RAG chunk evidence, got {:?}",
+        rag_evidence.metadata
+    );
 
     let summary = run.review_tasks[0].result.as_ref().unwrap()["agent_result"]["summary"]
         .as_str()
@@ -822,11 +847,14 @@ async fn real_ollama_agent_run_receives_indexed_rag_context() {
     );
 
     println!(
-        "CRYTEX_TAURI_REAL_RAG_E2E_RESULT model={} task_id={} summary={} rag_trace_seen={}",
+        "CRYTEX_TAURI_REAL_RAG_E2E_RESULT model={} task_id={} summary={} rag_trace_seen={} rag_evidence_chunks={}",
         model,
         task.id,
         summary,
-        rag_request.is_some()
+        rag_request.is_some(),
+        rag_evidence.metadata["chunks"]
+            .as_array()
+            .map_or(0, Vec::len)
     );
 }
 

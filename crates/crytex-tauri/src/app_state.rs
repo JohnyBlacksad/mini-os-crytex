@@ -131,9 +131,10 @@ impl CrytexAppState {
             Box::new(move |project_service, audit_service, context_assembler| {
                 Arc::new(
                     AgentTaskExecutor::new_project_scoped(
-                        Arc::new(StaticAgentService::with_default_agents(Some(
-                            context_assembler,
-                        ))),
+                        Arc::new(
+                            StaticAgentService::with_default_agents(Some(context_assembler))
+                                .with_audit(audit_service.clone()),
+                        ),
                         inference,
                         project_service,
                     )
@@ -590,9 +591,10 @@ impl CrytexAppState {
         );
         let executor = Arc::new(
             AgentTaskExecutor::new_project_scoped(
-                Arc::new(StaticAgentService::with_default_agents(Some(
-                    self.context_assembler.clone(),
-                ))),
+                Arc::new(
+                    StaticAgentService::with_default_agents(Some(self.context_assembler.clone()))
+                        .with_audit(self.audit_service.clone()),
+                ),
                 inference,
                 self.project_service.clone(),
             )
@@ -626,9 +628,10 @@ impl CrytexAppState {
         let inference = ollama_inference_service(ollama_url.to_string(), model.to_string());
         let executor = Arc::new(
             AgentTaskExecutor::new_project_scoped(
-                Arc::new(StaticAgentService::with_default_agents(Some(
-                    self.context_assembler.clone(),
-                ))),
+                Arc::new(
+                    StaticAgentService::with_default_agents(Some(self.context_assembler.clone()))
+                        .with_audit(self.audit_service.clone()),
+                ),
                 inference,
                 self.project_service.clone(),
             )
@@ -867,6 +870,7 @@ impl ToolService for EmptyToolService {
 struct StaticAgentService {
     agents: HashMap<String, Arc<dyn Agent>>,
     context_assembler: Option<Arc<ContextAssembler>>,
+    audit_service: Option<Arc<dyn AuditLogService>>,
 }
 
 impl StaticAgentService {
@@ -886,7 +890,13 @@ impl StaticAgentService {
         Self {
             agents,
             context_assembler,
+            audit_service: None,
         }
+    }
+
+    fn with_audit(mut self, audit_service: Arc<dyn AuditLogService>) -> Self {
+        self.audit_service = Some(audit_service);
+        self
     }
 
     fn default_agent_for_kind(kind: &str) -> &'static str {
@@ -951,8 +961,47 @@ impl AgentService for StaticAgentService {
                 top_k: 5,
                 summarize_threshold_ratio: 0.6,
             };
-            if let Ok(messages) = assembler.assemble(request).await {
-                let context = messages
+            if let Ok(assembly) = assembler.assemble_with_evidence(request).await {
+                if !assembly.rag.chunks.is_empty() {
+                    let chunks = assembly
+                        .rag
+                        .chunks
+                        .iter()
+                        .map(|chunk| {
+                            serde_json::json!({
+                                "id": chunk.id,
+                                "score": chunk.score,
+                                "source": chunk.source,
+                                "relative_path": chunk.relative_path,
+                                "text_preview": chunk.text_preview,
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    if let Some(audit_service) = &self.audit_service {
+                        let _ = audit_service
+                            .log(
+                                crytex_core::services::AuditLogEntry::new(
+                                    &agent_name,
+                                    "rag_context_assembled",
+                                )
+                                .project_id(&task.project_id)
+                                .task_id(&task.id)
+                                .trace_id(&task.trace_id)
+                                .level(crytex_core::models::AuditLogLevel::Info)
+                                .metadata(serde_json::json!({
+                                    "query": assembly.rag.query,
+                                    "project_id": assembly.rag.project_id,
+                                    "trace_id": task.trace_id,
+                                    "rerank_applied": assembly.rag.rerank_applied,
+                                    "chunks": chunks,
+                                })),
+                            )
+                            .await;
+                    }
+                }
+
+                let context = assembly
+                    .messages
                     .iter()
                     .map(|message| format!("{}: {}", message.role, message.content))
                     .collect::<Vec<_>>()
