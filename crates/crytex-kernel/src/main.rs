@@ -61,6 +61,7 @@ use crytex_inference::BackendRegistry;
 use crytex_sandbox::SandboxOrchestrator;
 use crytex_storage::Storage;
 use crytex_tools::{Capability, ScanningToolService, ToolServiceImpl, TypedToolRegistry};
+use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{error, info, warn};
@@ -146,6 +147,29 @@ enum Commands {
         activate: bool,
         #[arg(long, default_value = "local-hf")]
         backend_id: String,
+    },
+    /// Prove HuggingFace GGUF download, activation, load, and generation as one JSON artifact
+    ProveHfModel {
+        #[arg(short, long)]
+        id: String,
+        #[arg(short, long)]
+        name: Option<String>,
+        #[arg(short, long)]
+        repo: String,
+        #[arg(short, long)]
+        filename: String,
+        #[arg(short, long)]
+        quantization: Option<String>,
+        #[arg(long)]
+        params_b: Option<f32>,
+        #[arg(long, default_value = "local-hf-proof")]
+        backend_id: String,
+        #[arg(long)]
+        trace_id: Option<String>,
+        #[arg(long, default_value = "16")]
+        max_tokens: usize,
+        #[arg(long)]
+        report_path: Option<PathBuf>,
     },
     /// Add or update a managed HuggingFace/local model entry
     AddModel {
@@ -445,6 +469,41 @@ fn build_downloaded_model_backend_config(
         Some(recommendation.context_size),
         recommendation.gpu_layers,
     ))
+}
+
+#[derive(Debug, Serialize)]
+struct HfModelProofReport {
+    trace_id: String,
+    model_id: String,
+    repo: Option<String>,
+    filename: Option<String>,
+    local_path: Option<String>,
+    backend_id: String,
+    recommendation: crytex_core::services::RecommendedConfig,
+    runtime_probe: crytex_core::services::ModelRuntimeProbeReport,
+    passed: bool,
+}
+
+fn build_hf_model_proof_report(
+    backend_id: String,
+    model: &crytex_core::services::ManagedModel,
+    recommendation: crytex_core::services::RecommendedConfig,
+    runtime_probe: crytex_core::services::ModelRuntimeProbeReport,
+) -> HfModelProofReport {
+    HfModelProofReport {
+        trace_id: runtime_probe.trace_id.clone(),
+        model_id: model.id.clone(),
+        repo: model.repo.clone(),
+        filename: model.filename.clone(),
+        local_path: model
+            .local_path
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        backend_id,
+        recommendation,
+        passed: runtime_probe.passed,
+        runtime_probe,
+    }
 }
 
 const DEFAULT_CODEGEN_WORKFLOW: &str = r#"
@@ -881,6 +940,124 @@ async fn main() {
             "Model {} added. Use download-model --id {} then probe-model --id {}.",
             model.id, model.id, model.id
         );
+        return;
+    }
+
+    if let Commands::ProveHfModel {
+        id,
+        name,
+        repo,
+        filename,
+        quantization,
+        params_b,
+        backend_id,
+        trace_id,
+        max_tokens,
+        report_path,
+    } = &cli.command
+    {
+        let event_bus = Arc::new(crytex_core::EventBus::new());
+        let event_service = Arc::new(EventServiceImpl::new(event_bus));
+        let config_dir = CrytexConfig::config_path()
+            .parent()
+            .expect("config path must have a parent")
+            .to_path_buf();
+        let model_manager = ModelManagerImpl::new_standard(
+            &config_dir,
+            &config.paths.data_dir,
+            event_service,
+            Arc::new(SystemHardwareDetector::new()),
+        );
+        let entry = build_manifest_entry(
+            id.clone(),
+            name.clone().or_else(|| Some(id.clone())),
+            Some(repo.clone()),
+            Some(filename.clone()),
+            quantization.clone(),
+            "mistralrs".into(),
+            *params_b,
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to build HF model manifest entry: {}", e);
+            std::process::exit(1);
+        });
+        let _model = model_manager.add_model(entry).unwrap_or_else(|e| {
+            eprintln!("Failed to add HF model: {}", e);
+            std::process::exit(1);
+        });
+        let model = model_manager.download_model(id).await.unwrap_or_else(|e| {
+            eprintln!("Failed to download HF model: {}", e);
+            std::process::exit(1);
+        });
+        let recommendation = model_manager.recommend_config(id).unwrap_or_else(|e| {
+            eprintln!("Failed to recommend HF runtime config: {}", e);
+            std::process::exit(1);
+        });
+        let backend_config =
+            build_downloaded_model_backend_config(backend_id, &model, &recommendation)
+                .unwrap_or_else(|e| {
+                    eprintln!("Failed to build HF backend config: {}", e);
+                    std::process::exit(1);
+                });
+        let mut active_config = config.clone();
+        active_config
+            .inference
+            .backends
+            .retain(|backend| backend.id != backend_config.id);
+        active_config.inference.default_backend = Some(backend_config.id.clone());
+        active_config.inference.backends.push(backend_config);
+        if let Err(e) = active_config.save() {
+            eprintln!("Failed to save activated HF backend config: {}", e);
+            std::process::exit(1);
+        }
+        let inference = create_inference_service(&active_config).unwrap_or_else(|e| {
+            eprintln!("Failed to create inference service for HF proof: {}", e);
+            std::process::exit(1);
+        });
+        let detector = SystemHardwareDetector::new();
+        let device = crytex_core::services::HardwareDetector::detect(&detector);
+        let runtime = RuntimeFeatureSet::from_device(&device);
+        let model_name = model
+            .local_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| id.clone());
+        let runtime_probe = ModelRuntimeProbe::new(inference)
+            .probe(
+                &model,
+                &device,
+                &runtime,
+                ModelRuntimeProbeRequest {
+                    backend_id: Some(backend_id.clone()),
+                    model_name,
+                    trace_id: trace_id.clone(),
+                    max_tokens: *max_tokens,
+                    lora_adapter_id: None,
+                },
+            )
+            .await;
+        let report =
+            build_hf_model_proof_report(backend_id.clone(), &model, recommendation, runtime_probe);
+        let json = unwrap_or_exit!(
+            serde_json::to_string_pretty(&report),
+            "Failed to serialize HF proof report"
+        );
+        if let Some(path) = report_path {
+            if let Some(parent) = path.parent()
+                && let Err(e) = std::fs::create_dir_all(parent)
+            {
+                eprintln!("Failed to create HF proof report directory: {}", e);
+                std::process::exit(1);
+            }
+            if let Err(e) = std::fs::write(path, &json) {
+                eprintln!("Failed to write HF proof report: {}", e);
+                std::process::exit(1);
+            }
+        }
+        println!("{}", json);
+        if !report.passed {
+            std::process::exit(2);
+        }
         return;
     }
 
@@ -1920,6 +2097,9 @@ async fn main() {
         Commands::AddModel { .. } => {
             unreachable!("add-model is handled before AppContext initialization")
         }
+        Commands::ProveHfModel { .. } => {
+            unreachable!("prove-hf-model is handled before AppContext initialization")
+        }
         Commands::ShowModel { id } => {
             let model = model_manager.get_model(&id).unwrap_or_else(|e| {
                 eprintln!("Failed to get model: {}", e);
@@ -2475,5 +2655,68 @@ mod tests {
         assert_eq!(backend.model, model_path.display().to_string());
         assert_eq!(backend.context_size, Some(2048));
         assert_eq!(backend.gpu_layers, Some(12));
+    }
+
+    #[test]
+    fn hf_model_proof_report_includes_download_activation_and_generation_evidence() {
+        let model_path = PathBuf::from("B:/crytex-data/models/tiny/model.gguf");
+        let model = crytex_core::services::ManagedModel {
+            id: "hf-tiny".into(),
+            name: "HF Tiny".into(),
+            repo: Some("owner/repo".into()),
+            filename: Some("model.gguf".into()),
+            local_path: Some(model_path.clone()),
+            quantization: Some(crytex_core::services::Quantization::Q2K),
+            preferred_backend: BackendKind::MistralRs,
+            params_b: Some(1.1),
+            status: crytex_core::services::ModelStatus::Downloaded,
+        };
+        let recommendation = crytex_core::services::RecommendedConfig {
+            backend: BackendKind::MistralRs,
+            quantization: crytex_core::services::Quantization::Q2K,
+            gpu_layers: Some(12),
+            context_size: 2048,
+        };
+        let runtime_probe = crytex_core::services::ModelRuntimeProbeReport {
+            trace_id: "trace-hf-proof".into(),
+            model_id: "hf-tiny".into(),
+            backend_id: Some("local-hf-proof".into()),
+            backend_capability: None,
+            compatibility: crytex_core::services::ModelCompatibilityPlanner::plan(
+                &model,
+                &crytex_core::services::DeviceKind::Cpu,
+                &RuntimeFeatureSet {
+                    cuda_available: false,
+                    metal_available: false,
+                    gdn_cuda_available: false,
+                    cuda_unquantized_moe_fallback_available: false,
+                },
+            ),
+            stages: Vec::new(),
+            generated_preview: Some("ok".into()),
+            passed: true,
+        };
+
+        let report = build_hf_model_proof_report(
+            "local-hf-proof".into(),
+            &model,
+            recommendation,
+            runtime_probe,
+        );
+
+        assert!(report.passed);
+        assert_eq!(report.trace_id, "trace-hf-proof");
+        assert_eq!(report.model_id, "hf-tiny");
+        assert_eq!(report.repo.as_deref(), Some("owner/repo"));
+        assert_eq!(report.filename.as_deref(), Some("model.gguf"));
+        assert_eq!(
+            report.local_path.as_deref(),
+            Some(model_path.to_str().unwrap())
+        );
+        assert_eq!(report.backend_id, "local-hf-proof");
+        assert_eq!(
+            report.runtime_probe.generated_preview.as_deref(),
+            Some("ok")
+        );
     }
 }

@@ -421,8 +421,18 @@ mod tests {
             output_dir: &Path,
         ) -> Result<LoraTrainingResult, LoraTrainingError> {
             tokio::fs::create_dir_all(output_dir).await?;
-            let adapter_path = output_dir.join("candidate.safetensors");
-            tokio::fs::write(&adapter_path, b"small lora adapter").await?;
+            let adapter_path = output_dir.join("candidate");
+            tokio::fs::create_dir_all(&adapter_path).await?;
+            tokio::fs::write(
+                adapter_path.join("adapter_config.json"),
+                br#"{"peft_type":"LORA","r":8,"lora_alpha":16}"#,
+            )
+            .await?;
+            tokio::fs::write(
+                adapter_path.join("adapter_model.safetensors"),
+                b"small lora adapter",
+            )
+            .await?;
             Ok(LoraTrainingResult {
                 adapter_id: "candidate".into(),
                 adapter_path,
@@ -645,10 +655,7 @@ mod tests {
             storage.list_lora_adapters_by_kind("codegen").await.unwrap();
         assert!(adapters.is_empty(), "rejected LoRA must not be registered");
         assert!(
-            !adapters_dir
-                .join("codegen")
-                .join("candidate.safetensors")
-                .exists(),
+            !adapters_dir.join("codegen").join("candidate").exists(),
             "rejected LoRA artifact must be removed"
         );
         let _ = tokio::fs::remove_file(db_path).await;
