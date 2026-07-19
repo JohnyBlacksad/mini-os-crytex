@@ -4,6 +4,7 @@
 //! - AST-aware code chunking via tree-sitter (Rust, Python, JS/TS, Go, Java, C/C++).
 //! - Markdown text extraction.
 //! - HTML text extraction.
+//! - PDF text extraction.
 
 use std::path::Path;
 use tree_sitter::{Language, Node, Parser};
@@ -55,6 +56,9 @@ pub enum ChunkError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }
+
+const DOC_CHUNK_MAX_CHARS: usize = 1_200;
+const DOC_CHUNK_OVERLAP_CHARS: usize = 160;
 
 fn language_by_extension(path: &Path) -> Option<Language> {
     match path.extension().and_then(|e| e.to_str())? {
@@ -202,18 +206,12 @@ pub fn parse_markdown(file_path: &str, source: &str) -> Vec<Chunk> {
         return Vec::new();
     }
 
-    vec![Chunk {
-        id: format!("{}-0", file_path),
-        source: file_path.into(),
-        kind: ChunkKind::Doc,
-        language: Some("markdown".into()),
-        summary: Some(first_line(trimmed)),
-        start_line: 1,
-        end_line: source.lines().count().max(1),
-        text: trimmed.into(),
-        symbol_id: None,
-        related_symbols: Vec::new(),
-    }]
+    chunk_doc_text(
+        file_path,
+        "markdown",
+        trimmed,
+        source.lines().count().max(1),
+    )
 }
 
 /// Extract plain text from HTML.
@@ -225,18 +223,83 @@ pub fn parse_html(file_path: &str, source: &str) -> Vec<Chunk> {
         return Vec::new();
     }
 
-    vec![Chunk {
-        id: format!("{}-0", file_path),
-        source: file_path.into(),
-        kind: ChunkKind::Doc,
-        language: Some("html".into()),
-        summary: Some(first_line(trimmed)),
-        start_line: 1,
-        end_line: source.lines().count().max(1),
-        text: trimmed.into(),
-        symbol_id: None,
-        related_symbols: Vec::new(),
-    }]
+    chunk_doc_text(file_path, "html", trimmed, source.lines().count().max(1))
+}
+
+/// Extract plain text from a PDF byte buffer.
+pub fn parse_pdf_bytes(file_path: &str, bytes: &[u8]) -> Result<Vec<Chunk>, ChunkError> {
+    let extracted = pdf_extract::extract_text_from_mem(bytes)
+        .ok()
+        .filter(|text| !text.trim().is_empty())
+        .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned());
+    Ok(parse_pdf_text(file_path, &extracted))
+}
+
+/// Chunk already-extracted PDF text.
+pub fn parse_pdf_text(file_path: &str, source: &str) -> Vec<Chunk> {
+    let trimmed = source.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    chunk_doc_text(file_path, "pdf", trimmed, source.lines().count().max(1))
+}
+
+fn chunk_doc_text(
+    file_path: &str,
+    language: &str,
+    source: &str,
+    source_line_count: usize,
+) -> Vec<Chunk> {
+    let mut chunks = Vec::new();
+    let mut start = 0usize;
+    let mut index = 0usize;
+    while start < source.len() {
+        let end = next_char_boundary(source, (start + DOC_CHUNK_MAX_CHARS).min(source.len()));
+        let text = source[start..end].trim().to_string();
+        if !text.is_empty() {
+            chunks.push(Chunk {
+                id: format!("{}-{}", file_path, index),
+                source: file_path.into(),
+                kind: ChunkKind::Doc,
+                language: Some(language.into()),
+                summary: Some(first_line(&text)),
+                start_line: line_number_at_byte(source, start),
+                end_line: line_number_at_byte(source, end).min(source_line_count.max(1)),
+                text,
+                symbol_id: None,
+                related_symbols: Vec::new(),
+            });
+            index += 1;
+        }
+        if end == source.len() {
+            break;
+        }
+        start = previous_char_boundary(source, end.saturating_sub(DOC_CHUNK_OVERLAP_CHARS));
+    }
+    chunks
+}
+
+fn next_char_boundary(source: &str, mut index: usize) -> usize {
+    while index < source.len() && !source.is_char_boundary(index) {
+        index += 1;
+    }
+    index
+}
+
+fn previous_char_boundary(source: &str, mut index: usize) -> usize {
+    while index > 0 && !source.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+fn line_number_at_byte(source: &str, byte_index: usize) -> usize {
+    source[..byte_index.min(source.len())]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+        + 1
 }
 
 /// Parse a documentation file based on extension.
@@ -244,6 +307,7 @@ pub fn parse_doc(file_path: &str, source: &str) -> Vec<Chunk> {
     match Path::new(file_path).extension().and_then(|e| e.to_str()) {
         Some("md") => parse_markdown(file_path, source),
         Some("html") | Some("htm") => parse_html(file_path, source),
+        Some("pdf") => parse_pdf_text(file_path, source),
         _ => Vec::new(),
     }
 }
@@ -300,6 +364,42 @@ mod tests {
             .collect();
         assert!(names.contains(&"tracked.txt".into()));
         assert!(!names.contains(&"ignored.txt".into()));
+    }
+
+    #[test]
+    fn markdown_chunking_preserves_overlap_between_long_doc_chunks() {
+        let text = format!("{}\n{}", "alpha ".repeat(260), "omega ".repeat(260));
+
+        let chunks = parse_markdown("docs/long.md", &text);
+
+        assert!(chunks.len() > 1);
+        let first_tail = &chunks[0].text[chunks[0].text.len().saturating_sub(80)..];
+        assert!(
+            chunks[1].text.contains(first_tail.trim()),
+            "next chunk should include overlap from previous chunk"
+        );
+    }
+
+    #[test]
+    fn pdf_text_is_chunked_as_document_context() {
+        let chunks = parse_pdf_text(
+            "docs/architecture.pdf",
+            "Crytex PDF RAG_CONTEXT describes model download and LoRA evolution.",
+        );
+
+        assert_eq!(chunks[0].language.as_deref(), Some("pdf"));
+        assert!(chunks[0].text.contains("RAG_CONTEXT"));
+    }
+
+    #[test]
+    fn pdf_bytes_fall_back_to_embedded_text_when_extractor_returns_empty() {
+        let chunks = parse_pdf_bytes(
+            "docs/fallback.pdf",
+            b"%PDF-1.4\nstream\n(RAG_CONTEXT fallback text)\nendstream\n%%EOF",
+        )
+        .unwrap();
+
+        assert!(chunks[0].text.contains("RAG_CONTEXT fallback text"));
     }
 
     #[test]

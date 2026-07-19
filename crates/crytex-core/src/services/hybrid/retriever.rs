@@ -117,18 +117,51 @@ fn to_ranked_list(results: Vec<SearchResult>, source: RetrieverSource) -> Ranked
     results
         .into_iter()
         .enumerate()
-        .map(|(idx, result)| RankedResult {
-            result,
-            source,
-            rank: idx + 1,
+        .map(|(idx, mut result)| {
+            append_retrieval_evidence(&mut result.payload, source, idx + 1, result.score);
+            RankedResult {
+                result,
+                source,
+                rank: idx + 1,
+            }
         })
         .collect()
+}
+
+fn append_retrieval_evidence(
+    payload: &mut serde_json::Value,
+    source: RetrieverSource,
+    rank: usize,
+    score: f32,
+) {
+    let item = serde_json::json!({
+        "source": retriever_source_name(source),
+        "rank": rank,
+        "score": score,
+    });
+    if let Some(items) = payload
+        .get_mut("retrieval_evidence")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        items.push(item);
+    } else {
+        payload["retrieval_evidence"] = serde_json::json!([item]);
+    }
+}
+
+fn retriever_source_name(source: RetrieverSource) -> &'static str {
+    match source {
+        RetrieverSource::Dense => "dense",
+        RetrieverSource::Sparse => "sparse",
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::{MockEmbedder, MockSparseEmbedder, SparseVector, VectorPoint};
+    use crate::services::{
+        MockEmbedder, MockSparseEmbedder, ReciprocalRankFusion, SparseVector, VectorPoint,
+    };
     use std::collections::HashMap;
     use std::sync::Mutex;
 
@@ -280,6 +313,47 @@ mod tests {
         assert_eq!(lists.len(), 2);
         assert_eq!(lists[0][0].source, RetrieverSource::Dense);
         assert_eq!(lists[1][0].source, RetrieverSource::Sparse);
+    }
+
+    #[tokio::test]
+    async fn hybrid_retriever_adds_dense_and_sparse_rank_evidence() {
+        let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::new(8));
+        let sparse_embedder: Arc<dyn SparseEmbedder> = Arc::new(MockSparseEmbedder);
+        let store = Arc::new(StubVectorStore {
+            sparse_supported: true,
+            ..Default::default()
+        });
+        let query_vector = embedder.embed("query").await.unwrap();
+        store
+            .upsert(
+                "code_chunks",
+                vec![VectorPoint {
+                    id: "same".into(),
+                    vector: query_vector,
+                    payload: serde_json::json!({
+                        "project_id": "proj-1",
+                        "text": "dense and sparse match",
+                    }),
+                }],
+            )
+            .await
+            .unwrap();
+        let retriever = HybridRetriever::new(
+            embedder,
+            store,
+            Some(sparse_embedder),
+            Arc::new(ReciprocalRankFusion::default()),
+        );
+        let results = retriever
+            .search("query", "proj-1", &["code_chunks"], 5, 5)
+            .await
+            .unwrap();
+
+        let evidence = results[0].payload["retrieval_evidence"]
+            .as_array()
+            .expect("retrieval evidence should be present");
+        assert!(evidence.iter().any(|item| item["source"] == "dense"));
+        assert!(evidence.iter().any(|item| item["source"] == "sparse"));
     }
 
     #[tokio::test]

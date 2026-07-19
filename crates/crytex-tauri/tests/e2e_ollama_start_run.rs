@@ -760,7 +760,7 @@ async fn real_ollama_agent_run_receives_indexed_rag_context() {
                 "backend": "ollama",
                 "model": model,
                 "system_prompt_override": "You are a deterministic Crytex RAG E2E agent. Return exactly one valid JSON object and no markdown. Read the Relevant Context section in the user message. Extract the single uppercase verification token from that context and put it in the summary field. If no verification token exists in Relevant Context, use MISSING_RAG_CONTEXT. Do not call tools.",
-                "prompt": "Answer using only the relevant project context. The task text intentionally omits the verification phrase. Return {\"files_changed\":[],\"test_results\":null,\"summary\":\"<verification token from Relevant Context>\"}."
+                "prompt": "Answer using only the relevant project context. The task text intentionally omits the verification phrase. Return {\"files_changed\":[\"rag://retrieved-context\"],\"test_results\":\"not run in RAG e2e\",\"summary\":\"<verification token from Relevant Context>\"}."
             }),
             trace_id: Some("trace-real-ollama-rag-e2e".into()),
         })

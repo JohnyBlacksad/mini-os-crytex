@@ -71,6 +71,8 @@ pub struct RagAssemblyEvidence {
     pub query: String,
     pub project_id: Option<String>,
     pub rerank_applied: bool,
+    pub retrieval_candidates: Vec<RagChunkEvidence>,
+    pub reranked_chunks: Vec<RagChunkEvidence>,
     pub chunks: Vec<RagChunkEvidence>,
 }
 
@@ -82,6 +84,8 @@ pub struct RagChunkEvidence {
     pub source: Option<String>,
     pub relative_path: Option<String>,
     pub text_preview: String,
+    pub retrieval_sources: Vec<String>,
+    pub selection_reason: String,
 }
 
 impl Default for ContextRequest {
@@ -200,11 +204,18 @@ impl ContextAssembler {
             messages.push(Message::system(memory_context));
         }
 
-        let (retrieved, rerank_applied) = self.retrieve_relevant_chunks(&request).await?;
+        let (retrieved, rerank_applied, retrieval_candidates) =
+            self.retrieve_relevant_chunks(&request).await?;
         let rag = RagAssemblyEvidence {
             query: request.user_query.clone(),
             project_id: request.project_id.clone(),
             rerank_applied,
+            retrieval_candidates: retrieval_candidates.iter().map(chunk_evidence).collect(),
+            reranked_chunks: if rerank_applied {
+                retrieved.iter().map(chunk_evidence).collect()
+            } else {
+                Vec::new()
+            },
             chunks: retrieved.iter().map(chunk_evidence).collect(),
         };
         if !retrieved.is_empty() {
@@ -252,13 +263,13 @@ impl ContextAssembler {
     async fn retrieve_relevant_chunks(
         &self,
         request: &ContextRequest,
-    ) -> Result<(Vec<SearchResult>, bool), ContextAssemblerError> {
+    ) -> Result<(Vec<SearchResult>, bool, Vec<SearchResult>), ContextAssemblerError> {
         let project_id = match &request.project_id {
             Some(id) => id,
-            None => return Ok((Vec::new(), false)),
+            None => return Ok((Vec::new(), false, Vec::new())),
         };
         if request.user_query.is_empty() {
-            return Ok((Vec::new(), false));
+            return Ok((Vec::new(), false, Vec::new()));
         }
 
         let results = self
@@ -271,7 +282,10 @@ impl ContextAssembler {
                 request.top_k,
             )
             .await?;
-        self.rerank_results(&request.user_query, results).await
+        let before_rerank = results.clone();
+        let (after_rerank, rerank_applied) =
+            self.rerank_results(&request.user_query, results).await?;
+        Ok((after_rerank, rerank_applied, before_rerank))
     }
 
     async fn rerank_results(
@@ -431,7 +445,37 @@ fn chunk_evidence(result: &SearchResult) -> RagChunkEvidence {
         source: string_payload(&result.payload, "source"),
         relative_path: string_payload(&result.payload, "relative_path"),
         text_preview: preview(text, 240),
+        retrieval_sources: retrieval_sources(&result.payload),
+        selection_reason: selection_reason(result),
     }
+}
+
+fn retrieval_sources(payload: &serde_json::Value) -> Vec<String> {
+    let mut sources = Vec::new();
+    for source in payload
+        .get("retrieval_evidence")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.get("source").and_then(serde_json::Value::as_str))
+    {
+        if !sources.iter().any(|existing| existing == source) {
+            sources.push(source.to_string());
+        }
+    }
+    sources
+}
+
+fn selection_reason(result: &SearchResult) -> String {
+    let sources = retrieval_sources(&result.payload);
+    if sources.is_empty() {
+        return format!("selected by fused relevance score {:.4}", result.score);
+    }
+    format!(
+        "selected after {} retrieval evidence with fused/rerank score {:.4}",
+        sources.join("+"),
+        result.score
+    )
 }
 
 fn string_payload(payload: &serde_json::Value, key: &str) -> Option<String> {
@@ -883,6 +927,65 @@ mod tests {
         assert!(
             second_pos < first_pos,
             "reranker should move the second result before the dense winner: {context}"
+        );
+    }
+
+    #[tokio::test]
+    async fn assembler_evidence_records_before_after_rerank_and_selection_reason() {
+        let store = Arc::new(TestVectorStore::default());
+        store
+            .upsert(
+                "code_chunks",
+                vec![
+                    VectorPoint {
+                        id: "first".into(),
+                        vector: vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                        payload: serde_json::json!({
+                            "project_id": "proj-1",
+                            "source": "first.rs",
+                            "relative_path": "src/first.rs",
+                            "text": "first dense result",
+                            "retrieval_evidence": [{"source": "dense", "rank": 1, "score": 0.99}]
+                        }),
+                    },
+                    VectorPoint {
+                        id: "second".into(),
+                        vector: vec![0.99, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                        payload: serde_json::json!({
+                            "project_id": "proj-1",
+                            "source": "second.rs",
+                            "relative_path": "src/second.rs",
+                            "text": "second reranked result",
+                            "retrieval_evidence": [{"source": "dense", "rank": 2, "score": 0.98}]
+                        }),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        let assembler =
+            make_assembler_with_store(store).with_reranker(Arc::new(PreferSecondReranker));
+        let assembly = assembler
+            .assemble_with_evidence(ContextRequest {
+                system_prompt: "You are a coder.".into(),
+                user_query: "query".into(),
+                project_id: Some("proj-1".into()),
+                token_budget: 200,
+                top_k: 2,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert!(assembly.rag.rerank_applied);
+        assert_eq!(assembly.rag.retrieval_candidates[0].id, "first");
+        assert_eq!(assembly.rag.reranked_chunks[0].id, "second");
+        assert_eq!(assembly.rag.chunks[0].id, "second");
+        assert!(
+            assembly.rag.chunks[0]
+                .selection_reason
+                .contains("selected after dense retrieval evidence")
         );
     }
 

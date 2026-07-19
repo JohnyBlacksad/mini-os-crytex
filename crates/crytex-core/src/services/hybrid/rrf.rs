@@ -59,6 +59,7 @@ impl FusionStrategy for ReciprocalRankFusion {
                 let entry = scores
                     .entry(ranked.result.id.clone())
                     .or_insert_with(|| (ranked.result.clone(), 0.0));
+                merge_retrieval_evidence(&mut entry.0, &ranked.result);
                 entry.1 += contrib;
             }
         }
@@ -77,5 +78,29 @@ impl FusionStrategy for ReciprocalRankFusion {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         results
+    }
+}
+
+fn merge_retrieval_evidence(target: &mut SearchResult, source: &SearchResult) {
+    let Some(items) = source
+        .payload
+        .get("retrieval_evidence")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return;
+    };
+
+    if let Some(target_items) = target
+        .payload
+        .get_mut("retrieval_evidence")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for item in items {
+            if !target_items.iter().any(|existing| existing == item) {
+                target_items.push(item.clone());
+            }
+        }
+    } else {
+        target.payload["retrieval_evidence"] = serde_json::Value::Array(items.clone());
     }
 }

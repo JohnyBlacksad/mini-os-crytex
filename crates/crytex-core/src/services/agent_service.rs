@@ -272,6 +272,40 @@ impl AgentService for AgentServiceImpl {
                                     "source": chunk.source,
                                     "relative_path": chunk.relative_path,
                                     "text_preview": chunk.text_preview,
+                                    "retrieval_sources": chunk.retrieval_sources,
+                                    "selection_reason": chunk.selection_reason,
+                                })
+                            })
+                            .collect();
+                        let retrieval_candidates: Vec<Value> = assembly
+                            .rag
+                            .retrieval_candidates
+                            .iter()
+                            .map(|chunk| {
+                                serde_json::json!({
+                                    "id": chunk.id,
+                                    "score": chunk.score,
+                                    "source": chunk.source,
+                                    "relative_path": chunk.relative_path,
+                                    "text_preview": chunk.text_preview,
+                                    "retrieval_sources": chunk.retrieval_sources,
+                                    "selection_reason": chunk.selection_reason,
+                                })
+                            })
+                            .collect();
+                        let reranked_chunks: Vec<Value> = assembly
+                            .rag
+                            .reranked_chunks
+                            .iter()
+                            .map(|chunk| {
+                                serde_json::json!({
+                                    "id": chunk.id,
+                                    "score": chunk.score,
+                                    "source": chunk.source,
+                                    "relative_path": chunk.relative_path,
+                                    "text_preview": chunk.text_preview,
+                                    "retrieval_sources": chunk.retrieval_sources,
+                                    "selection_reason": chunk.selection_reason,
                                 })
                             })
                             .collect();
@@ -288,6 +322,8 @@ impl AgentService for AgentServiceImpl {
                                         "project_id": assembly.rag.project_id,
                                         "trace_id": task.trace_id,
                                         "rerank_applied": assembly.rag.rerank_applied,
+                                        "retrieval_candidates": retrieval_candidates,
+                                        "reranked_chunks": reranked_chunks,
                                         "chunks": chunks,
                                     })),
                             )
@@ -768,6 +804,26 @@ mod tests {
         assert_eq!(
             rag_entry.metadata["chunks"][0]["relative_path"],
             "docs/architecture.md"
+        );
+        assert_eq!(
+            rag_entry.metadata["retrieval_candidates"][0]["relative_path"],
+            "docs/architecture.md"
+        );
+        assert_eq!(
+            rag_entry.metadata["retrieval_candidates"][0]["retrieval_sources"][0],
+            "dense"
+        );
+        assert!(
+            rag_entry.metadata["reranked_chunks"]
+                .as_array()
+                .is_some_and(|items| items.is_empty()),
+            "reranked_chunks should be empty when rerank is not applied"
+        );
+        assert!(
+            rag_entry.metadata["chunks"][0]["selection_reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("selected after dense retrieval evidence")
         );
         assert!(
             rag_entry.metadata["chunks"][0]["score"]

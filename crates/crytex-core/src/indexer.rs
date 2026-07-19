@@ -7,7 +7,7 @@ use crytex_doc::{
     Chunk, ChunkKind, chunk_code,
     chunking::chunk_code_with_graph,
     graph::{CodeGraph, builder::CodeGraphBuilder},
-    parse_doc, walk_project,
+    parse_doc, parse_pdf_bytes, walk_project,
 };
 
 use crate::services::{
@@ -71,11 +71,11 @@ impl ProjectIndexer {
                 .to_string_lossy()
                 .to_string()
                 .replace('\\', "/");
-            let Ok(source) = tokio::fs::read_to_string(&path).await else {
+            let Ok(bytes) = tokio::fs::read(&path).await else {
                 continue;
             };
 
-            let chunks = self.chunk_file(&path, &relative, &source, Some(&code_graph))?;
+            let chunks = self.chunk_file(&path, &relative, &bytes, Some(&code_graph))?;
             if chunks.is_empty() {
                 continue;
             }
@@ -107,7 +107,7 @@ impl ProjectIndexer {
         relative_path: &str,
     ) -> Result<IndexStats, IndexerError> {
         let full_path = project_root.join(relative_path);
-        let source = tokio::fs::read_to_string(&full_path).await?;
+        let bytes = tokio::fs::read(&full_path).await?;
         let code_graph = CodeGraphBuilder::new()
             .index_project(project_root)
             .map_err(|e| IndexerError::Chunk(e.to_string()))?;
@@ -115,7 +115,7 @@ impl ProjectIndexer {
         let chunks = self.chunk_file(
             full_path.to_string_lossy().as_ref(),
             &normalized_relative_path,
-            &source,
+            &bytes,
             Some(&code_graph),
         )?;
         if chunks.is_empty() {
@@ -168,7 +168,7 @@ impl ProjectIndexer {
         &self,
         full_path: &str,
         relative_path: &str,
-        source: &str,
+        bytes: &[u8],
         code_graph: Option<&CodeGraph>,
     ) -> Result<Vec<Chunk>, IndexerError> {
         let ext = Path::new(full_path)
@@ -181,6 +181,9 @@ impl ProjectIndexer {
         let doc_exts = ["md", "html", "htm"];
 
         if code_exts.contains(&ext) {
+            let source = std::str::from_utf8(bytes).map_err(|error| {
+                IndexerError::Chunk(format!("invalid UTF-8 code file: {error}"))
+            })?;
             match code_graph {
                 Some(graph) => chunk_code_with_graph(relative_path, source, graph)
                     .map_err(|e| IndexerError::Chunk(e.to_string())),
@@ -188,7 +191,11 @@ impl ProjectIndexer {
                     .map_err(|e| IndexerError::Chunk(e.to_string())),
             }
         } else if doc_exts.contains(&ext) {
+            let source = std::str::from_utf8(bytes)
+                .map_err(|error| IndexerError::Chunk(format!("invalid UTF-8 document: {error}")))?;
             Ok(parse_doc(relative_path, source))
+        } else if ext == "pdf" {
+            parse_pdf_bytes(relative_path, bytes).map_err(|e| IndexerError::Chunk(e.to_string()))
         } else {
             Ok(Vec::new())
         }
@@ -638,6 +645,124 @@ mod tests {
         assert!(!results.is_empty());
         let text = results[0].payload.get("text").unwrap().as_str().unwrap();
         assert!(text.contains("fn add"));
+    }
+
+    #[tokio::test]
+    async fn indexer_indexes_mixed_code_markdown_and_pdf_with_overlap_and_ast_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::create_dir(root.join("docs")).unwrap();
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn fetch_context() -> &'static str { \"RAG_CONTEXT\" }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("docs/guide.md"),
+            format!(
+                "{}\n{}",
+                "RAG_CONTEXT markdown ".repeat(90),
+                "overlap marker ".repeat(90)
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("docs/spec.pdf"),
+            minimal_pdf_with_text(
+                "RAG_CONTEXT pdf requirements mention rerank and LoRA evolution.",
+            ),
+        )
+        .unwrap();
+
+        let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::new(8));
+        let vector_store: Arc<dyn VectorStore> = Arc::new(TestVectorStore::default());
+        let indexer = ProjectIndexer::new(embedder, vector_store.clone());
+        indexer.index("proj-mixed", root).await.unwrap();
+
+        let code = vector_store
+            .search(
+                "code_chunks",
+                &[1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                SearchOptions {
+                    limit: 10,
+                    filter: Some(
+                        serde_json::json!({"project_id": {"match": {"value": "proj-mixed"}}}),
+                    ),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(code.iter().any(|result| {
+            result.payload["relative_path"] == "src/lib.rs"
+                && result.payload["symbol_id"].as_str().is_some()
+                && result.payload["language"] == "rust"
+        }));
+
+        let docs = vector_store
+            .search(
+                "doc_chunks",
+                &[1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                SearchOptions {
+                    limit: 20,
+                    filter: Some(
+                        serde_json::json!({"project_id": {"match": {"value": "proj-mixed"}}}),
+                    ),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(docs.iter().any(|result| {
+            result.payload["relative_path"] == "docs/spec.pdf"
+                && result.payload["language"] == "pdf"
+        }));
+        let guide_chunks: Vec<_> = docs
+            .iter()
+            .filter(|result| result.payload["relative_path"] == "docs/guide.md")
+            .collect();
+        assert!(guide_chunks.len() > 1);
+        assert!(guide_chunks.windows(2).any(|pair| {
+            pair[1].payload["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("overlap marker")
+        }));
+    }
+
+    fn minimal_pdf_with_text(text: &str) -> Vec<u8> {
+        let escaped = text
+            .replace('\\', "\\\\")
+            .replace('(', "\\(")
+            .replace(')', "\\)");
+        let objects = [
+            "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_string(),
+            "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".to_string(),
+            "3 0 obj\n<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 4 0 R >> >> /MediaBox [0 0 612 792] /Contents 5 0 R >>\nendobj\n".to_string(),
+            "4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n".to_string(),
+            format!(
+                "5 0 obj\n<< /Length {} >>\nstream\nBT /F1 12 Tf 72 720 Td ({}) Tj ET\nendstream\nendobj\n",
+                33 + escaped.len(),
+                escaped
+            ),
+        ];
+        let mut pdf = String::from("%PDF-1.4\n");
+        let mut offsets = vec![0usize];
+        for object in objects {
+            offsets.push(pdf.len());
+            pdf.push_str(&object);
+        }
+        let xref_offset = pdf.len();
+        pdf.push_str("xref\n0 6\n0000000000 65535 f \n");
+        for offset in offsets.iter().skip(1) {
+            pdf.push_str(&format!("{offset:010} 00000 n \n"));
+        }
+        pdf.push_str(&format!(
+            "trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n"
+        ));
+        pdf.into_bytes()
     }
 
     #[tokio::test]

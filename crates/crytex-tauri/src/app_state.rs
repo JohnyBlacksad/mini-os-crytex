@@ -1341,6 +1341,40 @@ impl AgentService for StaticAgentService {
                                 "source": chunk.source,
                                 "relative_path": chunk.relative_path,
                                 "text_preview": chunk.text_preview,
+                                "retrieval_sources": chunk.retrieval_sources,
+                                "selection_reason": chunk.selection_reason,
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    let retrieval_candidates = assembly
+                        .rag
+                        .retrieval_candidates
+                        .iter()
+                        .map(|chunk| {
+                            serde_json::json!({
+                                "id": chunk.id,
+                                "score": chunk.score,
+                                "source": chunk.source,
+                                "relative_path": chunk.relative_path,
+                                "text_preview": chunk.text_preview,
+                                "retrieval_sources": chunk.retrieval_sources,
+                                "selection_reason": chunk.selection_reason,
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    let reranked_chunks = assembly
+                        .rag
+                        .reranked_chunks
+                        .iter()
+                        .map(|chunk| {
+                            serde_json::json!({
+                                "id": chunk.id,
+                                "score": chunk.score,
+                                "source": chunk.source,
+                                "relative_path": chunk.relative_path,
+                                "text_preview": chunk.text_preview,
+                                "retrieval_sources": chunk.retrieval_sources,
+                                "selection_reason": chunk.selection_reason,
                             })
                         })
                         .collect::<Vec<_>>();
@@ -1360,6 +1394,8 @@ impl AgentService for StaticAgentService {
                                     "project_id": assembly.rag.project_id,
                                     "trace_id": task.trace_id,
                                     "rerank_applied": assembly.rag.rerank_applied,
+                                    "retrieval_candidates": retrieval_candidates,
+                                    "reranked_chunks": reranked_chunks,
                                     "chunks": chunks,
                                 })),
                             )
@@ -2977,9 +3013,10 @@ mod tests {
             Box::new(move |project_service, audit_service, context_assembler| {
                 Arc::new(
                     AgentTaskExecutor::new_project_scoped(
-                        Arc::new(StaticAgentService::with_default_agents(Some(
-                            context_assembler,
-                        ))),
+                        Arc::new(
+                            StaticAgentService::with_default_agents(Some(context_assembler))
+                                .with_audit(audit_service.clone()),
+                        ),
                         inference,
                         project_service,
                     )
@@ -3065,9 +3102,10 @@ mod tests {
             Box::new(move |project_service, audit_service, context_assembler| {
                 Arc::new(
                     AgentTaskExecutor::new_project_scoped(
-                        Arc::new(StaticAgentService::with_default_agents(Some(
-                            context_assembler,
-                        ))),
+                        Arc::new(
+                            StaticAgentService::with_default_agents(Some(context_assembler))
+                                .with_audit(audit_service.clone()),
+                        ),
                         inference,
                         project_service,
                     )
@@ -3142,6 +3180,37 @@ mod tests {
         assert!(
             target_pos < baseline_pos,
             "reranker should order target context before baseline context in agent prompt: {prompt}"
+        );
+        let exported = state.get_project_state(&project.id).await.unwrap();
+        let exported_actions = exported
+            .recent_logs
+            .iter()
+            .map(|log| format!("{}:{:?}", log.action, log.metadata.get("trace_id")))
+            .collect::<Vec<_>>();
+        let rag_event = exported
+            .recent_logs
+            .iter()
+            .find(|log| {
+                log.action == "rag_context_assembled"
+                    && log.metadata["trace_id"] == "trace-agent-rerank-rag"
+            })
+            .unwrap_or_else(|| {
+                panic!("RAG diagnostics event should be exported: {exported_actions:?}")
+            });
+        assert_eq!(rag_event.metadata["rerank_applied"], true);
+        assert_eq!(
+            rag_event.metadata["retrieval_candidates"][0]["relative_path"],
+            "docs/dense-winner.md"
+        );
+        assert_eq!(
+            rag_event.metadata["reranked_chunks"][0]["relative_path"],
+            "docs/rerank-target.md"
+        );
+        assert!(
+            rag_event.metadata["chunks"][0]["selection_reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("retrieval evidence")
         );
         state.shutdown_project_watchers().await;
     }
