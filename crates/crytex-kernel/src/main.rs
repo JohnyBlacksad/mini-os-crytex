@@ -44,12 +44,12 @@ use crytex_core::{
     services::{
         AgentRole, AgentService, AgentServiceImpl, AgentWorkflowNodeExecutor, AlertService,
         AlertServiceImpl, AlertThresholds, BulkAuditLogService, CreateProjectRequest,
-        CreateTaskRequest, CriticCouncil, EventServiceImpl, InferenceServiceImpl, LoraRouter,
-        ModelManager, ModelManagerImpl, ModelRuntimeMatrixProbe, ModelRuntimeMatrixRequest,
-        ModelRuntimeProbe, ModelRuntimeProbeRequest, MutationOperator, Orchestrator,
-        OrchestratorImpl, ProjectService, ProjectServiceImpl, ProjectWatcher,
-        PromptEvolutionService, RecordRewardRequest, RewardService, RuntimeFeatureSet,
-        RuntimeMatrixEntryRequest, RuntimeMatrixReportWriter, SchedulerImpl,
+        CreateTaskRequest, CriticCouncil, EventServiceImpl, HfGgufResolveRequest,
+        InferenceServiceImpl, LoraRouter, ModelManager, ModelManagerImpl, ModelRuntimeMatrixProbe,
+        ModelRuntimeMatrixRequest, ModelRuntimeProbe, ModelRuntimeProbeRequest, MutationOperator,
+        Orchestrator, OrchestratorImpl, ProjectService, ProjectServiceImpl, ProjectWatcher,
+        PromptEvolutionService, Quantization, RecordRewardRequest, RewardService,
+        RuntimeFeatureSet, RuntimeMatrixEntryRequest, RuntimeMatrixReportWriter, SchedulerImpl,
         SystemHardwareDetector, TaskHandler, TaskServiceImpl, TomlWorkflowRepository, WorkerError,
         WorkerPool, WorkflowRepository, recommend_local_device,
     },
@@ -197,6 +197,15 @@ enum Commands {
     RecommendModel {
         #[arg(short, long)]
         id: String,
+    },
+    /// Resolve the best GGUF file from a HuggingFace model repo
+    ResolveHfGguf {
+        #[arg(short, long)]
+        repo: String,
+        #[arg(short, long)]
+        quantization: Option<String>,
+        #[arg(long)]
+        params_b: Option<f32>,
     },
     /// Run metadata, compatibility, and generation smoke probe for a managed model
     ProbeModel {
@@ -1110,6 +1119,51 @@ async fn main() {
         if !report.passed {
             std::process::exit(2);
         }
+        return;
+    }
+
+    if let Commands::ResolveHfGguf {
+        repo,
+        quantization,
+        params_b,
+    } = &cli.command
+    {
+        let event_bus = Arc::new(crytex_core::EventBus::new());
+        let event_service = Arc::new(EventServiceImpl::new(event_bus));
+        let config_dir = CrytexConfig::config_path()
+            .parent()
+            .expect("config path must have a parent")
+            .to_path_buf();
+        let model_manager = ModelManagerImpl::new_standard(
+            &config_dir,
+            &config.paths.data_dir,
+            event_service,
+            Arc::new(SystemHardwareDetector::new()),
+        );
+        let preferred_quantization = quantization
+            .as_deref()
+            .map(str::parse::<Quantization>)
+            .transpose()
+            .unwrap_or_else(|e| {
+                eprintln!("Failed to parse quantization: {}", e);
+                std::process::exit(1);
+            });
+        let resolution = model_manager
+            .resolve_hf_gguf(HfGgufResolveRequest {
+                repo: repo.clone(),
+                preferred_quantization,
+                params_b: *params_b,
+            })
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("Failed to resolve HF GGUF: {}", e);
+                std::process::exit(1);
+            });
+        let json = unwrap_or_exit!(
+            serde_json::to_string_pretty(&resolution),
+            "Failed to serialize HF GGUF resolution"
+        );
+        println!("{}", json);
         return;
     }
 
@@ -2199,6 +2253,9 @@ async fn main() {
             );
             println!("{}", json);
         }
+        Commands::ResolveHfGguf { .. } => {
+            unreachable!("resolve-hf-gguf is handled before AppContext initialization")
+        }
         Commands::ProbeModel { .. } => {
             unreachable!("probe-model is handled before AppContext initialization")
         }
@@ -2820,6 +2877,11 @@ mod tests {
         assert_eq!(report.runtime_placement.kind, "cuda_auto_device_mapping");
         assert_eq!(report.runtime_placement.gpu_layers, None);
         assert_eq!(report.runtime_placement.compatibility_strategy, "CudaFused");
-        assert!(report.runtime_placement.evidence.contains("automatic device mapping"));
+        assert!(
+            report
+                .runtime_placement
+                .evidence
+                .contains("automatic device mapping")
+        );
     }
 }

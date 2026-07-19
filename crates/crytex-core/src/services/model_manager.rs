@@ -38,6 +38,8 @@ pub enum ModelManagerError {
     Download(String),
     #[error("recommendation error: {0}")]
     Recommendation(String),
+    #[error("resolve error: {0}")]
+    Resolve(String),
 }
 
 /// Status of a managed model.
@@ -170,6 +172,30 @@ pub struct DownloadSource {
     pub target_dir: PathBuf,
 }
 
+/// Request for resolving a GGUF artifact from a HuggingFace model repo.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HfGgufResolveRequest {
+    pub repo: String,
+    pub preferred_quantization: Option<Quantization>,
+    pub params_b: Option<f32>,
+}
+
+/// A selectable GGUF file variant in a HuggingFace model repo.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HfGgufVariant {
+    pub repo: String,
+    pub filename: String,
+    pub quantization: Quantization,
+}
+
+/// Resolution result for a HuggingFace GGUF model repo.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HfGgufResolution {
+    pub selected: HfGgufVariant,
+    pub variants: Vec<HfGgufVariant>,
+    pub recommendation: RecommendedConfig,
+}
+
 /// Trait for reading the static model manifest.
 pub trait ModelManifestSource: Send + Sync {
     fn load(&self) -> Result<Manifest, ModelManagerError>;
@@ -202,6 +228,11 @@ pub trait ModelRecommender: Send + Sync {
     fn recommend(&self, model: &ManagedModel) -> Result<RecommendedConfig, ModelManagerError>;
 }
 
+#[async_trait]
+pub trait HfRepoFileLister: Send + Sync {
+    async fn list_files(&self, repo: &str) -> Result<Vec<String>, ModelManagerError>;
+}
+
 /// High-level model lifecycle trait.
 #[async_trait]
 pub trait ModelManager: Send + Sync {
@@ -223,6 +254,16 @@ pub trait ModelManager: Send + Sync {
 
     /// Recommend runtime configuration for a model.
     fn recommend_config(&self, id: &str) -> Result<RecommendedConfig, ModelManagerError>;
+
+    /// Resolve a concrete GGUF file from a HuggingFace repo.
+    async fn resolve_hf_gguf(
+        &self,
+        _request: HfGgufResolveRequest,
+    ) -> Result<HfGgufResolution, ModelManagerError> {
+        Err(ModelManagerError::Resolve(
+            "HF GGUF resolution is not supported".to_string(),
+        ))
+    }
 }
 
 /// Default composable implementation of [`ModelManager`].
@@ -230,6 +271,7 @@ pub struct ModelManagerImpl {
     manifest_source: Arc<dyn ModelManifestSource>,
     registry_store: Arc<dyn ModelRegistryStore>,
     downloader: Arc<dyn ModelDownloader>,
+    hf_repo_file_lister: Arc<dyn HfRepoFileLister>,
     recommender: Arc<dyn ModelRecommender>,
     event_service: Arc<dyn EventService>,
     models_dir: PathBuf,
@@ -240,6 +282,7 @@ impl ModelManagerImpl {
         manifest_source: Arc<dyn ModelManifestSource>,
         registry_store: Arc<dyn ModelRegistryStore>,
         downloader: Arc<dyn ModelDownloader>,
+        hf_repo_file_lister: Arc<dyn HfRepoFileLister>,
         recommender: Arc<dyn ModelRecommender>,
         event_service: Arc<dyn EventService>,
         models_dir: PathBuf,
@@ -248,6 +291,7 @@ impl ModelManagerImpl {
             manifest_source,
             registry_store,
             downloader,
+            hf_repo_file_lister,
             recommender,
             event_service,
             models_dir,
@@ -271,6 +315,7 @@ impl ModelManagerImpl {
             Arc::new(FileSystemManifestSource::new(manifest_path)),
             Arc::new(TomlRegistryStore::new(registry_path)),
             Arc::new(HfHubDownloader),
+            Arc::new(HfHubRepoFileLister),
             Arc::new(HardwareModelRecommender::new(hardware_detector)),
             event_service,
             models_dir,
@@ -417,6 +462,46 @@ impl ModelManager for ModelManagerImpl {
         let model = self.get_model(id)?;
         self.recommender.recommend(&model)
     }
+
+    async fn resolve_hf_gguf(
+        &self,
+        request: HfGgufResolveRequest,
+    ) -> Result<HfGgufResolution, ModelManagerError> {
+        let files = self.hf_repo_file_lister.list_files(&request.repo).await?;
+        let variants = list_gguf_variants(&request.repo, files);
+        if variants.is_empty() {
+            return Err(ModelManagerError::Resolve(format!(
+                "repo {} has no quantized GGUF files",
+                request.repo
+            )));
+        }
+
+        let synthetic_model = ManagedModel {
+            id: request.repo.clone(),
+            name: request.repo.clone(),
+            repo: Some(request.repo.clone()),
+            filename: None,
+            local_path: None,
+            quantization: request.preferred_quantization,
+            preferred_backend: BackendKind::MistralRs,
+            params_b: request.params_b,
+            status: ModelStatus::Available,
+        };
+        let recommendation = self.recommender.recommend(&synthetic_model)?;
+        let selected =
+            select_gguf_variant(&variants, recommendation.quantization).ok_or_else(|| {
+                ModelManagerError::Resolve(format!(
+                    "repo {} has no usable GGUF files",
+                    request.repo
+                ))
+            })?;
+
+        Ok(HfGgufResolution {
+            selected,
+            variants,
+            recommendation,
+        })
+    }
 }
 
 /// File-system backed manifest source.
@@ -519,9 +604,110 @@ impl ModelDownloader for HfHubDownloader {
     }
 }
 
+pub struct HfHubRepoFileLister;
+
+#[async_trait]
+impl HfRepoFileLister for HfHubRepoFileLister {
+    async fn list_files(&self, repo: &str) -> Result<Vec<String>, ModelManagerError> {
+        #[cfg(feature = "hf-hub")]
+        {
+            use hf_hub::api::tokio::Api;
+
+            let api = Api::new().map_err(|e| ModelManagerError::Resolve(e.to_string()))?;
+            let info = api
+                .model(repo.to_string())
+                .info()
+                .await
+                .map_err(|e| ModelManagerError::Resolve(e.to_string()))?;
+            Ok(info
+                .siblings
+                .into_iter()
+                .map(|sibling| sibling.rfilename)
+                .collect())
+        }
+
+        #[cfg(not(feature = "hf-hub"))]
+        {
+            let _ = repo;
+            Err(ModelManagerError::Resolve(
+                "hf-hub support is disabled".to_string(),
+            ))
+        }
+    }
+}
+
 /// Recommends config from detected hardware.
 pub struct HardwareModelRecommender {
     hardware_detector: Arc<dyn HardwareDetector>,
+}
+
+fn list_gguf_variants(repo: &str, filenames: Vec<String>) -> Vec<HfGgufVariant> {
+    let mut variants = filenames
+        .into_iter()
+        .filter(|filename| filename.to_ascii_lowercase().ends_with(".gguf"))
+        .filter_map(|filename| {
+            quantization_from_filename(&filename).map(|quantization| HfGgufVariant {
+                repo: repo.to_string(),
+                filename,
+                quantization,
+            })
+        })
+        .collect::<Vec<_>>();
+    variants.sort_by(|left, right| {
+        quantization_rank(right.quantization)
+            .cmp(&quantization_rank(left.quantization))
+            .then_with(|| left.filename.cmp(&right.filename))
+    });
+    variants
+}
+
+fn select_gguf_variant(
+    variants: &[HfGgufVariant],
+    preferred: Quantization,
+) -> Option<HfGgufVariant> {
+    variants
+        .iter()
+        .find(|variant| variant.quantization == preferred)
+        .or_else(|| {
+            variants
+                .iter()
+                .filter(|variant| {
+                    quantization_rank(variant.quantization) <= quantization_rank(preferred)
+                })
+                .max_by_key(|variant| quantization_rank(variant.quantization))
+        })
+        .or_else(|| {
+            variants
+                .iter()
+                .min_by_key(|variant| quantization_rank(variant.quantization))
+        })
+        .cloned()
+}
+
+fn quantization_from_filename(filename: &str) -> Option<Quantization> {
+    let upper = filename.to_ascii_uppercase();
+    [
+        ("Q2_K", Quantization::Q2K),
+        ("Q3_K_S", Quantization::Q3KS),
+        ("Q4_K_M", Quantization::Q4KM),
+        ("Q5_K_M", Quantization::Q5KM),
+        ("Q8_0", Quantization::Q8_0),
+        ("F16", Quantization::FP16),
+        ("FP16", Quantization::FP16),
+    ]
+    .into_iter()
+    .find_map(|(needle, quantization)| upper.contains(needle).then_some(quantization))
+}
+
+fn quantization_rank(quantization: Quantization) -> u8 {
+    match quantization {
+        Quantization::Q2K => 2,
+        Quantization::Q3KS => 3,
+        Quantization::Q4KM => 4,
+        Quantization::Q5KM => 5,
+        Quantization::Q8_0 => 8,
+        Quantization::FP16 => 16,
+    }
 }
 
 impl HardwareModelRecommender {
@@ -748,6 +934,17 @@ mod tests {
         events: Mutex<Vec<Event>>,
     }
 
+    struct MockHfRepoFileLister {
+        files: Vec<String>,
+    }
+
+    #[async_trait]
+    impl HfRepoFileLister for MockHfRepoFileLister {
+        async fn list_files(&self, _repo: &str) -> Result<Vec<String>, ModelManagerError> {
+            Ok(self.files.clone())
+        }
+    }
+
     #[async_trait]
     impl EventService for MockEventService {
         fn publish(&self, event: Event) {
@@ -774,6 +971,8 @@ mod tests {
             registry: Mutex::new(registry),
         });
         let downloader: Arc<dyn ModelDownloader> = Arc::new(MockDownloader::default());
+        let hf_repo_file_lister: Arc<dyn HfRepoFileLister> =
+            Arc::new(MockHfRepoFileLister { files: Vec::new() });
         let recommender: Arc<dyn ModelRecommender> = Arc::new(HardwareModelRecommender::new(
             Arc::new(FixedDetector(hardware)),
         ));
@@ -783,6 +982,7 @@ mod tests {
                 manifest_source,
                 registry_store,
                 downloader,
+                hf_repo_file_lister,
                 recommender,
                 events.clone(),
                 cache_dir.join("models"),
@@ -905,6 +1105,7 @@ mod tests {
             manifest_source,
             registry_store,
             Arc::new(MockDownloader::default()),
+            Arc::new(MockHfRepoFileLister { files: Vec::new() }),
             Arc::new(HardwareModelRecommender::new(Arc::new(FixedDetector(
                 DeviceKind::Cpu,
             )))),
@@ -915,6 +1116,75 @@ mod tests {
         let models = mgr.list_models().unwrap();
         assert_eq!(models.len(), 1);
         assert!(matches!(models[0].status, ModelStatus::Downloaded));
+    }
+
+    #[test]
+    fn gguf_variant_listing_filters_and_extracts_quantization() {
+        let variants = list_gguf_variants(
+            "owner/repo",
+            vec![
+                "README.md".into(),
+                "model.Q4_K_M.gguf".into(),
+                "model.Q2_K.gguf".into(),
+                "adapter.safetensors".into(),
+            ],
+        );
+
+        assert_eq!(
+            variants
+                .iter()
+                .map(|variant| (variant.filename.as_str(), variant.quantization))
+                .collect::<Vec<_>>(),
+            vec![
+                ("model.Q4_K_M.gguf", Quantization::Q4KM),
+                ("model.Q2_K.gguf", Quantization::Q2K),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_hf_gguf_selects_requested_quantization_from_repo_files() {
+        let (_config_dir, cache_dir) = temp_dirs("resolve-gguf");
+        let events = Arc::new(MockEventService::default());
+        let mgr = ModelManagerImpl::new(
+            Arc::new(InMemoryManifestSource {
+                manifest: Mutex::new(Manifest::default()),
+            }),
+            Arc::new(InMemoryRegistryStore {
+                registry: Mutex::new(Registry::default()),
+            }),
+            Arc::new(MockDownloader::default()),
+            Arc::new(MockHfRepoFileLister {
+                files: vec![
+                    "tiny.Q2_K.gguf".into(),
+                    "tiny.Q4_K_M.gguf".into(),
+                    "tiny.Q8_0.gguf".into(),
+                ],
+            }),
+            Arc::new(HardwareModelRecommender::new(Arc::new(FixedDetector(
+                DeviceKind::Cuda {
+                    name: "RTX 5080".into(),
+                    vram_mb: 16_000,
+                    driver_version: "581".into(),
+                },
+            )))),
+            events,
+            cache_dir.join("models"),
+        );
+
+        let resolution = mgr
+            .resolve_hf_gguf(HfGgufResolveRequest {
+                repo: "owner/repo".into(),
+                preferred_quantization: Some(Quantization::Q4KM),
+                params_b: Some(1.1),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(resolution.selected.filename, "tiny.Q4_K_M.gguf");
+        assert_eq!(resolution.selected.quantization, Quantization::Q4KM);
+        assert_eq!(resolution.recommendation.quantization, Quantization::Q4KM);
+        assert_eq!(resolution.variants.len(), 3);
     }
 
     #[tokio::test]

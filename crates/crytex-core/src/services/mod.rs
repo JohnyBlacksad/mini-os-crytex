@@ -75,10 +75,10 @@ pub use model_compatibility::{
     ModelFeature, ModelFormat, RuntimeFeatureSet,
 };
 pub use model_manager::{
-    FileSystemManifestSource, HardwareModelRecommender, HfHubDownloader, ManagedModel,
-    ManifestEntry, ModelDownloader, ModelManager, ModelManagerError, ModelManagerImpl,
-    ModelManifestSource, ModelRecommender, ModelRegistryStore, ModelStatus, Quantization,
-    RecommendedConfig, RegistryEntry, TomlRegistryStore,
+    FileSystemManifestSource, HardwareModelRecommender, HfGgufResolution, HfGgufResolveRequest,
+    HfGgufVariant, HfHubDownloader, ManagedModel, ManifestEntry, ModelDownloader, ModelManager,
+    ModelManagerError, ModelManagerImpl, ModelManifestSource, ModelRecommender, ModelRegistryStore,
+    ModelStatus, Quantization, RecommendedConfig, RegistryEntry, TomlRegistryStore,
 };
 pub use model_runtime_probe::{
     ModelRuntimeMatrixProbe, ModelRuntimeMatrixReport, ModelRuntimeMatrixRequest,
