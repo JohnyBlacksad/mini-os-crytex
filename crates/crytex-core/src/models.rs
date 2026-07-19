@@ -131,6 +131,8 @@ pub struct PromptVersion {
     pub system_prompt: String,
     pub fitness: Option<f64>,
     pub parent_id: Option<String>,
+    #[serde(default)]
+    pub metrics: serde_json::Value,
     pub created_at: i64,
     pub active: bool,
 }

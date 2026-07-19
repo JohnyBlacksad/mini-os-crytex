@@ -1159,6 +1159,7 @@ mod tests {
                     system_prompt: "You are a coder.".into(),
                     fitness: None,
                     parent_id: None,
+                    metrics: serde_json::Value::Null,
                     created_at: 0,
                     active: true,
                 },

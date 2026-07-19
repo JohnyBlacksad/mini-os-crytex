@@ -6,6 +6,7 @@ pub mod golden_set;
 pub mod harness;
 pub mod lora_gate;
 pub mod models;
+pub mod prompt_gate;
 pub mod repository;
 pub mod runner;
 pub mod scorer;
@@ -18,6 +19,7 @@ pub use lora_gate::BenchLoraBenchmarkGate;
 pub use models::{
     BenchmarkCase, BenchmarkResult, BenchmarkRun, BenchmarkRunSummary, BenchmarkVariant,
 };
+pub use prompt_gate::BenchPromptBenchmarkGate;
 pub use repository::{BenchmarkResultRepository, MemoryBenchmarkResultRepository};
 pub use runner::{
     AgentBenchmarkRunner, BenchmarkRunOutput, BenchmarkRunner, WorkflowBenchmarkRunner,

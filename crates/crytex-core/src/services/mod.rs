@@ -89,7 +89,10 @@ pub use model_runtime_probe::{
 pub use orchestrator::{Orchestrator, OrchestratorError, OrchestratorImpl};
 pub use project_service::{CreateProjectRequest, ProjectError, ProjectService, ProjectServiceImpl};
 pub use project_watcher::{ProjectWatcher, WatcherError};
-pub use prompt_evolution::{MutationOperator, PromptEvolutionError, PromptEvolutionService};
+pub use prompt_evolution::{
+    MutationOperator, PromptBenchmarkDecision, PromptBenchmarkGate, PromptBenchmarkRequest,
+    PromptEvolutionError, PromptEvolutionService,
+};
 pub use rate_limit::{RetryPolicy, RetryRateLimitBackend, TokenBucket};
 pub use reranker::{RerankPassage, RerankResult, Reranker, RerankerError};
 pub use reward_service::{RecordRewardRequest, RewardService, RewardServiceError};

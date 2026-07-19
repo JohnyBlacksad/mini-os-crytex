@@ -157,6 +157,21 @@ impl GraphStore {
         Ok(())
     }
 
+    async fn migrate_prompt_version_metrics(conn: &Connection) -> Result<(), Error> {
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('prompt_versions') WHERE name = 'metrics'",
+            [],
+            |row| row.get(0),
+        )?;
+        if count == 0 {
+            conn.execute(
+                "ALTER TABLE prompt_versions ADD COLUMN metrics TEXT DEFAULT '{}'",
+                [],
+            )?;
+        }
+        Ok(())
+    }
+
     async fn init_schema(&self) -> Result<(), Error> {
         let conn = self.conn.lock().await;
         conn.execute_batch(
@@ -230,6 +245,7 @@ CREATE TABLE IF NOT EXISTS prompt_versions (
     system_prompt TEXT NOT NULL,
     fitness     REAL,
     parent_id   TEXT REFERENCES prompt_versions(id),
+    metrics     TEXT DEFAULT '{}',
     created_at  INTEGER NOT NULL,
     active      INTEGER DEFAULT 0
 );
@@ -380,6 +396,7 @@ CREATE INDEX IF NOT EXISTS idx_ab_test_challenger ON ab_test_reports(challenger_
         Self::migrate_lora_task_kind(&conn).await?;
         Self::migrate_lora_agent_role(&conn).await?;
         Self::migrate_training_example_agent_role(&conn).await?;
+        Self::migrate_prompt_version_metrics(&conn).await?;
         Ok(())
     }
 
@@ -920,15 +937,17 @@ CREATE INDEX IF NOT EXISTS idx_ab_test_challenger ON ab_test_reports(challenger_
 
     pub async fn insert_prompt_version(&self, version: &PromptVersion) -> Result<(), Error> {
         let conn = self.conn.lock().await;
+        let metrics = serde_json::to_string(&version.metrics)?;
         conn.execute(
-            "INSERT INTO prompt_versions (id, agent, project_id, system_prompt, fitness, parent_id, created_at, active)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "INSERT INTO prompt_versions (id, agent, project_id, system_prompt, fitness, parent_id, metrics, created_at, active)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(id) DO UPDATE SET
                 agent = excluded.agent,
                 project_id = excluded.project_id,
                 system_prompt = excluded.system_prompt,
                 fitness = excluded.fitness,
                 parent_id = excluded.parent_id,
+                metrics = excluded.metrics,
                 active = excluded.active",
             [
                 &version.id as &dyn rusqlite::ToSql,
@@ -937,6 +956,7 @@ CREATE INDEX IF NOT EXISTS idx_ab_test_challenger ON ab_test_reports(challenger_
                 &version.system_prompt,
                 &version.fitness as &dyn rusqlite::ToSql,
                 &version.parent_id.as_deref(),
+                &metrics,
                 &version.created_at,
                 &(if version.active { 1i32 } else { 0i32 }),
             ],
@@ -947,7 +967,7 @@ CREATE INDEX IF NOT EXISTS idx_ab_test_challenger ON ab_test_reports(challenger_
     pub async fn get_prompt_version(&self, id: &str) -> Result<Option<PromptVersion>, Error> {
         let conn = self.conn.lock().await;
         let mut stmt = conn.prepare(
-            "SELECT id, agent, project_id, system_prompt, fitness, parent_id, created_at, active
+            "SELECT id, agent, project_id, system_prompt, fitness, parent_id, metrics, created_at, active
              FROM prompt_versions WHERE id = ?1",
         )?;
         let mut rows = stmt.query([id])?;
@@ -963,7 +983,7 @@ CREATE INDEX IF NOT EXISTS idx_ab_test_challenger ON ab_test_reports(challenger_
     ) -> Result<Vec<PromptVersion>, Error> {
         let conn = self.conn.lock().await;
         let mut stmt = conn.prepare(
-            "SELECT id, agent, project_id, system_prompt, fitness, parent_id, created_at, active
+            "SELECT id, agent, project_id, system_prompt, fitness, parent_id, metrics, created_at, active
              FROM prompt_versions WHERE agent = ?1 ORDER BY created_at",
         )?;
         let rows = stmt.query_map([agent], map_prompt_version_row)?;
@@ -976,7 +996,7 @@ CREATE INDEX IF NOT EXISTS idx_ab_test_challenger ON ab_test_reports(challenger_
     ) -> Result<Option<PromptVersion>, Error> {
         let conn = self.conn.lock().await;
         let mut stmt = conn.prepare(
-            "SELECT id, agent, project_id, system_prompt, fitness, parent_id, created_at, active
+            "SELECT id, agent, project_id, system_prompt, fitness, parent_id, metrics, created_at, active
              FROM prompt_versions WHERE agent = ?1 AND active = 1 LIMIT 1",
         )?;
         let mut rows = stmt.query([agent])?;
@@ -1363,8 +1383,15 @@ fn map_prompt_version_row(row: &rusqlite::Row<'_>) -> Result<PromptVersion, rusq
         system_prompt: row.get(3)?,
         fitness: row.get(4)?,
         parent_id: as_optional_string(row.get(5)?),
-        created_at: row.get(6)?,
-        active: row.get::<_, i32>(7)? != 0,
+        metrics: serde_json::from_str(&row.get::<_, String>(6)?).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                6,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?,
+        created_at: row.get(7)?,
+        active: row.get::<_, i32>(8)? != 0,
     })
 }
 
@@ -1749,6 +1776,7 @@ mod tests {
             system_prompt: "base".to_string(),
             fitness: None,
             parent_id: None,
+            metrics: serde_json::json!({ "seed": true }),
             created_at: 1,
             active: true,
         };
@@ -1761,6 +1789,7 @@ mod tests {
             system_prompt: "mutant".to_string(),
             fitness: Some(4.5),
             parent_id: Some("pv1".to_string()),
+            metrics: serde_json::json!({ "prompt_benchmark_gate": { "accepted": true } }),
             created_at: 2,
             active: false,
         };
@@ -1769,6 +1798,10 @@ mod tests {
         let fetched = store.get_prompt_version("pv2").await.unwrap().unwrap();
         assert_eq!(fetched.system_prompt, "mutant");
         assert_eq!(fetched.parent_id, Some("pv1".to_string()));
+        assert_eq!(
+            fetched.metrics["prompt_benchmark_gate"]["accepted"],
+            serde_json::Value::Bool(true)
+        );
 
         let coder_versions = store.list_prompt_versions_by_agent("coder").await.unwrap();
         assert_eq!(coder_versions.len(), 2);

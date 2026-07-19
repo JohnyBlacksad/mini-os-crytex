@@ -5,8 +5,10 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use chrono::Utc;
 use rand::RngCore;
+use serde_json::Value;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -22,6 +24,37 @@ pub enum PromptEvolutionError {
     VersionNotFound(String),
     #[error("no population for agent: {0}")]
     EmptyPopulation(String),
+    #[error("no active baseline prompt for agent: {0}")]
+    NoActiveBaseline(String),
+    #[error("prompt benchmark failed: {0}")]
+    BenchmarkFailed(String),
+}
+
+/// Input passed to a held-out prompt benchmark gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptBenchmarkRequest {
+    pub agent: String,
+    pub baseline_prompt_version_id: String,
+    pub challenger_prompt_version_id: String,
+}
+
+/// Decision returned by a held-out prompt benchmark gate.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PromptBenchmarkDecision {
+    pub accepted: bool,
+    pub reason: String,
+    pub baseline_score: f64,
+    pub challenger_score: f64,
+    pub metadata: Value,
+}
+
+/// Evaluates a baseline prompt against a challenger on a held-out benchmark.
+#[async_trait]
+pub trait PromptBenchmarkGate: Send + Sync {
+    async fn evaluate(
+        &self,
+        request: PromptBenchmarkRequest,
+    ) -> Result<PromptBenchmarkDecision, PromptEvolutionError>;
 }
 
 /// Deterministic mutation operators for a system prompt.
@@ -99,6 +132,7 @@ where
             system_prompt: base_prompt.to_string(),
             fitness: None,
             parent_id: None,
+            metrics: Value::Null,
             created_at: Utc::now().timestamp_millis(),
             active: true,
         };
@@ -128,6 +162,7 @@ where
             system_prompt: operator.apply(&parent.system_prompt),
             fitness: None,
             parent_id: Some(parent_id.to_string()),
+            metrics: Value::Null,
             created_at: Utc::now().timestamp_millis(),
             active: false,
         };
@@ -222,6 +257,54 @@ where
         Ok(())
     }
 
+    /// Evaluate a challenger against the active baseline and promote it only on held-out improvement.
+    pub async fn evaluate_challenger_with_benchmark(
+        &self,
+        challenger_id: &str,
+        gate: &dyn PromptBenchmarkGate,
+    ) -> Result<PromptBenchmarkDecision, PromptEvolutionError> {
+        let challenger = self
+            .prompt_repo
+            .get_prompt_version(challenger_id)
+            .await?
+            .ok_or_else(|| PromptEvolutionError::VersionNotFound(challenger_id.to_string()))?;
+        let baseline = self
+            .prompt_repo
+            .get_active_prompt_version(&challenger.agent)
+            .await?
+            .filter(|version| version.id != challenger.id)
+            .ok_or_else(|| PromptEvolutionError::NoActiveBaseline(challenger.agent.clone()))?;
+
+        let gate_decision = gate
+            .evaluate(PromptBenchmarkRequest {
+                agent: challenger.agent.clone(),
+                baseline_prompt_version_id: baseline.id.clone(),
+                challenger_prompt_version_id: challenger.id.clone(),
+            })
+            .await?;
+        let decision = enforce_improvement_policy(gate_decision);
+
+        let mut evaluated_challenger = challenger;
+        evaluated_challenger.fitness = Some(decision.challenger_score);
+        evaluated_challenger.active = false;
+        evaluated_challenger.metrics = prompt_benchmark_metrics(&decision);
+        self.prompt_repo
+            .update_prompt_version(&evaluated_challenger)
+            .await?;
+
+        if decision.accepted {
+            self.prompt_repo
+                .set_active_prompt_version(&evaluated_challenger.id, &evaluated_challenger.agent)
+                .await?;
+        } else {
+            self.prompt_repo
+                .set_active_prompt_version(&baseline.id, &baseline.agent)
+                .await?;
+        }
+
+        Ok(decision)
+    }
+
     /// Return the active version for an agent, if any.
     pub async fn active_version(
         &self,
@@ -248,6 +331,43 @@ where
             .list_prompt_versions_by_agent(agent)
             .await?)
     }
+}
+
+fn enforce_improvement_policy(decision: PromptBenchmarkDecision) -> PromptBenchmarkDecision {
+    if decision.accepted && decision.challenger_score > decision.baseline_score {
+        return decision;
+    }
+
+    PromptBenchmarkDecision {
+        accepted: false,
+        reason: if decision.challenger_score <= decision.baseline_score {
+            format!(
+                "{}; no held-out improvement: challenger_score={:.4}, baseline_score={:.4}",
+                decision.reason, decision.challenger_score, decision.baseline_score
+            )
+        } else {
+            decision.reason
+        },
+        ..decision
+    }
+}
+
+fn prompt_benchmark_metrics(decision: &PromptBenchmarkDecision) -> Value {
+    let mut metadata = match decision.metadata.clone() {
+        Value::Object(map) => map,
+        _ => serde_json::Map::new(),
+    };
+    metadata.insert("accepted".into(), Value::Bool(decision.accepted));
+    metadata.insert("reason".into(), Value::String(decision.reason.clone()));
+    metadata.insert(
+        "baseline_score".into(),
+        Value::from(decision.baseline_score),
+    );
+    metadata.insert(
+        "challenger_score".into(),
+        Value::from(decision.challenger_score),
+    );
+    serde_json::json!({ "prompt_benchmark_gate": Value::Object(metadata) })
 }
 
 #[cfg(test)]
@@ -383,6 +503,46 @@ mod tests {
         PromptEvolutionService::new(repo.clone(), repo)
     }
 
+    #[derive(Clone)]
+    struct StaticPromptGate {
+        decision: PromptBenchmarkDecision,
+    }
+
+    #[async_trait]
+    impl PromptBenchmarkGate for StaticPromptGate {
+        async fn evaluate(
+            &self,
+            request: PromptBenchmarkRequest,
+        ) -> Result<PromptBenchmarkDecision, PromptEvolutionError> {
+            assert_ne!(
+                request.baseline_prompt_version_id,
+                request.challenger_prompt_version_id
+            );
+            assert_eq!(request.agent, "coder");
+            Ok(self.decision.clone())
+        }
+    }
+
+    fn prompt_decision(
+        accepted: bool,
+        baseline_score: f64,
+        challenger_score: f64,
+    ) -> PromptBenchmarkDecision {
+        PromptBenchmarkDecision {
+            accepted,
+            reason: "held-out benchmark decision".into(),
+            baseline_score,
+            challenger_score,
+            metadata: serde_json::json!({
+                "held_out": true,
+                "baseline_run_id": "prompt-baseline-run",
+                "challenger_run_id": "prompt-challenger-run",
+                "baseline_pass_rate": baseline_score,
+                "challenger_pass_rate": challenger_score
+            }),
+        }
+    }
+
     #[tokio::test]
     async fn seed_creates_initial_active_version() {
         let service = make_service();
@@ -514,5 +674,94 @@ mod tests {
         service.seed_agent("coder", "active prompt").await.unwrap();
         let prompt = service.system_prompt_for_agent("coder").await.unwrap();
         assert_eq!(prompt, Some("active prompt".to_string()));
+    }
+
+    #[tokio::test]
+    async fn benchmark_gate_promotes_challenger_that_improves_on_held_out_set() {
+        let service = make_service();
+        let baseline = service.seed_agent("coder", "base").await.unwrap();
+        let challenger = service
+            .mutate(&baseline.id, MutationOperator::AddConstraint)
+            .await
+            .unwrap();
+        let gate = StaticPromptGate {
+            decision: prompt_decision(true, 0.40, 0.75),
+        };
+
+        let decision = service
+            .evaluate_challenger_with_benchmark(&challenger.id, &gate)
+            .await
+            .unwrap();
+        let active = service.active_version("coder").await.unwrap().unwrap();
+        let stored_challenger = service
+            .prompt_repo
+            .get_prompt_version(&challenger.id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(decision.accepted, "{}", decision.reason);
+        assert_eq!(active.id, challenger.id);
+        assert_eq!(stored_challenger.fitness, Some(0.75));
+        assert_eq!(
+            stored_challenger.metrics["prompt_benchmark_gate"]["held_out"],
+            serde_json::Value::Bool(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn benchmark_gate_rejects_challenger_and_keeps_baseline_active_on_degradation() {
+        let service = make_service();
+        let baseline = service.seed_agent("coder", "base").await.unwrap();
+        let challenger = service
+            .mutate(&baseline.id, MutationOperator::ChangeTone)
+            .await
+            .unwrap();
+        let gate = StaticPromptGate {
+            decision: prompt_decision(false, 0.80, 0.25),
+        };
+
+        let decision = service
+            .evaluate_challenger_with_benchmark(&challenger.id, &gate)
+            .await
+            .unwrap();
+        let active = service.active_version("coder").await.unwrap().unwrap();
+        let stored_challenger = service
+            .prompt_repo
+            .get_prompt_version(&challenger.id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(!decision.accepted);
+        assert_eq!(active.id, baseline.id);
+        assert!(!stored_challenger.active);
+        assert_eq!(
+            stored_challenger.metrics["prompt_benchmark_gate"]["accepted"],
+            serde_json::Value::Bool(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn benchmark_gate_refuses_promotion_when_challenger_does_not_improve() {
+        let service = make_service();
+        let baseline = service.seed_agent("coder", "base").await.unwrap();
+        let challenger = service
+            .mutate(&baseline.id, MutationOperator::InjectExample)
+            .await
+            .unwrap();
+        let gate = StaticPromptGate {
+            decision: prompt_decision(true, 0.70, 0.70),
+        };
+
+        let decision = service
+            .evaluate_challenger_with_benchmark(&challenger.id, &gate)
+            .await
+            .unwrap();
+        let active = service.active_version("coder").await.unwrap().unwrap();
+
+        assert!(!decision.accepted);
+        assert_eq!(active.id, baseline.id);
+        assert!(decision.reason.contains("no held-out improvement"));
     }
 }
