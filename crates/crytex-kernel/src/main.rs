@@ -45,13 +45,13 @@ use crytex_core::{
         AgentRole, AgentService, AgentServiceImpl, AgentWorkflowNodeExecutor, AlertService,
         AlertServiceImpl, AlertThresholds, BulkAuditLogService, CreateProjectRequest,
         CreateTaskRequest, CriticCouncil, EventServiceImpl, InferenceServiceImpl, LoraRouter,
-        ModelManagerImpl, ModelRuntimeMatrixProbe, ModelRuntimeMatrixRequest, ModelRuntimeProbe,
-        ModelRuntimeProbeRequest, MutationOperator, Orchestrator, OrchestratorImpl,
-        ProjectService, ProjectServiceImpl, ProjectWatcher, PromptEvolutionService,
-        RecordRewardRequest, RewardService, RuntimeFeatureSet, RuntimeMatrixEntryRequest,
-        RuntimeMatrixReportWriter, SchedulerImpl, SystemHardwareDetector, TaskHandler,
-        TaskServiceImpl, TomlWorkflowRepository, WorkerError, WorkerPool, WorkflowRepository,
-        recommend_local_device,
+        ModelManager, ModelManagerImpl, ModelRuntimeMatrixProbe, ModelRuntimeMatrixRequest,
+        ModelRuntimeProbe, ModelRuntimeProbeRequest, MutationOperator, Orchestrator,
+        OrchestratorImpl, ProjectService, ProjectServiceImpl, ProjectWatcher,
+        PromptEvolutionService, RecordRewardRequest, RewardService, RuntimeFeatureSet,
+        RuntimeMatrixEntryRequest, RuntimeMatrixReportWriter, SchedulerImpl,
+        SystemHardwareDetector, TaskHandler, TaskServiceImpl, TomlWorkflowRepository, WorkerError,
+        WorkerPool, WorkflowRepository, recommend_local_device,
     },
     state_export::export_project_state,
 };
@@ -142,6 +142,27 @@ enum Commands {
     DownloadModel {
         #[arg(short, long)]
         id: String,
+        #[arg(long)]
+        activate: bool,
+        #[arg(long, default_value = "local-hf")]
+        backend_id: String,
+    },
+    /// Add or update a managed HuggingFace/local model entry
+    AddModel {
+        #[arg(short, long)]
+        id: String,
+        #[arg(short, long)]
+        name: Option<String>,
+        #[arg(short, long)]
+        repo: Option<String>,
+        #[arg(short, long)]
+        filename: Option<String>,
+        #[arg(short, long)]
+        quantization: Option<String>,
+        #[arg(short, long, default_value = "mistralrs")]
+        backend: String,
+        #[arg(long)]
+        params_b: Option<f32>,
     },
     /// Show details for a managed model
     ShowModel {
@@ -375,6 +396,55 @@ fn parse_backend_kind(kind: &str) -> Result<BackendKind, String> {
         "custom" => Ok(BackendKind::Custom),
         other => Err(format!("unknown backend kind: {}", other)),
     }
+}
+
+fn build_manifest_entry(
+    id: String,
+    name: Option<String>,
+    repo: Option<String>,
+    filename: Option<String>,
+    quantization: Option<String>,
+    backend: String,
+    params_b: Option<f32>,
+) -> Result<crytex_core::services::ManifestEntry, String> {
+    parse_backend_kind(&backend)?;
+    if let Some(quantization) = quantization.as_deref() {
+        quantization
+            .parse::<crytex_core::services::Quantization>()
+            .map(|_| ())?;
+    }
+    Ok(crytex_core::services::ManifestEntry {
+        id: Some(id),
+        name,
+        repo,
+        filename,
+        quantization,
+        backend: Some(backend),
+        params_b,
+    })
+}
+
+fn build_downloaded_model_backend_config(
+    backend_id: &str,
+    model: &crytex_core::services::ManagedModel,
+    recommendation: &crytex_core::services::RecommendedConfig,
+) -> Result<BackendConfig, String> {
+    let local_path = model
+        .local_path
+        .as_ref()
+        .ok_or_else(|| format!("model {} is not downloaded", model.id))?;
+    if recommendation.backend != BackendKind::MistralRs {
+        return Err(format!(
+            "downloaded HF GGUF activation requires mistral.rs, got {:?}",
+            recommendation.backend
+        ));
+    }
+    Ok(BackendConfig::mistral_rs(
+        backend_id.to_string(),
+        local_path.display().to_string(),
+        Some(recommendation.context_size),
+        recommendation.gpu_layers,
+    ))
 }
 
 const DEFAULT_CODEGEN_WORKFLOW: &str = r#"
@@ -765,6 +835,52 @@ async fn main() {
             std::process::exit(1);
         }
         println!("Backend {} added. Use switch-backend to select it.", id);
+        return;
+    }
+
+    if let Commands::AddModel {
+        id,
+        name,
+        repo,
+        filename,
+        quantization,
+        backend,
+        params_b,
+    } = &cli.command
+    {
+        let event_bus = Arc::new(crytex_core::EventBus::new());
+        let event_service = Arc::new(EventServiceImpl::new(event_bus));
+        let config_dir = CrytexConfig::config_path()
+            .parent()
+            .expect("config path must have a parent")
+            .to_path_buf();
+        let model_manager = ModelManagerImpl::new_standard(
+            &config_dir,
+            &config.paths.data_dir,
+            event_service,
+            Arc::new(SystemHardwareDetector::new()),
+        );
+        let entry = build_manifest_entry(
+            id.clone(),
+            name.clone(),
+            repo.clone(),
+            filename.clone(),
+            quantization.clone(),
+            backend.clone(),
+            *params_b,
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to build model manifest entry: {}", e);
+            std::process::exit(1);
+        });
+        let model = model_manager.add_model(entry).unwrap_or_else(|e| {
+            eprintln!("Failed to add model: {}", e);
+            std::process::exit(1);
+        });
+        println!(
+            "Model {} added. Use download-model --id {} then probe-model --id {}.",
+            model.id, model.id, model.id
+        );
         return;
     }
 
@@ -1734,7 +1850,11 @@ async fn main() {
                 }
             }
         }
-        Commands::DownloadModel { id } => {
+        Commands::DownloadModel {
+            id,
+            activate,
+            backend_id,
+        } => {
             let mut rx = ctx.event_service.subscribe();
             let progress_id = id.clone();
             let progress_handle = tokio::spawn(async move {
@@ -1758,12 +1878,47 @@ async fn main() {
             match result {
                 Ok(model) => {
                     println!("Downloaded model {} to {:?}", model.id, model.local_path);
+                    if activate {
+                        let recommendation = model_manager
+                            .recommend_config(&model.id)
+                            .unwrap_or_else(|e| {
+                                eprintln!("Failed to recommend config: {}", e);
+                                std::process::exit(1);
+                            });
+                        let backend_config = build_downloaded_model_backend_config(
+                            &backend_id,
+                            &model,
+                            &recommendation,
+                        )
+                        .unwrap_or_else(|e| {
+                            eprintln!("Failed to build backend config: {}", e);
+                            std::process::exit(1);
+                        });
+                        let mut config = ctx.config.clone();
+                        config
+                            .inference
+                            .backends
+                            .retain(|backend| backend.id != backend_config.id);
+                        config.inference.default_backend = Some(backend_config.id.clone());
+                        config.inference.backends.push(backend_config);
+                        if let Err(e) = config.save() {
+                            eprintln!("Failed to save activated backend config: {}", e);
+                            std::process::exit(1);
+                        }
+                        println!(
+                            "Activated model {} as backend {}. Use probe-model --id {} --backend {}.",
+                            model.id, backend_id, model.id, backend_id
+                        );
+                    }
                 }
                 Err(e) => {
                     eprintln!("Failed to download model: {}", e);
                     std::process::exit(1);
                 }
             }
+        }
+        Commands::AddModel { .. } => {
+            unreachable!("add-model is handled before AppContext initialization")
         }
         Commands::ShowModel { id } => {
             let model = model_manager.get_model(&id).unwrap_or_else(|e| {
@@ -2257,5 +2412,68 @@ async fn main() {
                     });
             }
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn add_model_command_builds_hf_gguf_manifest_entry() {
+        let entry = build_manifest_entry(
+            "hf-tinyllama-chat-q2-gguf".into(),
+            Some("HF TinyLlama Chat Q2 GGUF".into()),
+            Some("TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF".into()),
+            Some("tinyllama-1.1b-chat-v1.0.Q2_K.gguf".into()),
+            Some("Q2_K".into()),
+            "mistralrs".into(),
+            Some(1.1),
+        )
+        .unwrap();
+
+        assert_eq!(entry.id.as_deref(), Some("hf-tinyllama-chat-q2-gguf"));
+        assert_eq!(
+            entry.repo.as_deref(),
+            Some("TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF")
+        );
+        assert_eq!(
+            entry.filename.as_deref(),
+            Some("tinyllama-1.1b-chat-v1.0.Q2_K.gguf")
+        );
+        assert_eq!(entry.quantization.as_deref(), Some("Q2_K"));
+        assert_eq!(entry.backend.as_deref(), Some("mistralrs"));
+        assert_eq!(entry.params_b, Some(1.1));
+    }
+
+    #[test]
+    fn downloaded_hf_model_builds_runtime_backend_config_from_recommendation() {
+        let model_path = PathBuf::from("B:/crytex-data/models/tiny/model.gguf");
+        let model = crytex_core::services::ManagedModel {
+            id: "hf-tiny".into(),
+            name: "HF Tiny".into(),
+            repo: Some("owner/repo".into()),
+            filename: Some("model.gguf".into()),
+            local_path: Some(model_path.clone()),
+            quantization: Some(crytex_core::services::Quantization::Q2K),
+            preferred_backend: BackendKind::MistralRs,
+            params_b: Some(1.1),
+            status: crytex_core::services::ModelStatus::Downloaded,
+        };
+        let recommendation = crytex_core::services::RecommendedConfig {
+            backend: BackendKind::MistralRs,
+            quantization: crytex_core::services::Quantization::Q2K,
+            gpu_layers: Some(12),
+            context_size: 2048,
+        };
+
+        let backend =
+            build_downloaded_model_backend_config("hf-runtime", &model, &recommendation).unwrap();
+
+        assert_eq!(backend.id, "hf-runtime");
+        assert_eq!(backend.kind, BackendKind::MistralRs);
+        assert_eq!(backend.model, model_path.display().to_string());
+        assert_eq!(backend.context_size, Some(2048));
+        assert_eq!(backend.gpu_layers, Some(12));
     }
 }

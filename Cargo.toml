@@ -22,6 +22,7 @@ members = [
     "crates/crytex-tools",
 ]
 exclude = [
+    "patches/candle-kernels",
     "patches/mistralrs-core",
     "patches/mistralrs-quant",
 ]
@@ -33,6 +34,7 @@ resolver = "2"
 # the dynamic CRT to match the rest of the workspace.
 [patch.crates-io]
 esaxx-rs = { path = "patches/esaxx-rs" }
+candle-kernels = { path = "patches/candle-kernels" }
 mistralrs-core = { path = "patches/mistralrs-core" }
 mistralrs-quant = { path = "patches/mistralrs-quant" }
 
