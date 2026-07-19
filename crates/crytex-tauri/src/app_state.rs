@@ -1,10 +1,12 @@
 //! Runtime state managed by the Tauri desktop shell.
 
 use crate::commands::{
-    self, AddManagedModelCommand, AgentTaskExecutor, CreateProjectCommand,
-    DownloadManagedModelCommand, ExportRunDiagnosticsCommand, GoalPlanResponse, ManagedModelRecord,
-    ManagedModelsResponse, OllamaModelsResponse, PlanDecisionCommand, PlanDecisionResponse,
-    RunDiagnosticsReport, RuntimeStatus, SearchProjectContextCommand, SearchProjectContextResponse,
+    self, AddManagedModelCommand, AgentTaskExecutor, BackendE2eEvidenceGate,
+    BackendE2eMatrixCommand, BackendE2eMatrixReport, BackendE2eScenarioKind,
+    BackendE2eScenarioReport, CreateProjectCommand, DownloadManagedModelCommand,
+    ExportRunDiagnosticsCommand, GoalPlanResponse, ManagedModelRecord, ManagedModelsResponse,
+    OllamaModelsResponse, PlanDecisionCommand, PlanDecisionResponse, RunDiagnosticsReport,
+    RuntimeStatus, SearchProjectContextCommand, SearchProjectContextResponse,
     SetActiveManagedModelCommand, SetActiveOllamaModelCommand, SetTaskStatusCommand,
     StartRunCommand, StartRunResponse, StubTaskExecutor, SubmitGoalCommand, SubmitTaskCommand,
     TaskExecutor, TaskReviewDecisionCommand, TaskReviewDecisionResponse, TauriCommandError,
@@ -17,7 +19,7 @@ use crytex_agents::{
 use crytex_core::bus::{Event, EventBus};
 use crytex_core::indexer::ProjectIndexer;
 use crytex_core::metrics::{MetricsService, MetricsServiceImpl};
-use crytex_core::models::{KanbanState, Project, Task};
+use crytex_core::models::{KanbanState, Project, Task, TaskDependency, TaskStatus};
 use crytex_core::persistence::ProjectSnapshotRepository;
 use crytex_core::services::{
     Agent, AgentService, AgentServiceError, AuditLogService, AuditLogServiceImpl, ContextAssembler,
@@ -43,6 +45,7 @@ use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{RwLock, oneshot};
 use tokio::task::JoinHandle;
 
@@ -495,6 +498,219 @@ impl CrytexAppState {
         .await
     }
 
+    pub async fn run_backend_e2e_matrix(
+        &self,
+        request: BackendE2eMatrixCommand,
+    ) -> Result<BackendE2eMatrixReport, TauriCommandError> {
+        let existing_ready_tasks = self
+            .task_service
+            .list_ready()
+            .await?
+            .into_iter()
+            .filter(|task| task.project_id == request.project_id)
+            .map(|task| task.id)
+            .collect::<Vec<_>>();
+        if !existing_ready_tasks.is_empty() {
+            return Err(TauriCommandError::Bootstrap(format!(
+                "backend e2e matrix requires an isolated project with no ready tasks; ready_task_ids={existing_ready_tasks:?}"
+            )));
+        }
+        let trace_id = request
+            .trace_id
+            .clone()
+            .unwrap_or_else(|| format!("backend-e2e-{}", timestamp_millis()));
+        let scenarios = matrix_scenarios_or_default(request.scenarios);
+        let mut reports = Vec::with_capacity(scenarios.len());
+
+        for scenario in scenarios {
+            reports.push(
+                self.run_backend_e2e_scenario(
+                    &request.project_id,
+                    &trace_id,
+                    scenario,
+                    request.max_steps.max(1),
+                )
+                .await?,
+            );
+        }
+
+        let passed = reports
+            .iter()
+            .flat_map(|report| report.gates.iter())
+            .all(|gate| gate.passed);
+        Ok(BackendE2eMatrixReport {
+            project_id: request.project_id,
+            trace_id,
+            passed,
+            scenarios: reports,
+        })
+    }
+
+    async fn run_backend_e2e_scenario(
+        &self,
+        project_id: &str,
+        matrix_trace_id: &str,
+        scenario: BackendE2eScenarioKind,
+        max_steps: usize,
+    ) -> Result<BackendE2eScenarioReport, TauriCommandError> {
+        let scenario_trace_id = format!("{matrix_trace_id}:{scenario:?}").to_lowercase();
+        self.seed_backend_e2e_scenario(project_id, &scenario_trace_id, &scenario)
+            .await?;
+        let run = self
+            .start_run(StartRunCommand {
+                project_id: project_id.to_string(),
+                max_steps,
+            })
+            .await?;
+        for review_task in &run.review_tasks {
+            let _ = self
+                .approve_task_review(TaskReviewDecisionCommand {
+                    task_id: review_task.id.clone(),
+                    comment: Some(format!("backend e2e matrix accepted {scenario:?}")),
+                })
+                .await;
+        }
+        let diagnostics = self
+            .export_run_diagnostics(ExportRunDiagnosticsCommand {
+                project_id: project_id.to_string(),
+                run_id: run.run_id.clone(),
+                trace_id: Some(scenario_trace_id.clone()),
+            })
+            .await?;
+        let gates = backend_e2e_gates(&scenario, &diagnostics);
+        Ok(BackendE2eScenarioReport {
+            scenario,
+            trace_id: scenario_trace_id,
+            run_id: run.run_id,
+            review_task_ids: diagnostics.review_task_ids.clone(),
+            gates,
+            diagnostics,
+        })
+    }
+
+    async fn seed_backend_e2e_scenario(
+        &self,
+        project_id: &str,
+        trace_id: &str,
+        scenario: &BackendE2eScenarioKind,
+    ) -> Result<(), TauriCommandError> {
+        let root = self
+            .submit_task(SubmitTaskCommand {
+                project_id: project_id.to_string(),
+                parent_id: None,
+                title: format!("Backend e2e matrix {scenario:?}"),
+                description: Some(
+                    "Synthetic backend proof root created by the matrix runner".into(),
+                ),
+                kind: "goal".into(),
+                assigned_agent: Some("architect".into()),
+                priority: 100,
+                payload: serde_json::json!({
+                    "source": "backend_e2e_matrix",
+                    "scenario": format!("{scenario:?}"),
+                }),
+                trace_id: Some(trace_id.to_string()),
+            })
+            .await?;
+        let root = self
+            .set_task_status(SetTaskStatusCommand {
+                task_id: root.id,
+                status: TaskStatus::Completed,
+            })
+            .await?;
+
+        match scenario {
+            BackendE2eScenarioKind::HappyPath => {
+                self.seed_backend_e2e_chain(project_id, &root.id, trace_id, None)
+                    .await?;
+            }
+            BackendE2eScenarioKind::RejectRemediation => {
+                self.seed_backend_e2e_chain(
+                    project_id,
+                    &root.id,
+                    trace_id,
+                    Some("backend_e2e_reject"),
+                )
+                .await?;
+            }
+            BackendE2eScenarioKind::Failure => {
+                let _ = self
+                    .submit_task(SubmitTaskCommand {
+                        project_id: project_id.to_string(),
+                        parent_id: Some(root.id),
+                        title: "Backend e2e forced executor failure".into(),
+                        description: Some(
+                            "The matrix runner forces this task to fail to verify diagnostics"
+                                .into(),
+                        ),
+                        kind: "codegen".into(),
+                        assigned_agent: Some("coder".into()),
+                        priority: 100,
+                        payload: serde_json::json!({
+                            "source": "backend_e2e_matrix",
+                            "backend_e2e_force_failure": true,
+                            "prompt": "Force an executor failure and keep diagnostic evidence"
+                        }),
+                        trace_id: Some(trace_id.to_string()),
+                    })
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn seed_backend_e2e_chain(
+        &self,
+        project_id: &str,
+        parent_id: &str,
+        trace_id: &str,
+        critic_mode: Option<&str>,
+    ) -> Result<(), TauriCommandError> {
+        let mut previous: Option<Task> = None;
+        for (agent, kind, priority) in [
+            ("architect", "design", 100),
+            ("coder", "codegen", 99),
+            ("qa", "qa", 98),
+            ("security", "security", 97),
+            ("critic", "review", 96),
+        ] {
+            let mut payload = serde_json::json!({
+                "source": "backend_e2e_matrix",
+                "prompt": format!("Run backend e2e {agent} step with typed artifact output"),
+            });
+            if agent == "critic" && critic_mode == Some("backend_e2e_reject") {
+                payload["backend_e2e_review_decision"] = serde_json::json!("reject");
+                if let Some(previous) = &previous {
+                    payload["backend_e2e_target_task_id"] = serde_json::json!(previous.id);
+                }
+            }
+            let task = self
+                .submit_task(SubmitTaskCommand {
+                    project_id: project_id.to_string(),
+                    parent_id: Some(parent_id.to_string()),
+                    title: format!("Backend e2e {agent} step"),
+                    description: Some(format!("Matrix runner {agent} step for trace {trace_id}")),
+                    kind: kind.to_string(),
+                    assigned_agent: Some(agent.to_string()),
+                    priority,
+                    payload,
+                    trace_id: Some(trace_id.to_string()),
+                })
+                .await?;
+            if let Some(previous) = previous {
+                self.task_service
+                    .add_dependency(TaskDependency {
+                        task_id: task.id.clone(),
+                        depends_on: previous.id,
+                        dep_type: "backend_e2e_chain".into(),
+                    })
+                    .await?;
+            }
+            previous = Some(task);
+        }
+        Ok(())
+    }
+
     pub async fn get_project_state(
         &self,
         project_id: &str,
@@ -728,6 +944,157 @@ impl CrytexAppState {
         }
         Ok(())
     }
+}
+
+fn matrix_scenarios_or_default(
+    scenarios: Vec<BackendE2eScenarioKind>,
+) -> Vec<BackendE2eScenarioKind> {
+    if scenarios.is_empty() {
+        return vec![
+            BackendE2eScenarioKind::HappyPath,
+            BackendE2eScenarioKind::RejectRemediation,
+            BackendE2eScenarioKind::Failure,
+        ];
+    }
+    scenarios
+}
+
+fn backend_e2e_gates(
+    scenario: &BackendE2eScenarioKind,
+    diagnostics: &RunDiagnosticsReport,
+) -> Vec<BackendE2eEvidenceGate> {
+    let mut gates = common_backend_e2e_gates(diagnostics);
+    match scenario {
+        BackendE2eScenarioKind::HappyPath => {
+            gates.push(gate(
+                "human_review_gate",
+                !diagnostics.review_task_ids.is_empty(),
+                "happy path must stop at human review",
+            ));
+            gates.push(gate(
+                "artifact_lineage",
+                !diagnostics.artifact_lineage.is_empty(),
+                "happy path must pass typed artifacts between agent tasks",
+            ));
+            gates.push(gate(
+                "human_reward",
+                diagnostics.human_reward_recorded,
+                "happy path must record human approval reward evidence",
+            ));
+        }
+        BackendE2eScenarioKind::RejectRemediation => {
+            gates.push(gate(
+                "critic_rejection",
+                diagnostics
+                    .events
+                    .iter()
+                    .any(|event| event.action == "critic_rejected"),
+                "reject scenario must record critic_rejected",
+            ));
+            gates.push(gate(
+                "critic_feedback",
+                !diagnostics.critic_feedback.is_empty(),
+                "reject scenario must expose critic feedback",
+            ));
+            gates.push(gate(
+                "remediation_plan",
+                diagnostics
+                    .events
+                    .iter()
+                    .any(|event| event.action == "remediation_plan_created"),
+                "reject scenario must create remediation plan",
+            ));
+            gates.push(gate(
+                "remediation_events",
+                !diagnostics.remediation_events.is_empty(),
+                "reject scenario must export remediation diagnostics",
+            ));
+            gates.push(gate(
+                "final_human_review_gate",
+                !diagnostics.review_task_ids.is_empty(),
+                "remediation path must return to human review",
+            ));
+        }
+        BackendE2eScenarioKind::Failure => {
+            gates.push(gate(
+                "failed_task_status",
+                diagnostics.tasks.iter().any(|task| task.status == "Failed"),
+                "failure scenario must persist failed task status",
+            ));
+            gates.push(gate(
+                "failure_event",
+                diagnostics
+                    .events
+                    .iter()
+                    .any(|event| event.action == "task_execution_failed"),
+                "failure scenario must emit task_execution_failed",
+            ));
+            gates.push(gate(
+                "failure_result_source",
+                diagnostics
+                    .tasks
+                    .iter()
+                    .any(|task| task.result_source.as_deref() == Some("task_executor_error")),
+                "failure scenario must preserve executor error as task result source",
+            ));
+        }
+    }
+    gates
+}
+
+fn common_backend_e2e_gates(diagnostics: &RunDiagnosticsReport) -> Vec<BackendE2eEvidenceGate> {
+    vec![
+        gate(
+            "trace_id",
+            !diagnostics.trace_ids.is_empty()
+                && diagnostics
+                    .tasks
+                    .iter()
+                    .all(|task| diagnostics.trace_ids.contains(&task.trace_id)),
+            "diagnostics must include a trace id for every scenario task",
+        ),
+        gate(
+            "run_started",
+            diagnostics
+                .events
+                .iter()
+                .any(|event| event.action == "run_started"),
+            "diagnostics must include run_started",
+        ),
+        gate(
+            "task_execution_started",
+            diagnostics
+                .events
+                .iter()
+                .any(|event| event.action == "task_execution_started"),
+            "diagnostics must include task_execution_started",
+        ),
+        gate(
+            "task_execution_finished_or_failed",
+            diagnostics.events.iter().any(|event| {
+                matches!(
+                    event.action.as_str(),
+                    "task_execution_finished" | "task_execution_failed"
+                )
+            }),
+            "diagnostics must include task completion or failure evidence",
+        ),
+    ]
+}
+
+fn gate(name: &str, passed: bool, message: &str) -> BackendE2eEvidenceGate {
+    BackendE2eEvidenceGate {
+        name: name.to_string(),
+        passed,
+        message: message.to_string(),
+    }
+}
+
+fn timestamp_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or_default()
 }
 
 /// Attaches the currently promoted LoRA adapter to a task before agent execution.
@@ -1386,6 +1753,131 @@ mod tests {
             status.model_compatibility.unwrap().format,
             crytex_core::services::ModelFormat::Gguf
         );
+    }
+
+    #[tokio::test]
+    async fn backend_e2e_matrix_runner_proves_happy_reject_remediation_and_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("crytex-backend-e2e-matrix.db");
+        let state = CrytexAppState::new_sqlite_with_executor(&db_path, Arc::new(StubTaskExecutor))
+            .await
+            .unwrap();
+
+        let project_root = dir.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let project = state
+            .create_project(CreateProjectCommand {
+                name: "Backend E2E Matrix".into(),
+                root_path: project_root.display().to_string(),
+            })
+            .await
+            .unwrap();
+
+        let report = state
+            .run_backend_e2e_matrix(BackendE2eMatrixCommand {
+                project_id: project.id.clone(),
+                trace_id: Some("trace-backend-e2e-matrix".into()),
+                max_steps: 20,
+                scenarios: vec![],
+            })
+            .await
+            .unwrap();
+
+        assert!(report.passed, "{:#?}", report.scenarios);
+        assert_eq!(report.scenarios.len(), 3);
+        for scenario in &report.scenarios {
+            assert!(
+                scenario.gates.iter().all(|gate| gate.passed),
+                "{:?} gates failed: {:#?}",
+                scenario.scenario,
+                scenario.gates
+            );
+            assert_eq!(
+                scenario.diagnostics.trace_ids,
+                vec![scenario.trace_id.clone()]
+            );
+            assert!(!scenario.diagnostics.tasks.is_empty());
+        }
+        assert!(report.scenarios.iter().any(|scenario| {
+            scenario.scenario == BackendE2eScenarioKind::HappyPath
+                && scenario.diagnostics.human_reward_recorded
+                && !scenario.diagnostics.artifact_lineage.is_empty()
+        }));
+        assert!(report.scenarios.iter().any(|scenario| {
+            scenario.scenario == BackendE2eScenarioKind::RejectRemediation
+                && scenario
+                    .diagnostics
+                    .events
+                    .iter()
+                    .any(|event| event.action == "critic_rejected")
+                && scenario
+                    .diagnostics
+                    .events
+                    .iter()
+                    .any(|event| event.action == "remediation_plan_created")
+        }));
+        assert!(report.scenarios.iter().any(|scenario| {
+            scenario.scenario == BackendE2eScenarioKind::Failure
+                && scenario
+                    .diagnostics
+                    .events
+                    .iter()
+                    .any(|event| event.action == "task_execution_failed")
+                && scenario
+                    .diagnostics
+                    .tasks
+                    .iter()
+                    .any(|task| task.status == "Failed")
+        }));
+
+        state.shutdown_project_watchers().await;
+    }
+
+    #[tokio::test]
+    async fn backend_e2e_matrix_runner_requires_isolated_ready_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("crytex-backend-e2e-matrix-guard.db");
+        let state = CrytexAppState::new_sqlite_with_executor(&db_path, Arc::new(StubTaskExecutor))
+            .await
+            .unwrap();
+
+        let project_root = dir.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let project = state
+            .create_project(CreateProjectCommand {
+                name: "Backend E2E Matrix Guard".into(),
+                root_path: project_root.display().to_string(),
+            })
+            .await
+            .unwrap();
+        let existing = state
+            .submit_task(SubmitTaskCommand {
+                project_id: project.id.clone(),
+                parent_id: None,
+                title: "Existing ready task".into(),
+                description: None,
+                kind: "codegen".into(),
+                assigned_agent: Some("coder".into()),
+                priority: 1,
+                payload: json!({}),
+                trace_id: Some("trace-existing-ready".into()),
+            })
+            .await
+            .unwrap();
+
+        let error = state
+            .run_backend_e2e_matrix(BackendE2eMatrixCommand {
+                project_id: project.id.clone(),
+                trace_id: Some("trace-backend-e2e-matrix-guard".into()),
+                max_steps: 20,
+                scenarios: vec![BackendE2eScenarioKind::HappyPath],
+            })
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("isolated project"));
+        assert!(error.to_string().contains(&existing.id));
+        state.shutdown_project_watchers().await;
     }
 
     #[test]

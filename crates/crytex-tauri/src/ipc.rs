@@ -2,10 +2,10 @@
 
 use crate::app_state::CrytexAppState;
 use crate::commands::{
-    AddManagedModelCommand, CreateProjectCommand, DownloadManagedModelCommand,
-    ExportRunDiagnosticsCommand, GoalPlanResponse, ManagedModelRecord, ManagedModelsResponse,
-    OllamaModelsResponse, PlanDecisionCommand, PlanDecisionResponse, RunDiagnosticsReport,
-    RuntimeStatus, SearchProjectContextCommand, SearchProjectContextResponse,
+    AddManagedModelCommand, BackendE2eMatrixCommand, BackendE2eMatrixReport, CreateProjectCommand,
+    DownloadManagedModelCommand, ExportRunDiagnosticsCommand, GoalPlanResponse, ManagedModelRecord,
+    ManagedModelsResponse, OllamaModelsResponse, PlanDecisionCommand, PlanDecisionResponse,
+    RunDiagnosticsReport, RuntimeStatus, SearchProjectContextCommand, SearchProjectContextResponse,
     SetActiveManagedModelCommand, SetActiveOllamaModelCommand, SetTaskStatusCommand,
     StartRunCommand, StartRunResponse, SubmitGoalCommand, SubmitTaskCommand,
     TaskReviewDecisionCommand, TaskReviewDecisionResponse, TauriCommandError,
@@ -184,6 +184,17 @@ pub async fn export_run_diagnostics(
 ) -> Result<RunDiagnosticsReport, IpcError> {
     state
         .export_run_diagnostics(request)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn run_backend_e2e_matrix(
+    state: State<'_, CrytexAppState>,
+    request: BackendE2eMatrixCommand,
+) -> Result<BackendE2eMatrixReport, IpcError> {
+    state
+        .run_backend_e2e_matrix(request)
         .await
         .map_err(Into::into)
 }

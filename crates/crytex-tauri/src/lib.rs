@@ -68,6 +68,7 @@ pub fn run() {
             ipc::start_run,
             ipc::get_project_state,
             ipc::export_run_diagnostics,
+            ipc::run_backend_e2e_matrix,
             ipc::search_project_context,
             ipc::runtime_status,
             ipc::list_ollama_models,

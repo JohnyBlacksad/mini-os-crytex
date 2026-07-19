@@ -249,6 +249,52 @@ pub struct RunDiagnosticsReport {
     pub human_reward_recorded: bool,
 }
 
+/// Backend e2e scenario selected by the proof matrix runner.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BackendE2eScenarioKind {
+    HappyPath,
+    RejectRemediation,
+    Failure,
+}
+
+/// Payload for running the backend e2e proof matrix without the frontend.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackendE2eMatrixCommand {
+    pub project_id: String,
+    pub trace_id: Option<String>,
+    pub max_steps: usize,
+    pub scenarios: Vec<BackendE2eScenarioKind>,
+}
+
+/// One evidence gate in a backend e2e scenario report.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BackendE2eEvidenceGate {
+    pub name: String,
+    pub passed: bool,
+    pub message: String,
+}
+
+/// One scenario result produced by the backend e2e matrix runner.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BackendE2eScenarioReport {
+    pub scenario: BackendE2eScenarioKind,
+    pub trace_id: String,
+    pub run_id: String,
+    pub review_task_ids: Vec<String>,
+    pub gates: Vec<BackendE2eEvidenceGate>,
+    pub diagnostics: RunDiagnosticsReport,
+}
+
+/// Complete backend e2e matrix report.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BackendE2eMatrixReport {
+    pub project_id: String,
+    pub trace_id: String,
+    pub passed: bool,
+    pub scenarios: Vec<BackendE2eScenarioReport>,
+}
+
 /// Runtime mode reported to the desktop UI for manual verification.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeStatus {
@@ -393,6 +439,40 @@ pub struct StubTaskExecutor;
 #[async_trait]
 impl TaskExecutor for StubTaskExecutor {
     async fn execute(&self, task: &Task, run_id: &str) -> Result<Value, TauriCommandError> {
+        if task
+            .payload
+            .get("backend_e2e_force_failure")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            return Err(TauriCommandError::Bootstrap(
+                "backend e2e forced executor failure".to_string(),
+            ));
+        }
+        if task.assigned_agent.as_deref() == Some("critic")
+            && task.payload["backend_e2e_review_decision"].as_str() == Some("reject")
+        {
+            return Ok(serde_json::json!({
+                "source": "tauri_stub_run",
+                "run_id": run_id,
+                "task_id": task.id,
+                "agent": task.assigned_agent,
+                "kind": task.kind,
+                "status": "review",
+                "agent_result": {
+                    "review_decision": "reject",
+                    "target_task_id": task.payload["backend_e2e_target_task_id"],
+                    "failure_type": "missing_acceptance_criteria",
+                    "blocking_issues": [{
+                        "severity": "high",
+                        "reason": "Backend e2e matrix forced a critic rejection",
+                        "expected": "Create remediation tasks and preserve diagnostics evidence"
+                    }],
+                    "feedback": "Backend e2e matrix forced rejection for remediation proof",
+                    "summary": "reject"
+                }
+            }));
+        }
         Ok(serde_json::json!({
             "source": "tauri_stub_run",
             "run_id": run_id,
@@ -1701,7 +1781,41 @@ pub async fn start_run_with_orchestrator(
             }),
         )
         .await;
-        let result = executor.execute(&running, &run_id).await?;
+        let result = match executor.execute(&running, &run_id).await {
+            Ok(result) => result,
+            Err(error) => {
+                let mut failed = running;
+                failed.result = Some(serde_json::json!({
+                    "source": "task_executor_error",
+                    "run_id": run_id,
+                    "task_id": failed.id,
+                    "agent": failed.assigned_agent,
+                    "kind": failed.kind,
+                    "error": error.to_string(),
+                }));
+                task_service.update_task(&failed).await?;
+                let failed = task_service
+                    .set_status(&failed.id, TaskStatus::Failed)
+                    .await?;
+                log_run_event(
+                    audit_service.as_ref(),
+                    event_service.as_ref(),
+                    "task_execution_failed",
+                    Some(&failed),
+                    &failed.project_id,
+                    Some(&failed.trace_id),
+                    serde_json::json!({
+                        "run_id": run_id,
+                        "kind": failed.kind,
+                        "agent": failed.assigned_agent,
+                        "result_source": "task_executor_error",
+                        "error": error.to_string(),
+                    }),
+                )
+                .await;
+                break;
+            }
+        };
         let mut task_with_result = running;
         task_with_result.result = Some(result);
         task_service.update_task(&task_with_result).await?;
