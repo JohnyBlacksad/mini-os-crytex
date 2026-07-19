@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
-use crytex_inference::{InferenceError, InferenceManager, InferenceRequest, Message};
+use crytex_inference::{BackendInfo, InferenceError, InferenceManager, InferenceRequest, Message};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -228,13 +228,13 @@ pub async fn doctor_with_api_checks_and_options(
     let backend_ids = configured_backend_ids(config, requested_backend_ids);
 
     for backend_id in backend_ids {
-        if let Some(backend) = config.backend(&backend_id) {
-            if backend.kind == DiagBackendKind::Ollama {
-                report.checks.push(check_ollama_tags_api(backend).await);
-                report
-                    .checks
-                    .push(check_ollama_ps_api(backend, options.require_gpu).await);
-            }
+        if let Some(backend) = config.backend(&backend_id)
+            && backend.kind == DiagBackendKind::Ollama
+        {
+            report.checks.push(check_ollama_tags_api(backend).await);
+            report
+                .checks
+                .push(check_ollama_ps_api(backend, options.require_gpu).await);
         }
     }
 
@@ -590,11 +590,40 @@ pub struct RuntimeProbeReport {
     pub trace_id: String,
     pub model_id: String,
     pub backend_id: String,
+    pub backend_capability: Option<BackendCapabilitySnapshot>,
     pub compatibility: CompatibilityReport,
     pub stages: Vec<ProbeStageReport>,
     pub runtime_placement: Option<RuntimePlacementReport>,
     pub generated_preview: Option<String>,
     pub passed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BackendCapabilitySnapshot {
+    pub id: String,
+    pub name: String,
+    pub generate: bool,
+    pub chat: bool,
+    pub embed: bool,
+    pub rerank: bool,
+    pub lora: bool,
+    pub hot_swap: bool,
+}
+
+impl BackendCapabilitySnapshot {
+    fn from_info(info: BackendInfo) -> Self {
+        let report = info.capability_report();
+        Self {
+            id: report.id,
+            name: report.name,
+            generate: report.generate,
+            chat: report.chat,
+            embed: report.embed,
+            rerank: report.rerank,
+            lora: report.lora,
+            hot_swap: report.hot_swap,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -721,6 +750,9 @@ async fn run_probe(
             0,
         ),
     ];
+    let backend_capability = backends
+        .get(&entry.backend_id)
+        .and_then(|backend| backend_capability_snapshot(backend.as_ref(), &entry.backend_id));
 
     let Some(backend) = backends.get(&entry.backend_id) else {
         stages.push(stage(
@@ -733,6 +765,7 @@ async fn run_probe(
             trace_id: entry_trace_id,
             model_id: entry.model_id.clone(),
             backend_id: entry.backend_id.clone(),
+            backend_capability,
             compatibility,
             stages,
             runtime_placement: None,
@@ -759,6 +792,7 @@ async fn run_probe(
                 trace_id: entry_trace_id,
                 model_id: entry.model_id.clone(),
                 backend_id: entry.backend_id.clone(),
+                backend_capability,
                 compatibility,
                 stages,
                 runtime_placement,
@@ -771,6 +805,7 @@ async fn run_probe(
             entry_trace_id,
             compatibility,
             stages,
+            backend_capability,
             format!(
                 "smoke generation missed expected sentinel CRYTEX_PROBE_OK: {}",
                 response.content.chars().take(120).collect::<String>()
@@ -782,6 +817,7 @@ async fn run_probe(
             entry_trace_id,
             compatibility,
             stages,
+            backend_capability,
             format!("smoke generation failed: {error}"),
             duration_ms,
         ),
@@ -793,6 +829,7 @@ fn failed_probe(
     trace_id: String,
     compatibility: CompatibilityReport,
     mut stages: Vec<ProbeStageReport>,
+    backend_capability: Option<BackendCapabilitySnapshot>,
     message: String,
     duration_ms: u128,
 ) -> RuntimeProbeReport {
@@ -806,12 +843,24 @@ fn failed_probe(
         trace_id,
         model_id: entry.model_id.clone(),
         backend_id: entry.backend_id.clone(),
+        backend_capability,
         compatibility,
         stages,
         runtime_placement: None,
         generated_preview: None,
         passed: false,
     }
+}
+
+fn backend_capability_snapshot(
+    backend: &dyn InferenceManager,
+    backend_id: &str,
+) -> Option<BackendCapabilitySnapshot> {
+    backend
+        .available_backends()
+        .into_iter()
+        .find(|info| info.id == backend_id)
+        .map(BackendCapabilitySnapshot::from_info)
 }
 
 async fn runtime_placement_after_generation(
@@ -868,7 +917,7 @@ fn smoke_request(entry: &RuntimeMatrixEntryRequest) -> InferenceRequest {
         }],
         system_prompt: Some("You are running a short runtime smoke test.".into()),
         temperature: Some(0.0),
-        max_tokens: Some(entry.max_tokens.min(32).max(1)),
+        max_tokens: Some(entry.max_tokens.clamp(1, 32)),
         lora_adapter_id: entry.lora_adapter_id.clone(),
     }
 }
@@ -1024,6 +1073,8 @@ fn sanitize_report_file_stem(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use crytex_inference::{InferenceResponse, LoRAAdapter, ModelInfo, TokenUsage};
 
     #[test]
     fn matrix_entries_include_baseline_and_each_lora_for_every_backend() {
@@ -1054,6 +1105,37 @@ mod tests {
         assert_eq!(entries[0].lora_adapter_id, None);
         assert_eq!(entries[1].lora_adapter_id.as_deref(), Some("coder-lora"));
         assert!(entries.iter().all(|entry| entry.max_tokens == 16));
+    }
+
+    #[tokio::test]
+    async fn runtime_matrix_reports_backend_lora_hot_swap_capability() {
+        let backend = Arc::new(StaticBackend::new(
+            "mistralrs",
+            vec!["generate", "chat", "lora", "hot_swap"],
+        ));
+        let backends =
+            HashMap::from([("mistralrs".to_string(), backend as Arc<dyn InferenceManager>)]);
+        let entries = build_runtime_matrix_entries(
+            &["mistralrs".into()],
+            &["coder-lora".into()],
+            "diag-model",
+            "tiny-coder",
+            16,
+        );
+
+        let report = run_runtime_matrix("trace-diag-lora".into(), entries, &backends).await;
+
+        assert!(report.passed);
+        assert_eq!(report.entries.len(), 2);
+        assert_eq!(report.entries[1].lora_adapter_id.as_deref(), Some("coder-lora"));
+        assert_eq!(
+            report.entries[1]
+                .report
+                .backend_capability
+                .as_ref()
+                .map(|capability| (capability.lora, capability.hot_swap)),
+            Some((true, true))
+        );
     }
 
     #[test]
@@ -1138,6 +1220,62 @@ mod tests {
         let names = ollama_tags_model_names(&tags);
 
         assert_eq!(names, vec!["qwen3.5:9b", "nomic-embed-text:latest"]);
+    }
+
+    struct StaticBackend {
+        id: String,
+        capabilities: Vec<String>,
+    }
+
+    impl StaticBackend {
+        fn new(id: &str, capabilities: Vec<&str>) -> Self {
+            Self {
+                id: id.into(),
+                capabilities: capabilities.into_iter().map(str::to_string).collect(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl InferenceManager for StaticBackend {
+        async fn generate(
+            &self,
+            _request: InferenceRequest,
+        ) -> Result<InferenceResponse, InferenceError> {
+            Ok(InferenceResponse {
+                content: "CRYTEX_PROBE_OK".into(),
+                usage: TokenUsage {
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    total_tokens: 2,
+                },
+                finish_reason: "stop".into(),
+            })
+        }
+
+        async fn embed(&self, _text: &str) -> Result<Vec<f32>, InferenceError> {
+            Ok(vec![])
+        }
+
+        async fn register_lora(&self, _lora: LoRAAdapter) -> Result<(), InferenceError> {
+            Ok(())
+        }
+
+        async fn swap_lora(&self, _lora_id: &str) -> Result<(), InferenceError> {
+            Ok(())
+        }
+
+        fn available_backends(&self) -> Vec<BackendInfo> {
+            vec![BackendInfo {
+                id: self.id.clone(),
+                name: self.id.clone(),
+                capabilities: self.capabilities.clone(),
+            }]
+        }
+
+        async fn list_models(&self) -> Result<Vec<ModelInfo>, InferenceError> {
+            Ok(vec![])
+        }
     }
 
     #[test]
