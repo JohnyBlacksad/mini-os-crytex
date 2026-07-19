@@ -11,6 +11,7 @@ crytex-agents = { path = "../crytex-agents" }
 crytex-inference = { path = "../crytex-inference" }
 crytex-inference-mistral = { path = "../crytex-inference-mistral" }
 crytex-inference-ollama = { path = "../crytex-inference-ollama" }
+crytex-inference-onnx = { path = "../crytex-inference-onnx" }
 crytex-storage = { path = "../crytex-storage" }
 crytex-tools = { path = "../crytex-tools" }
 crytex-sandbox = { path = "../crytex-sandbox" }

@@ -86,11 +86,13 @@ impl CrytexAppState {
         let planning_tools = planning_inference
             .as_ref()
             .map(|_| Arc::new(EmptyToolService) as Arc<dyn ToolService>);
+        let reranker = configured_reranker_from_env()?;
         Self::new_sqlite_with_executor_and_planning(
             db_path,
             None,
             planning_inference,
             planning_tools,
+            reranker,
             runtime_status,
         )
         .await
@@ -104,6 +106,7 @@ impl CrytexAppState {
         Self::new_sqlite_with_executor_and_planning(
             db_path,
             Some(task_executor),
+            None,
             None,
             None,
             custom_executor_runtime_status(),
@@ -122,6 +125,7 @@ impl CrytexAppState {
         let model = model.into();
         let inference = ollama_inference_service(ollama_url.clone(), model.clone());
         let runtime_status = ollama_agent_runtime_status(ollama_url, model, "deterministic");
+        let reranker = configured_reranker_from_env()?;
         Self::new_sqlite_with_executor_factory_and_planning(
             db_path,
             Box::new(move |project_service, audit_service, context_assembler| {
@@ -141,6 +145,7 @@ impl CrytexAppState {
             None,
             None,
             None,
+            reranker,
             runtime_status,
         )
         .await
@@ -152,6 +157,7 @@ impl CrytexAppState {
         task_executor: Option<Arc<dyn TaskExecutor>>,
         planning_inference: Option<Arc<dyn InferenceService>>,
         planning_tools: Option<Arc<dyn ToolService>>,
+        reranker: Option<Arc<dyn crytex_core::services::Reranker>>,
         runtime_status: RuntimeStatus,
     ) -> Result<Self, TauriCommandError> {
         Self::new_sqlite_with_executor_factory_and_planning(
@@ -169,6 +175,29 @@ impl CrytexAppState {
             None,
             None,
             None,
+            reranker,
+            runtime_status,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
+    async fn new_sqlite_with_executor_factory_planning_and_reranker(
+        db_path: impl AsRef<Path>,
+        task_executor_factory: TaskExecutorFactory,
+        reranker: Arc<dyn crytex_core::services::Reranker>,
+        runtime_status: RuntimeStatus,
+    ) -> Result<Self, TauriCommandError> {
+        Self::new_sqlite_with_executor_factory_and_planning(
+            db_path,
+            task_executor_factory,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(reranker),
             runtime_status,
         )
         .await
@@ -183,6 +212,7 @@ impl CrytexAppState {
         lora_evolution: Option<Arc<dyn LoraEvolutionService>>,
         lora_benchmark_gate: Option<Arc<dyn LoraBenchmarkGate>>,
         model_manager: Option<Arc<dyn ModelManager>>,
+        reranker: Option<Arc<dyn crytex_core::services::Reranker>>,
         runtime_status: RuntimeStatus,
     ) -> Result<Self, TauriCommandError> {
         let db_path_buf = db_path.as_ref().to_path_buf();
@@ -199,10 +229,12 @@ impl CrytexAppState {
         let vector_store: Arc<dyn VectorStore> = Arc::new(EdgeVectorStore::new(vector_path)?);
         let project_indexer = ProjectIndexer::new(embedder.clone(), vector_store.clone())
             .with_sparse_embedder(sparse_embedder.clone());
-        let context_assembler = Arc::new(
-            ContextAssembler::new(embedder.clone(), vector_store.clone())
-                .with_sparse_embedder(sparse_embedder),
-        );
+        let mut context_assembler = ContextAssembler::new(embedder.clone(), vector_store.clone())
+            .with_sparse_embedder(sparse_embedder);
+        if let Some(reranker) = reranker {
+            context_assembler = context_assembler.with_reranker(reranker);
+        }
+        let context_assembler = Arc::new(context_assembler);
         let storage = Arc::new(
             Storage::new(&db_path)
                 .await
@@ -960,6 +992,26 @@ fn configured_planning_inference_service() -> Option<Arc<dyn InferenceService>> 
         })
 }
 
+fn configured_reranker_from_env()
+-> Result<Option<Arc<dyn crytex_core::services::Reranker>>, TauriCommandError> {
+    configured_reranker_from_model_name(env::var("CRYTEX_TAURI_RERANK_MODEL").ok())
+}
+
+fn configured_reranker_from_model_name(
+    model_name: Option<String>,
+) -> Result<Option<Arc<dyn crytex_core::services::Reranker>>, TauriCommandError> {
+    let Some(model_name) = model_name.map(|value| value.trim().to_string()) else {
+        return Ok(None);
+    };
+    if model_name.is_empty() {
+        return Ok(None);
+    }
+
+    let reranker = crytex_inference_onnx::OnnxReranker::from_name(&model_name)
+        .map_err(|err| TauriCommandError::Bootstrap(err.to_string()))?;
+    Ok(Some(Arc::new(reranker)))
+}
+
 fn runtime_status_from_env() -> RuntimeStatus {
     let status = env::var("CRYTEX_TAURI_OLLAMA_MODEL")
         .ok()
@@ -1287,6 +1339,16 @@ mod tests {
         );
     }
 
+    #[test]
+    fn configured_reranker_from_model_name_builds_onnx_backend_without_eager_loading() {
+        let reranker =
+            configured_reranker_from_model_name(Some("BAAI/bge-reranker-base".to_string()))
+                .expect("known reranker should configure")
+                .expect("reranker should be enabled");
+
+        assert_eq!(Arc::strong_count(&reranker), 1);
+    }
+
     struct DownloadableManagedModelManager {
         model: Mutex<Option<ManagedModel>>,
         local_path: PathBuf,
@@ -1486,6 +1548,35 @@ mod tests {
             _backend_id: Option<&str>,
         ) -> Result<Vec<ModelInfo>, InferenceServiceError> {
             Ok(vec![])
+        }
+    }
+
+    #[derive(Debug)]
+    struct PreferRerankTarget;
+
+    #[async_trait]
+    impl crytex_core::services::Reranker for PreferRerankTarget {
+        async fn rerank(
+            &self,
+            _query: &str,
+            passages: &[crytex_core::services::RerankPassage],
+        ) -> Result<Vec<crytex_core::services::RerankResult>, crytex_core::services::RerankerError>
+        {
+            let mut results = passages
+                .iter()
+                .map(|passage| crytex_core::services::RerankResult {
+                    id: passage.id.clone(),
+                    score: if passage.text.contains("RERANK_TARGET_CONTEXT") {
+                        10.0
+                    } else {
+                        1.0
+                    },
+                    text: passage.text.clone(),
+                    payload: passage.payload.clone(),
+                })
+                .collect::<Vec<_>>();
+            results.sort_by(|left, right| right.score.partial_cmp(&left.score).unwrap());
+            Ok(results)
         }
     }
 
@@ -1988,6 +2079,7 @@ mod tests {
             None,
             None,
             Some(model_manager),
+            None,
             stub_runtime_status(),
         )
         .await
@@ -2358,6 +2450,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             custom_executor_runtime_status(),
         )
         .await
@@ -2420,6 +2513,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sqlite_state_applies_reranker_before_injecting_rag_context_into_agent_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("crytex-ui.db");
+        let captured_requests = Arc::new(Mutex::new(Vec::new()));
+        let inference = Arc::new(CapturingInference::new(captured_requests.clone()));
+        let reranker = Arc::new(PreferRerankTarget);
+        let state = CrytexAppState::new_sqlite_with_executor_factory_planning_and_reranker(
+            &db_path,
+            Box::new(move |project_service, audit_service, context_assembler| {
+                Arc::new(
+                    AgentTaskExecutor::new_project_scoped(
+                        Arc::new(StaticAgentService::with_default_agents(Some(
+                            context_assembler,
+                        ))),
+                        inference,
+                        project_service,
+                    )
+                    .with_audit(audit_service),
+                ) as Arc<dyn TaskExecutor>
+            }),
+            reranker,
+            custom_executor_runtime_status(),
+        )
+        .await
+        .unwrap();
+
+        let project_root = dir.path().join("project");
+        std::fs::create_dir_all(project_root.join("docs")).unwrap();
+        std::fs::write(
+            project_root.join("docs/dense-winner.md"),
+            "Payment retry adapter generic dense context. RERANK_BASELINE_CONTEXT.",
+        )
+        .unwrap();
+        std::fs::write(
+            project_root.join("docs/rerank-target.md"),
+            "Payment retry adapter precise reranked context. RERANK_TARGET_CONTEXT.",
+        )
+        .unwrap();
+
+        let project = state
+            .create_project(CreateProjectCommand {
+                name: "Agent Rerank RAG".into(),
+                root_path: project_root.display().to_string(),
+            })
+            .await
+            .unwrap();
+
+        state
+            .submit_task(SubmitTaskCommand {
+                project_id: project.id.clone(),
+                parent_id: None,
+                title: "Implement payment retry adapter".into(),
+                description: Some("Use reranked relevant project context first".into()),
+                kind: "codegen".into(),
+                assigned_agent: Some("coder".into()),
+                priority: 5,
+                payload: json!({}),
+                trace_id: Some("trace-agent-rerank-rag".into()),
+            })
+            .await
+            .unwrap();
+
+        state
+            .start_run(StartRunCommand {
+                project_id: project.id.clone(),
+                max_steps: 1,
+            })
+            .await
+            .unwrap();
+
+        let prompt = captured_requests
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|request| request.messages.iter())
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let target_pos = prompt
+            .find("RERANK_TARGET_CONTEXT")
+            .expect("reranked target context should be injected into prompt");
+        let baseline_pos = prompt
+            .find("RERANK_BASELINE_CONTEXT")
+            .expect("baseline context should be injected into prompt");
+        assert!(
+            target_pos < baseline_pos,
+            "reranker should order target context before baseline context in agent prompt: {prompt}"
+        );
+        state.shutdown_project_watchers().await;
+    }
+
+    #[tokio::test]
     async fn sqlite_state_uses_promoted_lora_for_next_agent_request() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("crytex-ui.db");
@@ -2439,6 +2625,7 @@ mod tests {
                     .with_audit(audit_service),
                 ) as Arc<dyn TaskExecutor>
             }),
+            None,
             None,
             None,
             None,
@@ -2549,6 +2736,7 @@ mod tests {
             Some(Arc::new(StubTaskExecutor)),
             Some(Arc::new(PlanningInference)),
             Some(Arc::new(NoopToolService)),
+            None,
             RuntimeStatus {
                 planning_mode: "planning_agent".to_string(),
                 ..stub_runtime_status()
@@ -3079,6 +3267,7 @@ mod tests {
             Some(lora_evolution.clone()),
             None,
             None,
+            None,
             stub_runtime_status(),
         )
         .await
@@ -3326,6 +3515,7 @@ mod tests {
             None,
             Some(gate.clone()),
             None,
+            None,
             stub_runtime_status(),
         )
         .await
@@ -3470,6 +3660,7 @@ mod tests {
             None,
             None,
             Some(gate),
+            None,
             None,
             stub_runtime_status(),
         )
@@ -3671,6 +3862,7 @@ mod tests {
             None,
             None,
             Some(lora_evolution.clone()),
+            None,
             None,
             None,
             stub_runtime_status(),
