@@ -258,9 +258,43 @@ impl AgentService for AgentServiceImpl {
                 top_k: 5,
                 summarize_threshold_ratio: 0.6,
             };
-            match assembler.assemble(request).await {
-                Ok(messages) => {
-                    let context = messages
+            match assembler.assemble_with_evidence(request).await {
+                Ok(assembly) => {
+                    if !assembly.rag.chunks.is_empty() {
+                        let chunks: Vec<Value> = assembly
+                            .rag
+                            .chunks
+                            .iter()
+                            .map(|chunk| {
+                                serde_json::json!({
+                                    "id": chunk.id,
+                                    "score": chunk.score,
+                                    "source": chunk.source,
+                                    "relative_path": chunk.relative_path,
+                                    "text_preview": chunk.text_preview,
+                                })
+                            })
+                            .collect();
+                        let _ = self
+                            .audit
+                            .log(
+                                AuditLogEntry::new(&agent_name, "rag_context_assembled")
+                                    .project_id(&task.project_id)
+                                    .task_id(&task.id)
+                                    .trace_id(&task.trace_id)
+                                    .level(AuditLogLevel::Info)
+                                    .metadata(serde_json::json!({
+                                        "query": assembly.rag.query,
+                                        "project_id": assembly.rag.project_id,
+                                        "rerank_applied": assembly.rag.rerank_applied,
+                                        "chunks": chunks,
+                                    })),
+                            )
+                            .await;
+                    }
+
+                    let context = assembly
+                        .messages
                         .iter()
                         .map(|m| format!("{}: {}", m.role, m.content))
                         .collect::<Vec<_>>()
@@ -656,6 +690,93 @@ mod tests {
             .and_then(|v| v.as_str())
             .expect("assembled_context should be injected");
         assert!(context.contains("Relevant project context"));
+    }
+
+    #[derive(Default)]
+    struct RagEvidenceVectorStore;
+
+    #[async_trait]
+    impl VectorStore for RagEvidenceVectorStore {
+        async fn create_collection(
+            &self,
+            _collection: &str,
+            _dim: usize,
+        ) -> Result<(), VectorStoreError> {
+            Ok(())
+        }
+        async fn delete_collection(&self, _collection: &str) -> Result<(), VectorStoreError> {
+            Ok(())
+        }
+        async fn upsert(
+            &self,
+            _collection: &str,
+            _points: Vec<VectorPoint>,
+        ) -> Result<(), VectorStoreError> {
+            Ok(())
+        }
+        async fn search(
+            &self,
+            collection: &str,
+            _vector: &[f32],
+            _options: SearchOptions,
+        ) -> Result<Vec<SearchResult>, VectorStoreError> {
+            if collection != "doc_chunks" {
+                return Ok(vec![]);
+            }
+
+            Ok(vec![SearchResult {
+                id: "doc-1".into(),
+                score: 0.91,
+                payload: serde_json::json!({
+                    "source": "docs/architecture.md",
+                    "relative_path": "docs/architecture.md",
+                    "text": "RAG_TRACE_SENTINEL explains the payment retry adapter.",
+                }),
+            }])
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_logs_rag_context_evidence_for_observe() {
+        let embedder: Arc<dyn crate::services::Embedder> = Arc::new(MockEmbedder::new(8));
+        let vector_store: Arc<dyn VectorStore> = Arc::new(RagEvidenceVectorStore);
+        let assembler = Arc::new(ContextAssembler::new(embedder, vector_store));
+        let (svc, audit) = service_with_audit();
+        let svc = svc.with_context_assembler(assembler);
+
+        let agent = Arc::new(RecordingAgent::default());
+        svc.register(agent).await;
+
+        let task = sample_task("codegen", Some("coder"));
+        let _ = svc
+            .execute(&task, Arc::new(MockInference), Arc::new(MockToolService))
+            .await
+            .unwrap();
+
+        let entries = audit.entries();
+        let rag_entry = entries
+            .iter()
+            .find(|entry| entry.action == "rag_context_assembled")
+            .expect("RAG context evidence should be logged for Observe");
+
+        assert_eq!(rag_entry.trace_id, "trace-1");
+        assert_eq!(rag_entry.task_id.as_deref(), Some("t1"));
+        assert_eq!(rag_entry.metadata["query"], "test ");
+        assert_eq!(rag_entry.metadata["rerank_applied"], false);
+        assert_eq!(
+            rag_entry.metadata["chunks"][0]["relative_path"],
+            "docs/architecture.md"
+        );
+        assert!(
+            rag_entry.metadata["chunks"][0]["score"].as_f64().unwrap_or(0.0) > 0.0,
+            "chunk score should be logged after retrieval/fusion"
+        );
+        assert!(
+            rag_entry.metadata["chunks"][0]["text_preview"]
+                .as_str()
+                .unwrap()
+                .contains("RAG_TRACE_SENTINEL")
+        );
     }
 
     struct MockToolService;

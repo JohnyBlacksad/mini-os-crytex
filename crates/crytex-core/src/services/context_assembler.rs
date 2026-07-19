@@ -58,6 +58,32 @@ pub struct ContextRequest {
     pub summarize_threshold_ratio: f32,
 }
 
+/// Messages assembled for an agent plus retrieval evidence for Observe.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContextAssembly {
+    pub messages: Vec<Message>,
+    pub rag: RagAssemblyEvidence,
+}
+
+/// Project-context retrieval evidence emitted alongside assembled prompts.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RagAssemblyEvidence {
+    pub query: String,
+    pub project_id: Option<String>,
+    pub rerank_applied: bool,
+    pub chunks: Vec<RagChunkEvidence>,
+}
+
+/// One retrieved chunk that was considered for prompt injection.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RagChunkEvidence {
+    pub id: String,
+    pub score: f32,
+    pub source: Option<String>,
+    pub relative_path: Option<String>,
+    pub text_preview: String,
+}
+
 impl Default for ContextRequest {
     fn default() -> Self {
         Self {
@@ -158,6 +184,14 @@ impl ContextAssembler {
         &self,
         request: ContextRequest,
     ) -> Result<Vec<Message>, ContextAssemblerError> {
+        Ok(self.assemble_with_evidence(request).await?.messages)
+    }
+
+    /// Assemble context messages and return retrieval evidence for diagnostics.
+    pub async fn assemble_with_evidence(
+        &self,
+        request: ContextRequest,
+    ) -> Result<ContextAssembly, ContextAssemblerError> {
         let mut messages = Vec::new();
 
         messages.push(Message::system(request.system_prompt.clone()));
@@ -166,7 +200,13 @@ impl ContextAssembler {
             messages.push(Message::system(memory_context));
         }
 
-        let retrieved = self.retrieve_relevant_chunks(&request).await?;
+        let (retrieved, rerank_applied) = self.retrieve_relevant_chunks(&request).await?;
+        let rag = RagAssemblyEvidence {
+            query: request.user_query.clone(),
+            project_id: request.project_id.clone(),
+            rerank_applied,
+            chunks: retrieved.iter().map(chunk_evidence).collect(),
+        };
         if !retrieved.is_empty() {
             messages.push(Message::system(format_retrieved_context(&retrieved)));
         }
@@ -183,7 +223,7 @@ impl ContextAssembler {
             return Err(ContextAssemblerError::BudgetTooSmall);
         }
 
-        Ok(messages)
+        Ok(ContextAssembly { messages, rag })
     }
 
     async fn retrieve_memory_context(
@@ -212,13 +252,13 @@ impl ContextAssembler {
     async fn retrieve_relevant_chunks(
         &self,
         request: &ContextRequest,
-    ) -> Result<Vec<SearchResult>, ContextAssemblerError> {
+    ) -> Result<(Vec<SearchResult>, bool), ContextAssemblerError> {
         let project_id = match &request.project_id {
             Some(id) => id,
-            None => return Ok(Vec::new()),
+            None => return Ok((Vec::new(), false)),
         };
         if request.user_query.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), false));
         }
 
         let results = self
@@ -238,12 +278,12 @@ impl ContextAssembler {
         &self,
         query: &str,
         results: Vec<SearchResult>,
-    ) -> Result<Vec<SearchResult>, ContextAssemblerError> {
+    ) -> Result<(Vec<SearchResult>, bool), ContextAssemblerError> {
         let Some(reranker) = &self.reranker else {
-            return Ok(results);
+            return Ok((results, false));
         };
         if results.len() < 2 {
-            return Ok(results);
+            return Ok((results, false));
         }
 
         let passages: Vec<RerankPassage> = results
@@ -261,18 +301,21 @@ impl ContextAssembler {
             .collect();
 
         let reranked = reranker.rerank(query, &passages).await?;
-        Ok(reranked
-            .into_iter()
-            .map(|result| SearchResult {
-                id: result.id,
-                score: result.score,
-                payload: result.payload.unwrap_or_else(|| {
-                    serde_json::json!({
-                        "text": result.text,
-                    })
-                }),
-            })
-            .collect())
+        Ok((
+            reranked
+                .into_iter()
+                .map(|result| SearchResult {
+                    id: result.id,
+                    score: result.score,
+                    payload: result.payload.unwrap_or_else(|| {
+                        serde_json::json!({
+                            "text": result.text,
+                        })
+                    }),
+                })
+                .collect(),
+            true,
+        ))
     }
 
     async fn fit_to_budget(
@@ -374,6 +417,32 @@ fn format_retrieved_context(results: &[SearchResult]) -> String {
         })
         .collect();
     format!("Relevant context:\n{}", parts.join("\n\n"))
+}
+
+fn chunk_evidence(result: &SearchResult) -> RagChunkEvidence {
+    let text = result
+        .payload
+        .get("text")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    RagChunkEvidence {
+        id: result.id.clone(),
+        score: result.score,
+        source: string_payload(&result.payload, "source"),
+        relative_path: string_payload(&result.payload, "relative_path"),
+        text_preview: preview(text, 240),
+    }
+}
+
+fn string_payload(payload: &serde_json::Value, key: &str) -> Option<String> {
+    payload
+        .get(key)
+        .and_then(|value| value.as_str())
+        .map(ToString::to_string)
+}
+
+fn preview(text: &str, max_chars: usize) -> String {
+    text.chars().take(max_chars).collect()
 }
 
 /// A simple summarizer that keeps the leading portion of the text.
