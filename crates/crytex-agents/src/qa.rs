@@ -43,7 +43,10 @@ fn parse_qa_output(content: &str, usage: &TokenUsage) -> Result<Value, serde_jso
 }
 
 fn default_qa_summary(value: &Value) -> String {
-    let passed = value.get("passed").and_then(Value::as_bool).unwrap_or(false);
+    let passed = value
+        .get("passed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let failure_count = value
         .get("failures")
         .and_then(Value::as_array)

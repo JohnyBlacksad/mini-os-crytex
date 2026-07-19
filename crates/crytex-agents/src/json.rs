@@ -20,11 +20,7 @@ pub(crate) fn parse_llm_json_value(content: &str) -> Result<Value, serde_json::E
         .or_else(|_| serde_json::from_str(&without_trailing_commas))
         .or_else(|_| serde_json::from_str(&with_quoted_keys))
         .or_else(|_| serde_json::from_str(&balanced))
-        .or_else(|_| {
-            serde_json::from_str(&insert_missing_json_commas_between_values(
-                &balanced,
-            ))
-        })
+        .or_else(|_| serde_json::from_str(&insert_missing_json_commas_between_values(&balanced)))
 }
 
 fn remove_trailing_json_commas(input: &str) -> String {

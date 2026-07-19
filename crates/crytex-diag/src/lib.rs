@@ -1113,8 +1113,10 @@ mod tests {
             "mistralrs",
             vec!["generate", "chat", "lora", "hot_swap"],
         ));
-        let backends =
-            HashMap::from([("mistralrs".to_string(), backend as Arc<dyn InferenceManager>)]);
+        let backends = HashMap::from([(
+            "mistralrs".to_string(),
+            backend as Arc<dyn InferenceManager>,
+        )]);
         let entries = build_runtime_matrix_entries(
             &["mistralrs".into()],
             &["coder-lora".into()],
@@ -1127,7 +1129,10 @@ mod tests {
 
         assert!(report.passed);
         assert_eq!(report.entries.len(), 2);
-        assert_eq!(report.entries[1].lora_adapter_id.as_deref(), Some("coder-lora"));
+        assert_eq!(
+            report.entries[1].lora_adapter_id.as_deref(),
+            Some("coder-lora")
+        );
         assert_eq!(
             report.entries[1]
                 .report
@@ -1144,8 +1149,10 @@ mod tests {
             "mistralrs",
             vec!["generate", "chat", "lora", "hot_swap"],
         ));
-        let backends =
-            HashMap::from([("mistralrs".to_string(), backend as Arc<dyn InferenceManager>)]);
+        let backends = HashMap::from([(
+            "mistralrs".to_string(),
+            backend as Arc<dyn InferenceManager>,
+        )]);
         let entries = build_runtime_matrix_entries(
             &["mistralrs".into()],
             &["coder-lora".into()],
@@ -1163,10 +1170,7 @@ mod tests {
 
         assert_eq!(lora_entry["lora_adapter_id"], "coder-lora");
         assert_eq!(lora_entry["report"]["backend_capability"]["lora"], true);
-        assert_eq!(
-            lora_entry["report"]["backend_capability"]["hot_swap"],
-            true
-        );
+        assert_eq!(lora_entry["report"]["backend_capability"]["hot_swap"], true);
     }
 
     #[test]

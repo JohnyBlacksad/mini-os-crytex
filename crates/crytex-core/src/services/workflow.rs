@@ -1291,22 +1291,18 @@ task_kind = "codegen"
             tasks[0].payload["agent_session"]["session_id"],
             tasks[1].payload["agent_session"]["session_id"]
         );
-        assert_eq!(
-            tasks[0].payload["agent_session"]["trace_id"],
-            "trace-chain"
-        );
-        assert_eq!(
-            tasks[1].payload["agent_session"]["trace_id"],
-            "trace-chain"
-        );
+        assert_eq!(tasks[0].payload["agent_session"]["trace_id"], "trace-chain");
+        assert_eq!(tasks[1].payload["agent_session"]["trace_id"], "trace-chain");
         assert_eq!(
             tasks[1].payload["upstream_artifact"],
             result.state["design_artifact"]
         );
-        assert!(tasks[1]
-            .payload
-            .get("architect_private_scratchpad")
-            .is_none());
+        assert!(
+            tasks[1]
+                .payload
+                .get("architect_private_scratchpad")
+                .is_none()
+        );
         assert_eq!(
             result.state["patch_artifact"]["artifact"],
             result.state["design_artifact"]
