@@ -720,6 +720,15 @@ impl HardwareModelRecommender {
         let params = model.params_b.unwrap_or(7.0);
         params * quantization.gib_per_b_params()
     }
+
+    fn cuda_gpu_layers(
+        model: &ManagedModel,
+        quantization: Quantization,
+        usable_gib: f32,
+    ) -> Option<usize> {
+        let estimated_model_gib = Self::approximate_size_gib(model, quantization);
+        (estimated_model_gib <= usable_gib * 0.7).then_some(999)
+    }
 }
 
 impl ModelRecommender for HardwareModelRecommender {
@@ -789,7 +798,7 @@ impl ModelRecommender for HardwareModelRecommender {
                 Ok(RecommendedConfig {
                     backend: BackendKind::MistralRs,
                     quantization,
-                    gpu_layers: None,
+                    gpu_layers: Self::cuda_gpu_layers(model, quantization, usable_gib),
                     context_size,
                 })
             }
@@ -1369,7 +1378,7 @@ mod tests {
     }
 
     #[test]
-    fn recommend_config_preserves_explicit_gguf_quantization_on_cuda() {
+    fn recommend_config_preserves_explicit_gguf_quantization_and_pins_small_cuda_models_to_gpu() {
         let manifest = Manifest {
             models: vec![ManifestEntry {
                 id: Some("tinyllama-q2".into()),
@@ -1394,7 +1403,7 @@ mod tests {
         let cfg = mgr.recommend_config("tinyllama-q2").unwrap();
 
         assert_eq!(cfg.quantization, Quantization::Q2K);
-        assert_eq!(cfg.gpu_layers, None);
+        assert_eq!(cfg.gpu_layers, Some(999));
         assert_eq!(cfg.context_size, 4096);
     }
 

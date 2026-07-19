@@ -578,6 +578,10 @@ fn build_hf_runtime_placement_proof(
             "cpu",
             "gpu_layers=0 explicitly selects CPU execution for the local GGUF backend",
         ),
+        (BackendKind::MistralRs, Some(999), _) => (
+            "cuda_full_offload",
+            "gpu_layers=999 pins all supported GGUF layers to CUDA to avoid mixed CPU/GPU auto mapping",
+        ),
         (BackendKind::MistralRs, Some(_), _) => (
             "manual_gpu_layers",
             "gpu_layers is explicitly pinned for the local GGUF backend",
@@ -2976,6 +2980,61 @@ mod tests {
                 .runtime_placement
                 .evidence
                 .contains("automatic device mapping")
+        );
+    }
+
+    #[test]
+    fn hf_runtime_placement_marks_mistral_cuda_999_gpu_layers_as_full_offload() {
+        let model = crytex_core::services::ManagedModel {
+            id: "hf-tiny".into(),
+            name: "HF Tiny".into(),
+            repo: Some("owner/repo".into()),
+            filename: Some("model.gguf".into()),
+            local_path: Some(PathBuf::from("B:/crytex-data/models/tiny/model.gguf")),
+            quantization: Some(crytex_core::services::Quantization::Q2K),
+            preferred_backend: BackendKind::MistralRs,
+            params_b: Some(1.1),
+            status: crytex_core::services::ModelStatus::Downloaded,
+        };
+        let recommendation = crytex_core::services::RecommendedConfig {
+            backend: BackendKind::MistralRs,
+            quantization: crytex_core::services::Quantization::Q2K,
+            gpu_layers: Some(999),
+            context_size: 4096,
+        };
+        let runtime_probe = crytex_core::services::ModelRuntimeProbeReport {
+            trace_id: "trace-hf-proof".into(),
+            model_id: "hf-tiny".into(),
+            backend_id: Some("local-hf-proof".into()),
+            backend_capability: None,
+            compatibility: crytex_core::services::ModelCompatibilityPlan {
+                format: crytex_core::services::ModelFormat::Gguf,
+                features: vec![crytex_core::services::ModelFeature::Dense],
+                strategy: crytex_core::services::ExecutionStrategy::CudaFused,
+                status: crytex_core::services::CompatibilityStatus::Ready,
+                actions: vec!["use CudaFused execution strategy".into()],
+                warnings: Vec::new(),
+                blockers: Vec::new(),
+            },
+            stages: Vec::new(),
+            generated_preview: Some("ok".into()),
+            passed: true,
+        };
+
+        let report = build_hf_model_proof_report(
+            "local-hf-proof".into(),
+            &model,
+            recommendation,
+            runtime_probe,
+        );
+
+        assert_eq!(report.runtime_placement.kind, "cuda_full_offload");
+        assert_eq!(report.runtime_placement.gpu_layers, Some(999));
+        assert!(
+            report
+                .runtime_placement
+                .evidence
+                .contains("all supported GGUF layers")
         );
     }
 }
