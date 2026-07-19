@@ -520,6 +520,7 @@ struct HfModelProofReport {
     build_profile: String,
     recommendation: crytex_core::services::RecommendedConfig,
     runtime_placement: HfRuntimePlacementProof,
+    generation_evidence: HfGenerationEvidence,
     runtime_probe: crytex_core::services::ModelRuntimeProbeReport,
     passed: bool,
 }
@@ -532,6 +533,15 @@ struct HfRuntimePlacementProof {
     evidence: String,
 }
 
+#[derive(Debug, Serialize)]
+struct HfGenerationEvidence {
+    generated: bool,
+    sentinel_matched: bool,
+    preview: Option<String>,
+    duration_ms: Option<u128>,
+    message: Option<String>,
+}
+
 fn build_hf_model_proof_report(
     backend_id: String,
     model: &crytex_core::services::ManagedModel,
@@ -539,6 +549,7 @@ fn build_hf_model_proof_report(
     runtime_probe: crytex_core::services::ModelRuntimeProbeReport,
 ) -> HfModelProofReport {
     let runtime_placement = build_hf_runtime_placement_proof(&recommendation, &runtime_probe);
+    let generation_evidence = build_hf_generation_evidence(&runtime_probe);
     HfModelProofReport {
         trace_id: runtime_probe.trace_id.clone(),
         model_id: model.id.clone(),
@@ -552,6 +563,7 @@ fn build_hf_model_proof_report(
         build_profile: build_profile().to_string(),
         recommendation,
         runtime_placement,
+        generation_evidence,
         passed: runtime_probe.passed,
         runtime_probe,
     }
@@ -607,6 +619,25 @@ fn build_hf_runtime_placement_proof(
         gpu_layers: recommendation.gpu_layers,
         compatibility_strategy: strategy,
         evidence: evidence.into(),
+    }
+}
+
+fn build_hf_generation_evidence(
+    runtime_probe: &crytex_core::services::ModelRuntimeProbeReport,
+) -> HfGenerationEvidence {
+    let generation = runtime_probe
+        .stages
+        .iter()
+        .find(|stage| stage.name == crytex_core::services::ProbeStageName::Generation);
+    let message = generation.map(|stage| stage.message.clone());
+    HfGenerationEvidence {
+        generated: runtime_probe.generated_preview.is_some(),
+        sentinel_matched: message
+            .as_deref()
+            .is_some_and(|message| message.contains("matched expected sentinel")),
+        preview: runtime_probe.generated_preview.clone(),
+        duration_ms: generation.map(|stage| stage.duration_ms),
+        message,
     }
 }
 
@@ -2909,7 +2940,12 @@ mod tests {
                     cuda_unquantized_moe_fallback_available: false,
                 },
             ),
-            stages: Vec::new(),
+            stages: vec![crytex_core::services::ProbeStageReport {
+                name: crytex_core::services::ProbeStageName::Generation,
+                status: crytex_core::services::ProbeStageStatus::Passed,
+                message: "smoke generation matched expected sentinel CRYTEX_PROBE_OK".into(),
+                duration_ms: 42,
+            }],
             generated_preview: Some("ok".into()),
             passed: true,
         };
@@ -2935,6 +2971,86 @@ mod tests {
         assert_eq!(
             report.runtime_probe.generated_preview.as_deref(),
             Some("ok")
+        );
+        assert!(report.generation_evidence.generated);
+        assert!(report.generation_evidence.sentinel_matched);
+        assert_eq!(report.generation_evidence.preview.as_deref(), Some("ok"));
+        assert_eq!(report.generation_evidence.duration_ms, Some(42));
+        assert!(
+            report
+                .generation_evidence
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("matched expected sentinel"))
+        );
+    }
+
+    #[test]
+    fn hf_model_proof_report_marks_nonempty_sentinel_miss_as_generation_evidence() {
+        let model = crytex_core::services::ManagedModel {
+            id: "hf-tiny".into(),
+            name: "HF Tiny".into(),
+            repo: Some("owner/repo".into()),
+            filename: Some("model.gguf".into()),
+            local_path: Some(PathBuf::from("B:/crytex-data/models/tiny/model.gguf")),
+            quantization: Some(crytex_core::services::Quantization::Q2K),
+            preferred_backend: BackendKind::MistralRs,
+            params_b: Some(1.1),
+            status: crytex_core::services::ModelStatus::Downloaded,
+        };
+        let recommendation = crytex_core::services::RecommendedConfig {
+            backend: BackendKind::MistralRs,
+            quantization: crytex_core::services::Quantization::Q2K,
+            gpu_layers: Some(999),
+            context_size: 4096,
+        };
+        let runtime_probe = crytex_core::services::ModelRuntimeProbeReport {
+            trace_id: "trace-hf-proof".into(),
+            model_id: "hf-tiny".into(),
+            backend_id: Some("local-hf-proof".into()),
+            backend_capability: None,
+            compatibility: crytex_core::services::ModelCompatibilityPlan {
+                format: crytex_core::services::ModelFormat::Gguf,
+                features: vec![crytex_core::services::ModelFeature::Dense],
+                strategy: crytex_core::services::ExecutionStrategy::CudaFused,
+                status: crytex_core::services::CompatibilityStatus::Ready,
+                actions: vec!["use CudaFused execution strategy".into()],
+                warnings: Vec::new(),
+                blockers: Vec::new(),
+            },
+            stages: vec![crytex_core::services::ProbeStageReport {
+                name: crytex_core::services::ProbeStageName::Generation,
+                status: crytex_core::services::ProbeStageStatus::Passed,
+                message:
+                    "smoke generation missed expected sentinel CRYTEX_PROBE_OK: useful preview"
+                        .into(),
+                duration_ms: 5844,
+            }],
+            generated_preview: Some("useful preview".into()),
+            passed: true,
+        };
+
+        let report = build_hf_model_proof_report(
+            "local-hf-proof".into(),
+            &model,
+            recommendation,
+            runtime_probe,
+        );
+
+        assert!(report.passed);
+        assert!(report.generation_evidence.generated);
+        assert!(!report.generation_evidence.sentinel_matched);
+        assert_eq!(
+            report.generation_evidence.preview.as_deref(),
+            Some("useful preview")
+        );
+        assert_eq!(report.generation_evidence.duration_ms, Some(5844));
+        assert!(
+            report
+                .generation_evidence
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("missed expected sentinel"))
         );
     }
 
