@@ -47,6 +47,14 @@ pub enum CompatibilityStatus {
     Unsupported,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelSupportStatus {
+    Supported,
+    Partial,
+    Unsupported,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeFeatureSet {
     pub cuda_available: bool,
@@ -81,9 +89,11 @@ pub struct ModelCompatibilityPlan {
     pub features: Vec<ModelFeature>,
     pub strategy: ExecutionStrategy,
     pub status: CompatibilityStatus,
+    pub support_status: ModelSupportStatus,
     pub actions: Vec<String>,
     pub warnings: Vec<String>,
     pub blockers: Vec<String>,
+    pub failure_reasons: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -122,9 +132,11 @@ impl ModelCompatibilityPlanner {
                 features: vec![ModelFeature::Dense],
                 strategy: ExecutionStrategy::Remote,
                 status: CompatibilityStatus::Ready,
+                support_status: ModelSupportStatus::Supported,
                 actions: vec!["route to configured non-mistral backend".to_string()],
                 warnings: vec![],
                 blockers: vec![],
+                failure_reasons: vec![],
             };
         }
 
@@ -135,6 +147,8 @@ impl ModelCompatibilityPlanner {
         let warnings = compatibility_warnings(&features, device);
         let strategy = execution_strategy(&features, device, &blockers);
         let status = compatibility_status(&blockers, &warnings);
+        let support_status = support_status(status);
+        let failure_reasons = failure_reasons(&blockers, &warnings);
         let actions = execution_actions(format, &features, strategy);
 
         ModelCompatibilityPlan {
@@ -142,9 +156,11 @@ impl ModelCompatibilityPlanner {
             features,
             strategy,
             status,
+            support_status,
             actions,
             warnings,
             blockers,
+            failure_reasons,
         }
     }
 }
@@ -505,7 +521,10 @@ fn compatibility_warnings(features: &[ModelFeature], device: &DeviceKind) -> Vec
             .iter()
             .any(|feature| matches!(feature, ModelFeature::Gdn | ModelFeature::Moe))
     {
-        return vec!["MoE/GDN models can run slowly on CPU; prefer GPU when available".to_string()];
+        return vec![
+            "CPU MoE/GDN execution is supported but degraded; prefer GPU when available"
+                .to_string(),
+        ];
     }
     vec![]
 }
@@ -542,6 +561,22 @@ fn compatibility_status(blockers: &[String], warnings: &[String]) -> Compatibili
         CompatibilityStatus::Degraded
     } else {
         CompatibilityStatus::Ready
+    }
+}
+
+fn support_status(status: CompatibilityStatus) -> ModelSupportStatus {
+    match status {
+        CompatibilityStatus::Ready => ModelSupportStatus::Supported,
+        CompatibilityStatus::Degraded => ModelSupportStatus::Partial,
+        CompatibilityStatus::Unsupported => ModelSupportStatus::Unsupported,
+    }
+}
+
+fn failure_reasons(blockers: &[String], warnings: &[String]) -> Vec<String> {
+    if !blockers.is_empty() {
+        blockers.to_vec()
+    } else {
+        warnings.to_vec()
     }
 }
 
@@ -610,6 +645,8 @@ mod tests {
         );
 
         assert_eq!(plan.status, CompatibilityStatus::Ready);
+        assert_eq!(plan.support_status, ModelSupportStatus::Supported);
+        assert!(plan.failure_reasons.is_empty());
         assert_eq!(plan.format, ModelFormat::HuggingFace);
         assert!(plan.features.contains(&ModelFeature::Gdn));
         assert!(plan.features.contains(&ModelFeature::Moe));
@@ -638,6 +675,12 @@ mod tests {
         );
 
         assert_eq!(plan.status, CompatibilityStatus::Unsupported);
+        assert_eq!(plan.support_status, ModelSupportStatus::Unsupported);
+        assert!(
+            plan.failure_reasons
+                .iter()
+                .any(|reason| reason.contains("GDN CUDA kernel"))
+        );
         assert!(
             plan.blockers
                 .iter()
@@ -664,9 +707,34 @@ mod tests {
         );
 
         assert_eq!(plan.status, CompatibilityStatus::Ready);
+        assert_eq!(plan.support_status, ModelSupportStatus::Supported);
         assert_eq!(plan.format, ModelFormat::Gguf);
         assert!(plan.features.contains(&ModelFeature::Gguf));
         assert_eq!(plan.strategy, ExecutionStrategy::CudaFused);
+    }
+
+    #[test]
+    fn should_mark_cpu_moe_gdn_as_partial_with_warning_reason() {
+        let model = model("tiny-random/qwen3-next-moe", None, None);
+
+        let plan = ModelCompatibilityPlanner::plan(
+            &model,
+            &DeviceKind::Cpu,
+            &RuntimeFeatureSet {
+                cuda_available: false,
+                metal_available: false,
+                gdn_cuda_available: false,
+                cuda_unquantized_moe_fallback_available: false,
+            },
+        );
+
+        assert_eq!(plan.status, CompatibilityStatus::Degraded);
+        assert_eq!(plan.support_status, ModelSupportStatus::Partial);
+        assert!(
+            plan.failure_reasons
+                .iter()
+                .any(|reason| { reason.contains("CPU MoE/GDN execution") })
+        );
     }
 
     #[test]

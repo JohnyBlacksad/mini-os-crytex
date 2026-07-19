@@ -561,9 +561,11 @@ pub struct CompatibilityReport {
     pub features: Vec<String>,
     pub strategy: String,
     pub status: String,
+    pub support_status: String,
     pub actions: Vec<String>,
     pub warnings: Vec<String>,
     pub blockers: Vec<String>,
+    pub failure_reasons: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -593,6 +595,7 @@ pub struct RuntimeProbeReport {
     pub backend_capability: Option<BackendCapabilitySnapshot>,
     pub compatibility: CompatibilityReport,
     pub stages: Vec<ProbeStageReport>,
+    pub failure_reasons: Vec<String>,
     pub runtime_placement: Option<RuntimePlacementReport>,
     pub generated_preview: Option<String>,
     pub passed: bool,
@@ -637,7 +640,16 @@ pub struct RuntimeMatrixEntryReport {
 pub struct RuntimeMatrixReport {
     pub trace_id: String,
     pub entries: Vec<RuntimeMatrixEntryReport>,
+    pub summary: RuntimeMatrixSummary,
     pub passed: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeMatrixSummary {
+    pub supported: usize,
+    pub partial: usize,
+    pub unsupported: usize,
+    pub failed: usize,
 }
 
 pub fn build_runtime_matrix_entries(
@@ -721,10 +733,29 @@ pub async fn run_runtime_matrix_with_config(
         });
     }
     let passed = reports.iter().all(|entry| entry.report.passed);
+    let summary = RuntimeMatrixSummary::from_entries(&reports);
     RuntimeMatrixReport {
         trace_id,
         entries: reports,
+        summary,
         passed,
+    }
+}
+
+impl RuntimeMatrixSummary {
+    fn from_entries(entries: &[RuntimeMatrixEntryReport]) -> Self {
+        entries.iter().fold(Self::default(), |mut summary, entry| {
+            match entry.report.compatibility.support_status.as_str() {
+                "supported" => summary.supported += 1,
+                "partial" => summary.partial += 1,
+                "unsupported" => summary.unsupported += 1,
+                _ => summary.unsupported += 1,
+            }
+            if !entry.report.passed {
+                summary.failed += 1;
+            }
+            summary
+        })
     }
 }
 
@@ -755,12 +786,15 @@ async fn run_probe(
         .and_then(|backend| backend_capability_snapshot(backend.as_ref(), &entry.backend_id));
 
     let Some(backend) = backends.get(&entry.backend_id) else {
+        let message = format!("backend {} is not registered", entry.backend_id);
+        let compatibility = unsupported_compatibility(message.clone());
         stages.push(stage(
             ProbeStageName::Generation,
             ProbeStageStatus::Failed,
-            format!("backend {} is not registered", entry.backend_id),
+            message,
             0,
         ));
+        let failure_reasons = compatibility_failure_reasons(&compatibility, &[]);
         return RuntimeProbeReport {
             trace_id: entry_trace_id,
             model_id: entry.model_id.clone(),
@@ -768,6 +802,7 @@ async fn run_probe(
             backend_capability,
             compatibility,
             stages,
+            failure_reasons,
             runtime_placement: None,
             generated_preview: None,
             passed: false,
@@ -788,6 +823,7 @@ async fn run_probe(
                 duration_ms,
             ));
             let runtime_placement = runtime_placement_after_generation(config, entry).await;
+            let failure_reasons = compatibility_failure_reasons(&compatibility, &[]);
             RuntimeProbeReport {
                 trace_id: entry_trace_id,
                 model_id: entry.model_id.clone(),
@@ -795,6 +831,7 @@ async fn run_probe(
                 backend_capability,
                 compatibility,
                 stages,
+                failure_reasons,
                 runtime_placement,
                 generated_preview: Some(preview),
                 passed: true,
@@ -833,6 +870,8 @@ fn failed_probe(
     message: String,
     duration_ms: u128,
 ) -> RuntimeProbeReport {
+    let failure_reasons =
+        compatibility_failure_reasons(&compatibility, std::slice::from_ref(&message));
     stages.push(stage(
         ProbeStageName::Generation,
         ProbeStageStatus::Failed,
@@ -846,6 +885,7 @@ fn failed_probe(
         backend_capability,
         compatibility,
         stages,
+        failure_reasons,
         runtime_placement: None,
         generated_preview: None,
         passed: false,
@@ -935,10 +975,38 @@ fn remote_compatibility() -> CompatibilityReport {
         features: vec!["dense".to_string()],
         strategy: "remote".to_string(),
         status: "ready".to_string(),
+        support_status: "supported".to_string(),
         actions: vec!["route to configured non-mistral backend".to_string()],
         warnings: vec![],
         blockers: vec![],
+        failure_reasons: vec![],
     }
+}
+
+fn unsupported_compatibility(reason: String) -> CompatibilityReport {
+    CompatibilityReport {
+        format: "unknown".to_string(),
+        features: vec!["dense".to_string()],
+        strategy: "remote".to_string(),
+        status: "unsupported".to_string(),
+        support_status: "unsupported".to_string(),
+        actions: vec!["register or configure the requested backend before probing".to_string()],
+        warnings: vec![],
+        blockers: vec![reason.clone()],
+        failure_reasons: vec![reason],
+    }
+}
+
+fn compatibility_failure_reasons(
+    compatibility: &CompatibilityReport,
+    runtime_failures: &[String],
+) -> Vec<String> {
+    compatibility
+        .failure_reasons
+        .iter()
+        .cloned()
+        .chain(runtime_failures.iter().cloned())
+        .collect()
 }
 
 fn stage(
@@ -1130,6 +1198,15 @@ mod tests {
         assert!(report.passed);
         assert_eq!(report.entries.len(), 2);
         assert_eq!(
+            report.summary,
+            RuntimeMatrixSummary {
+                supported: 2,
+                partial: 0,
+                unsupported: 0,
+                failed: 0,
+            }
+        );
+        assert_eq!(
             report.entries[1].lora_adapter_id.as_deref(),
             Some("coder-lora")
         );
@@ -1171,6 +1248,46 @@ mod tests {
         assert_eq!(lora_entry["lora_adapter_id"], "coder-lora");
         assert_eq!(lora_entry["report"]["backend_capability"]["lora"], true);
         assert_eq!(lora_entry["report"]["backend_capability"]["hot_swap"], true);
+        assert_eq!(report_value["summary"]["supported"], 2);
+        assert_eq!(
+            lora_entry["report"]["compatibility"]["support_status"],
+            "supported"
+        );
+        assert!(
+            lora_entry["report"]["failure_reasons"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_matrix_reports_missing_backend_as_unsupported_with_failure_reason() {
+        let backends = HashMap::new();
+        let entries =
+            build_runtime_matrix_entries(&["missing".into()], &[], "diag-model", "tiny-coder", 16);
+
+        let report = run_runtime_matrix("trace-diag-missing".into(), entries, &backends).await;
+
+        assert!(!report.passed);
+        assert_eq!(
+            report.summary,
+            RuntimeMatrixSummary {
+                supported: 0,
+                partial: 0,
+                unsupported: 1,
+                failed: 1,
+            }
+        );
+        let probe = &report.entries[0].report;
+        assert_eq!(probe.compatibility.support_status, "unsupported");
+        assert!(
+            probe
+                .failure_reasons
+                .iter()
+                .any(|reason| reason.contains("backend missing is not registered")),
+            "expected missing backend failure reason, got {:?}",
+            probe.failure_reasons
+        );
     }
 
     #[test]

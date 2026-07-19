@@ -72,7 +72,7 @@ pub use memory_bank::{
 };
 pub use model_compatibility::{
     CompatibilityStatus, ExecutionStrategy, ModelCompatibilityPlan, ModelCompatibilityPlanner,
-    ModelFeature, ModelFormat, RuntimeFeatureSet,
+    ModelFeature, ModelFormat, ModelSupportStatus, RuntimeFeatureSet,
 };
 pub use model_manager::{
     FileSystemManifestSource, HardwareModelRecommender, HfGgufResolution, HfGgufResolveRequest,
@@ -84,7 +84,7 @@ pub use model_runtime_probe::{
     ModelRuntimeMatrixProbe, ModelRuntimeMatrixReport, ModelRuntimeMatrixRequest,
     ModelRuntimeProbe, ModelRuntimeProbeReport, ModelRuntimeProbeRequest, ProbeStageName,
     ProbeStageReport, ProbeStageStatus, RuntimeMatrixEntryReport, RuntimeMatrixEntryRequest,
-    RuntimeMatrixReportWriter,
+    RuntimeMatrixReportWriter, RuntimeMatrixSummary,
 };
 pub use orchestrator::{Orchestrator, OrchestratorError, OrchestratorImpl};
 pub use project_service::{CreateProjectRequest, ProjectError, ProjectService, ProjectServiceImpl};

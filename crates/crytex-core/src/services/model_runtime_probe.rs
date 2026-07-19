@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::services::hardware::DeviceKind;
 use crate::services::model_compatibility::{
-    CompatibilityStatus, ModelCompatibilityPlan, ModelCompatibilityPlanner, RuntimeFeatureSet,
+    CompatibilityStatus, ModelCompatibilityPlan, ModelCompatibilityPlanner, ModelSupportStatus,
+    RuntimeFeatureSet,
 };
 use crate::services::model_manager::ManagedModel;
 use crate::services::{InferenceService, InferenceServiceError};
@@ -48,6 +49,7 @@ pub struct ModelRuntimeProbeReport {
     pub backend_capability: Option<BackendCapabilityReport>,
     pub compatibility: ModelCompatibilityPlan,
     pub stages: Vec<ProbeStageReport>,
+    pub failure_reasons: Vec<String>,
     pub generated_preview: Option<String>,
     pub passed: bool,
 }
@@ -110,6 +112,7 @@ impl ModelRuntimeProbe {
         ));
 
         if compatibility.status == CompatibilityStatus::Unsupported {
+            let failure_reasons = compatibility_failure_reasons(&compatibility, &[]);
             stages.push(stage(
                 ProbeStageName::Compatibility,
                 ProbeStageStatus::Failed,
@@ -129,6 +132,7 @@ impl ModelRuntimeProbe {
                 backend_capability,
                 compatibility,
                 stages,
+                failure_reasons,
                 generated_preview: None,
                 passed: false,
             };
@@ -160,6 +164,7 @@ impl ModelRuntimeProbe {
         match generation {
             Ok(content) if is_expected_smoke_response(&content) => {
                 let preview = content.chars().take(512).collect::<String>();
+                let failure_reasons = compatibility_failure_reasons(&compatibility, &[]);
                 stages.push(stage(
                     ProbeStageName::Generation,
                     ProbeStageStatus::Passed,
@@ -173,6 +178,7 @@ impl ModelRuntimeProbe {
                     backend_capability,
                     compatibility,
                     stages,
+                    failure_reasons,
                     generated_preview: Some(preview),
                     passed: true,
                 }
@@ -262,6 +268,7 @@ fn smoke_request(request: &ModelRuntimeProbeRequest) -> InferenceRequest {
 pub struct RuntimeMatrixEntryRequest {
     pub label: String,
     pub model: ManagedModel,
+    pub device: Option<DeviceKind>,
     pub backend_id: Option<String>,
     pub model_name: String,
     pub lora_adapter_id: Option<String>,
@@ -285,7 +292,16 @@ pub struct RuntimeMatrixEntryReport {
 pub struct ModelRuntimeMatrixReport {
     pub trace_id: String,
     pub entries: Vec<RuntimeMatrixEntryReport>,
+    pub summary: RuntimeMatrixSummary,
     pub passed: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeMatrixSummary {
+    pub supported: usize,
+    pub partial: usize,
+    pub unsupported: usize,
+    pub failed: usize,
 }
 
 pub struct ModelRuntimeMatrixProbe {
@@ -312,11 +328,12 @@ impl ModelRuntimeMatrixProbe {
         let mut entries = Vec::new();
 
         for (index, entry) in request.entries.into_iter().enumerate() {
+            let entry_device = entry.device.as_ref().unwrap_or(device);
             let report = self
                 .probe
                 .probe(
                     &entry.model,
-                    device,
+                    entry_device,
                     runtime,
                     ModelRuntimeProbeRequest {
                         backend_id: entry.backend_id,
@@ -335,12 +352,32 @@ impl ModelRuntimeMatrixProbe {
             });
         }
 
+        let summary = RuntimeMatrixSummary::from_entries(&entries);
         let passed = entries.iter().all(|entry| entry.report.passed);
         ModelRuntimeMatrixReport {
             trace_id,
             entries,
+            summary,
             passed,
         }
+    }
+}
+
+impl RuntimeMatrixSummary {
+    fn from_entries(entries: &[RuntimeMatrixEntryReport]) -> Self {
+        entries.iter().fold(Self::default(), |mut summary, entry| {
+            match entry.report.compatibility.support_status {
+                ModelSupportStatus::Supported => summary.supported += 1,
+                ModelSupportStatus::Partial => summary.partial += 1,
+                ModelSupportStatus::Unsupported => {
+                    summary.unsupported += 1;
+                }
+            }
+            if !entry.report.passed {
+                summary.failed += 1;
+            }
+            summary
+        })
     }
 }
 
@@ -435,6 +472,7 @@ fn passed_generation_report(
         message,
         duration_ms,
     ));
+    let failure_reasons = compatibility_failure_reasons(&context.compatibility, &[]);
     ModelRuntimeProbeReport {
         trace_id: context.trace_id,
         model_id: context.model_id,
@@ -442,6 +480,7 @@ fn passed_generation_report(
         backend_capability: context.backend_capability,
         compatibility: context.compatibility,
         stages: context.stages,
+        failure_reasons,
         generated_preview: None,
         passed: true,
     }
@@ -452,6 +491,8 @@ fn failed_generation_report(
     message: String,
     duration_ms: u128,
 ) -> ModelRuntimeProbeReport {
+    let failure_reasons =
+        compatibility_failure_reasons(&context.compatibility, std::slice::from_ref(&message));
     context.stages.push(stage(
         ProbeStageName::Generation,
         ProbeStageStatus::Failed,
@@ -465,6 +506,7 @@ fn failed_generation_report(
         backend_capability: context.backend_capability,
         compatibility: context.compatibility,
         stages: context.stages,
+        failure_reasons,
         generated_preview: None,
         passed: false,
     }
@@ -479,6 +521,18 @@ impl ModelRuntimeProbeReport {
 
 fn generation_error_message(error: InferenceServiceError) -> String {
     format!("smoke generation failed: {error}")
+}
+
+fn compatibility_failure_reasons(
+    compatibility: &ModelCompatibilityPlan,
+    runtime_failures: &[String],
+) -> Vec<String> {
+    compatibility
+        .failure_reasons
+        .iter()
+        .cloned()
+        .chain(runtime_failures.iter().cloned())
+        .collect()
 }
 
 fn stage(
@@ -547,6 +601,18 @@ mod tests {
         assert!(report.stages.iter().any(|stage| {
             stage.name == ProbeStageName::Generation && stage.status == ProbeStageStatus::Skipped
         }));
+        assert_eq!(
+            report.compatibility.support_status,
+            ModelSupportStatus::Unsupported
+        );
+        assert!(
+            report
+                .failure_reasons
+                .iter()
+                .any(|reason| reason.contains("GDN CUDA kernel")),
+            "expected GDN kernel blocker, got {:?}",
+            report.failure_reasons
+        );
     }
 
     #[tokio::test]
@@ -582,6 +648,11 @@ mod tests {
         assert!(report.stages.iter().any(|stage| {
             stage.name == ProbeStageName::Generation && stage.status == ProbeStageStatus::Passed
         }));
+        assert_eq!(
+            report.compatibility.support_status,
+            ModelSupportStatus::Supported
+        );
+        assert!(report.failure_reasons.is_empty());
     }
 
     #[tokio::test]
@@ -687,6 +758,7 @@ mod tests {
                         RuntimeMatrixEntryRequest {
                             label: "baseline".into(),
                             model: model.clone(),
+                            device: None,
                             backend_id: Some("mistralrs".into()),
                             model_name: "tiny-coder".into(),
                             lora_adapter_id: None,
@@ -695,6 +767,7 @@ mod tests {
                         RuntimeMatrixEntryRequest {
                             label: "coder-lora".into(),
                             model: model.clone(),
+                            device: None,
                             backend_id: Some("mistralrs".into()),
                             model_name: "tiny-coder".into(),
                             lora_adapter_id: Some("coder-lora-v1".into()),
@@ -726,6 +799,15 @@ mod tests {
             Some("coder-lora-v1")
         );
         assert!(report.entries.iter().all(|entry| entry.report.passed));
+        assert_eq!(
+            report.summary,
+            RuntimeMatrixSummary {
+                supported: 2,
+                partial: 0,
+                unsupported: 0,
+                failed: 0,
+            }
+        );
     }
 
     #[tokio::test]
@@ -749,6 +831,114 @@ mod tests {
                 && stage.status == ProbeStageStatus::Failed
                 && stage.message.contains("backend exploded")
         }));
+        assert!(
+            report
+                .failure_reasons
+                .iter()
+                .any(|reason| reason.contains("backend exploded")),
+            "expected backend failure reason, got {:?}",
+            report.failure_reasons
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_matrix_summarizes_supported_partial_unsupported_and_failed_paths() {
+        let inference = Arc::new(RecordingInference::with_error_for("dense-fails"));
+        let matrix = ModelRuntimeMatrixProbe::new(inference.clone());
+
+        let report = matrix
+            .probe(
+                &DeviceKind::Cpu,
+                &RuntimeFeatureSet {
+                    cuda_available: true,
+                    metal_available: false,
+                    gdn_cuda_available: false,
+                    cuda_unquantized_moe_fallback_available: true,
+                },
+                ModelRuntimeMatrixRequest {
+                    trace_id: Some("trace-runtime-proof".into()),
+                    entries: vec![
+                        RuntimeMatrixEntryRequest {
+                            label: "cpu-dense".into(),
+                            model: model("tiny-coder"),
+                            device: Some(DeviceKind::Cpu),
+                            backend_id: Some("mistralrs".into()),
+                            model_name: "tiny-coder".into(),
+                            lora_adapter_id: None,
+                            max_tokens: 16,
+                        },
+                        RuntimeMatrixEntryRequest {
+                            label: "cpu-moe-gdn-partial".into(),
+                            model: model("tiny-random/qwen3-next-moe"),
+                            device: Some(DeviceKind::Cpu),
+                            backend_id: Some("mistralrs".into()),
+                            model_name: "tiny-random/qwen3-next-moe".into(),
+                            lora_adapter_id: None,
+                            max_tokens: 16,
+                        },
+                        RuntimeMatrixEntryRequest {
+                            label: "gpu-gdn-unsupported".into(),
+                            model: model("tiny-random/qwen3-next-gdn"),
+                            device: Some(cuda_device()),
+                            backend_id: Some("mistralrs".into()),
+                            model_name: "tiny-random/qwen3-next-gdn".into(),
+                            lora_adapter_id: None,
+                            max_tokens: 16,
+                        },
+                        RuntimeMatrixEntryRequest {
+                            label: "dense-fails".into(),
+                            model: model("dense-fails"),
+                            device: Some(DeviceKind::Cpu),
+                            backend_id: Some("mistralrs".into()),
+                            model_name: "dense-fails".into(),
+                            lora_adapter_id: None,
+                            max_tokens: 16,
+                        },
+                    ],
+                },
+            )
+            .await;
+
+        assert!(!report.passed);
+        assert_eq!(
+            report.summary,
+            RuntimeMatrixSummary {
+                supported: 2,
+                partial: 1,
+                unsupported: 1,
+                failed: 2,
+            }
+        );
+        assert_eq!(
+            support_status_for(&report, "cpu-moe-gdn-partial"),
+            Some(ModelSupportStatus::Partial)
+        );
+        assert_eq!(
+            support_status_for(&report, "gpu-gdn-unsupported"),
+            Some(ModelSupportStatus::Unsupported)
+        );
+        assert!(
+            report
+                .entries
+                .iter()
+                .find(|entry| entry.label == "cpu-moe-gdn-partial")
+                .is_some_and(|entry| entry
+                    .report
+                    .failure_reasons
+                    .iter()
+                    .any(|reason| reason.contains("CPU MoE/GDN execution")))
+        );
+        assert!(
+            report
+                .entries
+                .iter()
+                .find(|entry| entry.label == "gpu-gdn-unsupported")
+                .is_some_and(|entry| entry
+                    .report
+                    .failure_reasons
+                    .iter()
+                    .any(|reason| reason.contains("GDN CUDA kernel")))
+        );
     }
 
     #[tokio::test]
@@ -797,10 +987,17 @@ mod tests {
                         &RuntimeFeatureSet::fully_enabled_cuda(),
                     ),
                     stages: vec![],
+                    failure_reasons: vec![],
                     generated_preview: Some("CRYTEX_PROBE_OK".into()),
                     passed: true,
                 },
             }],
+            summary: RuntimeMatrixSummary {
+                supported: 1,
+                partial: 0,
+                unsupported: 0,
+                failed: 0,
+            },
             passed: true,
         };
 
@@ -814,6 +1011,8 @@ mod tests {
         );
         assert!(json.contains("\"trace_id\": \"trace/runtime matrix:01\""));
         assert!(json.contains("\"label\": \"ollama:baseline\""));
+        assert!(json.contains("\"summary\""));
+        assert!(json.contains("\"supported\": 1"));
     }
 
     struct RecordingInference {
@@ -824,6 +1023,7 @@ mod tests {
     enum RecordingResponse {
         Success(String),
         Error,
+        ErrorFor(String),
         Delay(u64),
     }
 
@@ -842,6 +1042,13 @@ mod tests {
             }
         }
 
+        fn with_error_for(model_name: &str) -> Self {
+            Self {
+                requests: Mutex::new(Vec::new()),
+                response: RecordingResponse::ErrorFor(model_name.into()),
+            }
+        }
+
         fn with_delay(delay_ms: u64) -> Self {
             Self {
                 requests: Mutex::new(Vec::new()),
@@ -856,6 +1063,7 @@ mod tests {
             &self,
             request: InferenceRequest,
         ) -> Result<InferenceResponse, InferenceServiceError> {
+            let request_model = request.model.clone();
             self.requests.lock().unwrap().push(request);
             match &self.response {
                 RecordingResponse::Success(content) => Ok(InferenceResponse {
@@ -870,6 +1078,21 @@ mod tests {
                 RecordingResponse::Error => Err(InferenceServiceError::Inference(
                     InferenceError::GenerationFailed("backend exploded".into()),
                 )),
+                RecordingResponse::ErrorFor(model_name) if request_model == *model_name => Err(
+                    InferenceServiceError::Inference(InferenceError::GenerationFailed(format!(
+                        "backend exploded for {}",
+                        request_model
+                    ))),
+                ),
+                RecordingResponse::ErrorFor(_) => Ok(InferenceResponse {
+                    content: "CRYTEX_PROBE_OK".into(),
+                    usage: TokenUsage {
+                        prompt_tokens: 1,
+                        completion_tokens: 1,
+                        total_tokens: 2,
+                    },
+                    finish_reason: "stop".into(),
+                }),
                 RecordingResponse::Delay(delay_ms) => {
                     tokio::time::sleep(Duration::from_millis(*delay_ms)).await;
                     Ok(InferenceResponse {
@@ -938,5 +1161,16 @@ mod tests {
             vram_mb: 16_303,
             driver_version: "596.36".into(),
         }
+    }
+
+    fn support_status_for(
+        report: &ModelRuntimeMatrixReport,
+        label: &str,
+    ) -> Option<ModelSupportStatus> {
+        report
+            .entries
+            .iter()
+            .find(|entry| entry.label == label)
+            .map(|entry| entry.report.compatibility.support_status)
     }
 }
