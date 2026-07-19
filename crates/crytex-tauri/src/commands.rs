@@ -4568,6 +4568,22 @@ mod tests {
                     }),
                 ),
                 diagnostic_log(
+                    "rag_context_assembled",
+                    Some("task-coder"),
+                    json!({
+                        "trace_id": "trace-1",
+                        "query": "payment retry adapter",
+                        "rerank_applied": true,
+                        "chunks": [{
+                            "id": "doc-1",
+                            "score": 0.72,
+                            "source": "docs/payment.md",
+                            "relative_path": "docs/payment.md",
+                            "text_preview": "REAL_RUNTIME_SMOKE_RAG_MARKER"
+                        }]
+                    }),
+                ),
+                diagnostic_log(
                     "critic_rejected",
                     Some("task-critic"),
                     json!({
@@ -4627,6 +4643,16 @@ mod tests {
         );
         assert_eq!(report.remediation_events.len(), 1);
         assert!(report.rag_context_sent_to_model);
+        let rag_event = report
+            .events
+            .iter()
+            .find(|event| event.action == "rag_context_assembled")
+            .expect("run diagnostics should include RAG retrieval evidence events");
+        assert_eq!(rag_event.metadata["rerank_applied"], true);
+        assert_eq!(
+            rag_event.metadata["chunks"][0]["relative_path"],
+            "docs/payment.md"
+        );
         assert!(report.human_reward_recorded);
     }
 

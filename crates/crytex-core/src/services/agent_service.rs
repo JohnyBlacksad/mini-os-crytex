@@ -286,6 +286,7 @@ impl AgentService for AgentServiceImpl {
                                     .metadata(serde_json::json!({
                                         "query": assembly.rag.query,
                                         "project_id": assembly.rag.project_id,
+                                        "trace_id": task.trace_id,
                                         "rerank_applied": assembly.rag.rerank_applied,
                                         "chunks": chunks,
                                     })),
@@ -760,6 +761,7 @@ mod tests {
             .expect("RAG context evidence should be logged for Observe");
 
         assert_eq!(rag_entry.trace_id, "trace-1");
+        assert_eq!(rag_entry.metadata["trace_id"], "trace-1");
         assert_eq!(rag_entry.task_id.as_deref(), Some("t1"));
         assert_eq!(rag_entry.metadata["query"], "test ");
         assert_eq!(rag_entry.metadata["rerank_applied"], false);
@@ -768,7 +770,10 @@ mod tests {
             "docs/architecture.md"
         );
         assert!(
-            rag_entry.metadata["chunks"][0]["score"].as_f64().unwrap_or(0.0) > 0.0,
+            rag_entry.metadata["chunks"][0]["score"]
+                .as_f64()
+                .unwrap_or(0.0)
+                > 0.0,
             "chunk score should be logged after retrieval/fusion"
         );
         assert!(
