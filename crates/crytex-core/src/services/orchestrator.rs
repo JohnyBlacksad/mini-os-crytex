@@ -34,12 +34,16 @@ pub trait Orchestrator: Send + Sync {
 }
 
 fn agent_node(id: &str, agent: &str) -> WorkflowNode {
+    agent_node_io(id, agent, "task", "result")
+}
+
+fn agent_node_io(id: &str, agent: &str, input: &str, output: &str) -> WorkflowNode {
     WorkflowNode::Agent {
         id: id.to_string(),
         agent: agent.to_string(),
         task_kind: None,
-        input: "task".to_string(),
-        output: "result".to_string(),
+        input: input.to_string(),
+        output: output.to_string(),
         timeout_seconds: None,
         retry: crate::services::WorkflowRetryPolicy::default(),
     }
@@ -102,13 +106,13 @@ fn default_debug_workflow() -> WorkflowDefinition {
                 agent: "coder".to_string(),
                 task_kind: Some("debug".to_string()),
                 input: "task".to_string(),
-                output: "result".to_string(),
+                output: "debug_artifact".to_string(),
                 timeout_seconds: None,
                 retry: crate::services::WorkflowRetryPolicy::default(),
             },
-            agent_node("fix", "coder"),
-            agent_node("qa", "qa"),
-            agent_node("critic", "critic"),
+            agent_node_io("fix", "coder", "debug_artifact", "fix_artifact"),
+            agent_node_io("qa", "qa", "fix_artifact", "qa_artifact"),
+            agent_node_io("critic", "critic", "qa_artifact", "result"),
             WorkflowNode::End {
                 id: "end".to_string(),
             },
@@ -625,6 +629,41 @@ mod tests {
         let ready = svc.list_ready().await.unwrap();
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].kind, "review");
+    }
+
+    #[test]
+    fn debug_workflow_passes_artifact_between_remediation_agents() {
+        let workflow = default_debug_workflow();
+
+        let debug = workflow.node("debug").unwrap();
+        let fix = workflow.node("fix").unwrap();
+        let qa = workflow.node("qa").unwrap();
+        let critic = workflow.node("critic").unwrap();
+
+        assert!(matches!(
+            debug,
+            WorkflowNode::Agent {
+                input, output, ..
+            } if input == "task" && output == "debug_artifact"
+        ));
+        assert!(matches!(
+            fix,
+            WorkflowNode::Agent {
+                input, output, ..
+            } if input == "debug_artifact" && output == "fix_artifact"
+        ));
+        assert!(matches!(
+            qa,
+            WorkflowNode::Agent {
+                input, output, ..
+            } if input == "fix_artifact" && output == "qa_artifact"
+        ));
+        assert!(matches!(
+            critic,
+            WorkflowNode::Agent {
+                input, output, ..
+            } if input == "qa_artifact" && output == "result"
+        ));
     }
 
     #[tokio::test]
