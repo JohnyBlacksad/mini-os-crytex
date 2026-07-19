@@ -1138,6 +1138,37 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn runtime_matrix_json_report_persists_backend_lora_hot_swap_capability() {
+        let backend = Arc::new(StaticBackend::new(
+            "mistralrs",
+            vec!["generate", "chat", "lora", "hot_swap"],
+        ));
+        let backends =
+            HashMap::from([("mistralrs".to_string(), backend as Arc<dyn InferenceManager>)]);
+        let entries = build_runtime_matrix_entries(
+            &["mistralrs".into()],
+            &["coder-lora".into()],
+            "diag-model",
+            "tiny-coder",
+            16,
+        );
+        let report = run_runtime_matrix("trace-diag-lora-json".into(), entries, &backends).await;
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        let report_path = write_report_pretty_json(&report, temp_dir.path()).unwrap();
+        let report_json = std::fs::read_to_string(report_path).unwrap();
+        let report_value = serde_json::from_str::<serde_json::Value>(&report_json).unwrap();
+        let lora_entry = &report_value["entries"][1];
+
+        assert_eq!(lora_entry["lora_adapter_id"], "coder-lora");
+        assert_eq!(lora_entry["report"]["backend_capability"]["lora"], true);
+        assert_eq!(
+            lora_entry["report"]["backend_capability"]["hot_swap"],
+            true
+        );
+    }
+
     #[test]
     fn partial_config_deserializes_only_diagnostic_fields() {
         let config = toml::from_str::<DiagConfig>(
