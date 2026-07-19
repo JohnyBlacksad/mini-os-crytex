@@ -521,6 +521,7 @@ struct HfModelProofReport {
     recommendation: crytex_core::services::RecommendedConfig,
     runtime_placement: HfRuntimePlacementProof,
     generation_evidence: HfGenerationEvidence,
+    proof_gate: HfProofGate,
     runtime_probe: crytex_core::services::ModelRuntimeProbeReport,
     passed: bool,
 }
@@ -542,6 +543,19 @@ struct HfGenerationEvidence {
     message: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct HfProofGate {
+    passed: bool,
+    requirements: Vec<HfProofRequirement>,
+}
+
+#[derive(Debug, Serialize)]
+struct HfProofRequirement {
+    name: String,
+    passed: bool,
+    evidence: String,
+}
+
 fn build_hf_model_proof_report(
     backend_id: String,
     model: &crytex_core::services::ManagedModel,
@@ -550,6 +564,8 @@ fn build_hf_model_proof_report(
 ) -> HfModelProofReport {
     let runtime_placement = build_hf_runtime_placement_proof(&recommendation, &runtime_probe);
     let generation_evidence = build_hf_generation_evidence(&runtime_probe);
+    let proof_gate =
+        build_hf_proof_gate(model, &backend_id, &runtime_placement, &generation_evidence);
     HfModelProofReport {
         trace_id: runtime_probe.trace_id.clone(),
         model_id: model.id.clone(),
@@ -564,6 +580,7 @@ fn build_hf_model_proof_report(
         recommendation,
         runtime_placement,
         generation_evidence,
+        proof_gate,
         passed: runtime_probe.passed,
         runtime_probe,
     }
@@ -618,6 +635,69 @@ fn build_hf_runtime_placement_proof(
         kind: kind.into(),
         gpu_layers: recommendation.gpu_layers,
         compatibility_strategy: strategy,
+        evidence: evidence.into(),
+    }
+}
+
+fn build_hf_proof_gate(
+    model: &crytex_core::services::ManagedModel,
+    backend_id: &str,
+    runtime_placement: &HfRuntimePlacementProof,
+    generation_evidence: &HfGenerationEvidence,
+) -> HfProofGate {
+    let local_path = model
+        .local_path
+        .as_ref()
+        .map(|path| path.display().to_string());
+    let requirements = vec![
+        proof_requirement(
+            "hf_repo_recorded",
+            model.repo.is_some(),
+            model.repo.as_deref().unwrap_or("missing HF repo"),
+        ),
+        proof_requirement(
+            "hf_gguf_resolved",
+            model
+                .filename
+                .as_deref()
+                .is_some_and(|filename| filename.ends_with(".gguf")),
+            model.filename.as_deref().unwrap_or("missing GGUF filename"),
+        ),
+        proof_requirement(
+            "hf_model_downloaded",
+            local_path.is_some(),
+            local_path.as_deref().unwrap_or("missing local model path"),
+        ),
+        proof_requirement(
+            "backend_activated",
+            !backend_id.trim().is_empty(),
+            backend_id,
+        ),
+        proof_requirement(
+            "runtime_placement_selected",
+            runtime_placement.kind != "backend_default",
+            &runtime_placement.evidence,
+        ),
+        proof_requirement(
+            "runtime_generated",
+            generation_evidence.generated,
+            generation_evidence
+                .preview
+                .as_deref()
+                .unwrap_or("missing generated preview"),
+        ),
+    ];
+    let passed = requirements.iter().all(|requirement| requirement.passed);
+    HfProofGate {
+        passed,
+        requirements,
+    }
+}
+
+fn proof_requirement(name: &str, passed: bool, evidence: &str) -> HfProofRequirement {
+    HfProofRequirement {
+        name: name.into(),
+        passed,
         evidence: evidence.into(),
     }
 }
@@ -2983,6 +3063,25 @@ mod tests {
                 .as_deref()
                 .is_some_and(|message| message.contains("matched expected sentinel"))
         );
+        assert!(report.proof_gate.passed);
+        assert!(
+            report
+                .proof_gate
+                .requirements
+                .iter()
+                .any(|requirement| requirement.name == "hf_gguf_resolved"
+                    && requirement.passed
+                    && requirement.evidence.contains("model.gguf"))
+        );
+        assert!(
+            report
+                .proof_gate
+                .requirements
+                .iter()
+                .any(|requirement| requirement.name == "runtime_generated"
+                    && requirement.passed
+                    && requirement.evidence.contains("ok"))
+        );
     }
 
     #[test]
@@ -3051,6 +3150,68 @@ mod tests {
                 .message
                 .as_deref()
                 .is_some_and(|message| message.contains("missed expected sentinel"))
+        );
+    }
+
+    #[test]
+    fn hf_model_proof_gate_reports_missing_downloaded_artifact() {
+        let model = crytex_core::services::ManagedModel {
+            id: "hf-tiny".into(),
+            name: "HF Tiny".into(),
+            repo: Some("owner/repo".into()),
+            filename: Some("model.gguf".into()),
+            local_path: None,
+            quantization: Some(crytex_core::services::Quantization::Q2K),
+            preferred_backend: BackendKind::MistralRs,
+            params_b: Some(1.1),
+            status: crytex_core::services::ModelStatus::Available,
+        };
+        let recommendation = crytex_core::services::RecommendedConfig {
+            backend: BackendKind::MistralRs,
+            quantization: crytex_core::services::Quantization::Q2K,
+            gpu_layers: Some(999),
+            context_size: 4096,
+        };
+        let runtime_probe = crytex_core::services::ModelRuntimeProbeReport {
+            trace_id: "trace-hf-proof".into(),
+            model_id: "hf-tiny".into(),
+            backend_id: Some("local-hf-proof".into()),
+            backend_capability: None,
+            compatibility: crytex_core::services::ModelCompatibilityPlan {
+                format: crytex_core::services::ModelFormat::Gguf,
+                features: vec![crytex_core::services::ModelFeature::Dense],
+                strategy: crytex_core::services::ExecutionStrategy::CudaFused,
+                status: crytex_core::services::CompatibilityStatus::Ready,
+                actions: vec!["use CudaFused execution strategy".into()],
+                warnings: Vec::new(),
+                blockers: Vec::new(),
+            },
+            stages: vec![crytex_core::services::ProbeStageReport {
+                name: crytex_core::services::ProbeStageName::Generation,
+                status: crytex_core::services::ProbeStageStatus::Passed,
+                message: "smoke generation matched expected sentinel CRYTEX_PROBE_OK".into(),
+                duration_ms: 42,
+            }],
+            generated_preview: Some("ok".into()),
+            passed: true,
+        };
+
+        let report = build_hf_model_proof_report(
+            "local-hf-proof".into(),
+            &model,
+            recommendation,
+            runtime_probe,
+        );
+
+        assert!(!report.proof_gate.passed);
+        assert!(
+            report
+                .proof_gate
+                .requirements
+                .iter()
+                .any(|requirement| requirement.name == "hf_model_downloaded"
+                    && !requirement.passed
+                    && requirement.evidence == "missing local model path")
         );
     }
 
