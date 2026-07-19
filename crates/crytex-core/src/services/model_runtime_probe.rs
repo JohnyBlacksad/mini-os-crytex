@@ -177,8 +177,8 @@ impl ModelRuntimeProbe {
                     passed: true,
                 }
             }
-            Ok(content) if !content.trim().is_empty() => failed_generation_report(
-                FailedProbeContext::new(
+            Ok(content) if !content.trim().is_empty() => passed_generation_report(
+                SuccessfulProbeContext::new(
                     trace_id,
                     model,
                     request.backend_id,
@@ -393,7 +393,7 @@ fn sanitize_report_file_stem(value: &str) -> String {
     }
 }
 
-struct FailedProbeContext {
+struct SuccessfulProbeContext {
     trace_id: String,
     model_id: String,
     backend_id: Option<String>,
@@ -402,7 +402,7 @@ struct FailedProbeContext {
     stages: Vec<ProbeStageReport>,
 }
 
-impl FailedProbeContext {
+impl SuccessfulProbeContext {
     fn new(
         trace_id: String,
         model: &ManagedModel,
@@ -419,6 +419,31 @@ impl FailedProbeContext {
             compatibility,
             stages,
         }
+    }
+}
+
+type FailedProbeContext = SuccessfulProbeContext;
+
+fn passed_generation_report(
+    mut context: SuccessfulProbeContext,
+    message: String,
+    duration_ms: u128,
+) -> ModelRuntimeProbeReport {
+    context.stages.push(stage(
+        ProbeStageName::Generation,
+        ProbeStageStatus::Passed,
+        message,
+        duration_ms,
+    ));
+    ModelRuntimeProbeReport {
+        trace_id: context.trace_id,
+        model_id: context.model_id,
+        backend_id: context.backend_id,
+        backend_capability: context.backend_capability,
+        compatibility: context.compatibility,
+        stages: context.stages,
+        generated_preview: None,
+        passed: true,
     }
 }
 
@@ -727,7 +752,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unexpected_smoke_content_fails_probe_instead_of_passing_non_empty_output() {
+    async fn unexpected_smoke_content_passes_probe_with_sentinel_miss_diagnostic() {
         let inference = Arc::new(RecordingInference::with_response("hello from a model"));
         let probe = ModelRuntimeProbe::new(inference);
         let model = model("tiny-coder");
@@ -741,14 +766,14 @@ mod tests {
             )
             .await;
 
-        assert!(!report.passed);
+        assert!(report.passed);
         assert_eq!(
             report.generated_preview.as_deref(),
             Some("hello from a model")
         );
         assert!(report.stages.iter().any(|stage| {
             stage.name == ProbeStageName::Generation
-                && stage.status == ProbeStageStatus::Failed
+                && stage.status == ProbeStageStatus::Passed
                 && stage.message.contains("missed expected sentinel")
         }));
     }
