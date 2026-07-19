@@ -219,10 +219,13 @@ impl ModelRuntimeProbe {
 }
 
 fn is_expected_smoke_response(content: &str) -> bool {
-    content
+    let normalized = content
         .trim()
         .trim_matches(|ch: char| ch == '"' || ch == '\'' || ch == '`')
-        .eq("CRYTEX_PROBE_OK")
+        .to_ascii_uppercase();
+    normalized
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+        .any(|token| token == "CRYTEX_PROBE_OK")
 }
 
 fn smoke_request(request: &ModelRuntimeProbeRequest) -> InferenceRequest {
@@ -528,6 +531,30 @@ mod tests {
         assert!(report.stages.iter().any(|stage| {
             stage.name == ProbeStageName::Generation && stage.status == ProbeStageStatus::Passed
         }));
+    }
+
+    #[tokio::test]
+    async fn wrapped_case_variant_sentinel_counts_as_successful_smoke_generation() {
+        let inference = Arc::new(RecordingInference::with_response(
+            "Certainly! Here is the exact CRYTEx_PROBE_OK response:",
+        ));
+        let probe = ModelRuntimeProbe::new(inference);
+        let model = model("tiny-coder");
+
+        let report = probe
+            .probe(
+                &model,
+                &cuda_device(),
+                &RuntimeFeatureSet::fully_enabled_cuda(),
+                ModelRuntimeProbeRequest::smoke("tiny-coder"),
+            )
+            .await;
+
+        assert!(report.passed);
+        assert!(report
+            .generated_preview
+            .as_deref()
+            .is_some_and(|preview| preview.contains("CRYTEx_PROBE_OK")));
     }
 
     #[tokio::test]
