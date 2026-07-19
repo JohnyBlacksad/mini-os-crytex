@@ -61,6 +61,7 @@ pub struct LoraBenchmarkRequest {
     pub base_model: String,
     pub challenger_metrics: serde_json::Value,
     pub validation_reward: f64,
+    pub training_fingerprints: Vec<String>,
 }
 
 /// Promotion decision returned by a LoRA benchmark gate.
@@ -379,6 +380,17 @@ impl LoraEvolutionServiceImpl {
         Ok(())
     }
 
+    fn is_golden_training_example(&self, example: &TrainingExample) -> bool {
+        example.reward >= self.validation_reward_threshold
+    }
+
+    fn training_fingerprints(examples: &[TrainingExample]) -> Vec<String> {
+        examples
+            .iter()
+            .map(|example| format!("{} {}", example.input_text, example.output_text))
+            .collect()
+    }
+
     async fn validate_adapter_artifact(
         &self,
         result: &LoraTrainingResult,
@@ -592,14 +604,29 @@ impl LoraEvolutionServiceImpl {
     ) -> Result<LoraAdapter, LoraEvolutionError> {
         examples.sort_by_key(|e| e.created_at);
         self.validate_training_examples(&examples, key)?;
+        let golden_examples = examples
+            .iter()
+            .filter(|example| self.is_golden_training_example(example))
+            .cloned()
+            .collect::<Vec<_>>();
+        if golden_examples.len() < self.threshold {
+            return Err(LoraEvolutionError::ValidationFailed(
+                key.to_string(),
+                format!(
+                    "golden dataset contains only {} usable examples below training threshold {}",
+                    golden_examples.len(),
+                    self.threshold
+                ),
+            ));
+        }
 
-        let validation_count = ((examples.len() as f64
+        let validation_count = ((golden_examples.len() as f64
             * LoraTrainingConfig::default().validation_ratio)
             .ceil() as usize)
             .max(1)
-            .min(examples.len().saturating_sub(1));
-        let split_index = examples.len() - validation_count;
-        let (train_examples, validation_examples) = examples.split_at(split_index);
+            .min(golden_examples.len().saturating_sub(1));
+        let split_index = golden_examples.len() - validation_count;
+        let (train_examples, validation_examples) = golden_examples.split_at(split_index);
 
         let job_id = Ulid::new().to_string();
         let job_repo = self.training_job_repo.clone();
@@ -751,6 +778,7 @@ impl LoraEvolutionServiceImpl {
                     base_model: self.base_model.clone(),
                     challenger_metrics: metrics.clone(),
                     validation_reward,
+                    training_fingerprints: Self::training_fingerprints(&examples),
                 })
                 .await?;
             let gate_metadata = serde_json::json!({
@@ -937,16 +965,22 @@ impl LoraEvolutionService for LoraEvolutionServiceImpl {
     async fn should_train(&self, task_kind: &str) -> Result<bool, LoraEvolutionError> {
         let count = self
             .training_example_repo
-            .count_training_examples_by_kind(task_kind)
-            .await?;
+            .list_training_examples_by_kind(task_kind)
+            .await?
+            .iter()
+            .filter(|example| self.is_golden_training_example(example))
+            .count();
         Ok(count >= self.threshold)
     }
 
     async fn should_train_for_role(&self, role: AgentRole) -> Result<bool, LoraEvolutionError> {
         let count = self
             .training_example_repo
-            .count_training_examples_by_role(role.as_str())
-            .await?;
+            .list_training_examples_by_role(role.as_str())
+            .await?
+            .iter()
+            .filter(|example| self.is_golden_training_example(example))
+            .count();
         Ok(count >= self.threshold)
     }
 
@@ -1588,6 +1622,33 @@ mod tests {
         }
     }
 
+    struct RecordingTrainer {
+        inner: MockTrainer,
+        trained_examples: Mutex<Vec<TrainingExample>>,
+    }
+
+    impl RecordingTrainer {
+        fn new(inner: MockTrainer) -> Self {
+            Self {
+                inner,
+                trained_examples: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LoraTrainer for RecordingTrainer {
+        async fn train(
+            &self,
+            examples: Vec<TrainingExample>,
+            config: LoraTrainingConfig,
+            output_dir: &Path,
+        ) -> Result<LoraTrainingResult, LoraTrainingError> {
+            *self.trained_examples.lock().unwrap() = examples.clone();
+            self.inner.train(examples, config, output_dir).await
+        }
+    }
+
     fn evolution_service(
         task: Task,
         examples: Vec<TrainingExample>,
@@ -1827,12 +1888,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validation_rejects_adapter_below_threshold() {
+    async fn validation_rejects_dataset_below_usable_golden_threshold() {
         let task = make_task("p1", "codegen", TaskStatus::Completed, Some(5.0));
-        // 3 examples: 2 train (reward 5.0), 1 validation (reward 1.0). Threshold 3.0.
+        // Low-reward rows are counter examples; they must not count as usable SFT targets.
         let examples = vec![
             example("codegen", 5.0, 0),
-            example("codegen", 5.0, 1),
+            example("codegen", 1.0, 1),
             example("codegen", 1.0, 2),
         ];
         let (service, _, _, _, _) = evolution_service(task, examples, vec![]);
@@ -2077,6 +2138,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn should_train_ignores_counter_examples_below_golden_threshold() {
+        let task = make_task("p1", "codegen", TaskStatus::Completed, Some(5.0));
+        let examples = vec![
+            example("codegen", 5.0, 0),
+            example("codegen", 0.0, 1),
+            example("codegen", 0.0, 2),
+        ];
+        let (service, _, _, _, _) = evolution_service(task, examples, vec![]);
+
+        assert!(!service.should_train("codegen").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn train_and_register_does_not_train_on_counter_examples_as_targets() {
+        let task = make_task("p1", "codegen", TaskStatus::Completed, Some(5.0));
+        let examples = vec![
+            example("codegen", 5.0, 0),
+            example("codegen", 5.0, 1),
+            TrainingExample {
+                input_text: "bad rejected input".into(),
+                output_text: "bad rejected output must not become target".into(),
+                reward: 0.0,
+                ..example("codegen", 0.0, 2)
+            },
+        ];
+        let trainer = Arc::new(RecordingTrainer::new(MockTrainer::new()));
+        let (service, _, _, _) = evolution_service_with_trainer(task, examples, trainer.clone());
+
+        service.train_and_register("codegen").await.unwrap();
+
+        let trained = trainer.trained_examples.lock().unwrap().clone();
+        assert_eq!(trained.len(), 1);
+        assert!(trained.iter().all(|example| example.reward >= 3.0));
+        assert!(
+            !trained
+                .iter()
+                .any(|example| example.output_text.contains("bad rejected output"))
+        );
+    }
+
+    #[tokio::test]
     async fn golden_example_is_written_to_experience_repository() {
         let task = make_task("p1", "codegen", TaskStatus::Completed, Some(5.0));
         let (service, _, _, _, _) = evolution_service(task, vec![], vec![]);
@@ -2280,6 +2382,13 @@ mod tests {
         );
         assert_eq!(requests[0].challenger_adapter_id, "codegen-v2");
         assert_eq!(requests[0].base_model, "mistral-7b");
+        assert_eq!(requests[0].training_fingerprints.len(), 3);
+        assert!(
+            requests[0]
+                .training_fingerprints
+                .iter()
+                .any(|fingerprint| fingerprint.contains("input") && fingerprint.contains("output"))
+        );
         assert!(requests[0].challenger_adapter_path.ends_with("adapter"));
         assert!(
             requests[0]

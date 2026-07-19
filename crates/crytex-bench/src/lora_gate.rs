@@ -7,6 +7,7 @@ use crytex_core::services::{
 };
 
 use crate::ab_test::{ABTest, ABWinner};
+use crate::golden_set::GoldenSet;
 use crate::harness::{BenchmarkHarness, BenchmarkRunRequest};
 use crate::models::BenchmarkVariant;
 use crate::repository::BenchmarkResultRepository;
@@ -26,6 +27,7 @@ pub struct BenchLoraBenchmarkGate {
     significance_level: f64,
     min_delta_pass_rate: f64,
     project_id: Option<String>,
+    leakage_similarity_threshold: f64,
 }
 
 impl BenchLoraBenchmarkGate {
@@ -58,6 +60,7 @@ impl BenchLoraBenchmarkGate {
             significance_level: 0.05,
             min_delta_pass_rate: 0.0,
             project_id: None,
+            leakage_similarity_threshold: 0.8,
         }
     }
 
@@ -78,6 +81,11 @@ impl BenchLoraBenchmarkGate {
 
     pub fn with_project_id(mut self, project_id: impl Into<String>) -> Self {
         self.project_id = Some(project_id.into());
+        self
+    }
+
+    pub fn with_leakage_similarity_threshold(mut self, threshold: f64) -> Self {
+        self.leakage_similarity_threshold = threshold;
         self
     }
 
@@ -116,6 +124,38 @@ impl LoraBenchmarkGate for BenchLoraBenchmarkGate {
         &self,
         request: LoraBenchmarkRequest,
     ) -> Result<LoraBenchmarkDecision, LoraEvolutionError> {
+        let cases = GoldenSet::load_validated(&self.golden_set_path)
+            .await
+            .map_err(|e| {
+                LoraEvolutionError::ValidationFailed(
+                    request.task_kind.clone(),
+                    format!("LoRA held-out benchmark is invalid: {e}"),
+                )
+            })?;
+        let training_texts = request
+            .training_fingerprints
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        if let Err(error) = GoldenSet::validate_no_training_leakage(
+            &cases,
+            &training_texts,
+            self.leakage_similarity_threshold,
+        ) {
+            return Ok(LoraBenchmarkDecision {
+                accepted: false,
+                reason: format!("held-out benchmark leakage check failed: {error}"),
+                metadata: serde_json::json!({
+                    "leakage_check": {
+                        "passed": false,
+                        "training_fingerprint_count": request.training_fingerprints.len(),
+                        "similarity_threshold": self.leakage_similarity_threshold,
+                        "error": error.to_string()
+                    }
+                }),
+            });
+        }
+
         let baseline_run_id = self
             .run_variant(
                 &request.task_kind,
@@ -166,6 +206,11 @@ impl LoraBenchmarkGate for BenchLoraBenchmarkGate {
         );
 
         let metadata = serde_json::json!({
+            "leakage_check": {
+                "passed": true,
+                "training_fingerprint_count": request.training_fingerprints.len(),
+                "similarity_threshold": self.leakage_similarity_threshold
+            },
             "baseline_run_id": baseline_run_id,
             "challenger_run_id": challenger_run_id,
             "winner": format!("{:?}", report.winner),
@@ -686,8 +731,25 @@ mod tests {
             output_dir: &Path,
         ) -> Result<LoraTrainingResult, LoraTrainingError> {
             tokio::fs::create_dir_all(output_dir).await?;
-            let adapter_path = output_dir.join("candidate.safetensors");
-            tokio::fs::write(&adapter_path, b"deterministic adapter").await?;
+            let adapter_path = output_dir.join("candidate");
+            tokio::fs::create_dir_all(&adapter_path).await?;
+            tokio::fs::write(
+                adapter_path.join("adapter_config.json"),
+                serde_json::json!({
+                    "peft_type": "LORA",
+                    "base_model_name_or_path": "mistral-7b",
+                    "r": 8,
+                    "lora_alpha": 16,
+                    "target_modules": ["q_proj", "v_proj"]
+                })
+                .to_string(),
+            )
+            .await?;
+            tokio::fs::write(
+                adapter_path.join("adapter_model.safetensors"),
+                b"deterministic adapter",
+            )
+            .await?;
             let average_reward =
                 examples.iter().map(|example| example.reward).sum::<f64>() / examples.len() as f64;
             Ok(LoraTrainingResult {
@@ -777,6 +839,21 @@ mod tests {
         dir
     }
 
+    async fn leaked_golden_set() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let line = serde_json::json!({
+            "id": "leaked-heldout",
+            "input": { "prompt": "Implement deterministic parser branch from training corpus" },
+            "expected": { "answer": "Parser branch implementation copied from training corpus" },
+            "tags": ["heldout", "lora"]
+        })
+        .to_string();
+        tokio::fs::write(dir.path().join("golden.jsonl"), line)
+            .await
+            .unwrap();
+        dir
+    }
+
     #[tokio::test]
     async fn gate_accepts_challenger_that_wins_ab_benchmark() {
         let dir = golden_set().await;
@@ -806,6 +883,7 @@ mod tests {
                 base_model: "mistral-7b".into(),
                 challenger_metrics: serde_json::json!({}),
                 validation_reward: 5.0,
+                training_fingerprints: vec![],
             })
             .await
             .unwrap();
@@ -846,6 +924,7 @@ mod tests {
                 base_model: "mistral-7b".into(),
                 challenger_metrics: serde_json::json!({}),
                 validation_reward: 5.0,
+                training_fingerprints: vec![],
             })
             .await
             .unwrap();
@@ -889,6 +968,7 @@ mod tests {
                 base_model: "mistral-7b".into(),
                 challenger_metrics: serde_json::json!({}),
                 validation_reward: 5.0,
+                training_fingerprints: vec![],
             })
             .await
             .unwrap();
@@ -898,6 +978,45 @@ mod tests {
             requested_kinds.lock().unwrap().as_slice(),
             ["architecture", "architecture"]
         );
+    }
+
+    #[tokio::test]
+    async fn gate_rejects_held_out_benchmark_that_leaks_training_corpus() {
+        let dir = leaked_golden_set().await;
+        let repo: Arc<dyn BenchmarkResultRepository> =
+            Arc::new(MemoryBenchmarkResultRepository::new());
+        let event_service: Arc<dyn EventService> =
+            Arc::new(EventServiceImpl::new(Arc::new(EventBus::new())));
+        let harness: Arc<dyn BenchmarkHarness> =
+            Arc::new(DefaultBenchmarkHarness::new(repo.clone(), event_service));
+        let gate = BenchLoraBenchmarkGate::new(
+            harness,
+            repo,
+            dir.path().join("golden.jsonl"),
+            Arc::new(LoraSensitiveRunner),
+            Arc::new(ExactMatchScorer),
+        );
+
+        let decision = gate
+            .evaluate(LoraBenchmarkRequest {
+                task_kind: "codegen".into(),
+                agent_role: Some("coder".into()),
+                baseline_adapter_id: None,
+                challenger_adapter_id: "candidate-lora".into(),
+                challenger_adapter_path: dir.path().join("candidate.safetensors"),
+                base_model: "mistral-7b".into(),
+                challenger_metrics: serde_json::json!({}),
+                validation_reward: 5.0,
+                training_fingerprints: vec![
+                    "Implement deterministic parser branch from training corpus Parser branch implementation copied from training corpus".into(),
+                ],
+            })
+            .await
+            .unwrap();
+
+        assert!(!decision.accepted);
+        assert!(decision.reason.contains("leakage"));
+        assert_eq!(decision.metadata["leakage_check"]["passed"], false);
     }
 
     #[tokio::test]
