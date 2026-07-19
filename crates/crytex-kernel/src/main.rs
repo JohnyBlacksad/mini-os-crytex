@@ -173,6 +173,22 @@ enum Commands {
         #[arg(long)]
         report_path: Option<PathBuf>,
     },
+    /// Prove multiple HuggingFace GGUF models as one matrix JSON artifact
+    ProveHfRuntimeMatrix {
+        /// Repeatable spec: id=repo,quantization=Q2_K,params_b=1.1,filename=file.gguf,name=Label
+        #[arg(short, long)]
+        model: Vec<String>,
+        #[arg(long, default_value = "local-hf-proof")]
+        backend_id_prefix: String,
+        #[arg(long)]
+        trace_id: Option<String>,
+        #[arg(long, default_value = "16")]
+        max_tokens: usize,
+        #[arg(long, default_value = "120")]
+        timeout_seconds: u64,
+        #[arg(long)]
+        report_path: Option<PathBuf>,
+    },
     /// Add or update a managed HuggingFace/local model entry
     AddModel {
         #[arg(short, long)]
@@ -554,6 +570,212 @@ struct HfProofRequirement {
     name: String,
     passed: bool,
     evidence: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct HfProofModelSpec {
+    id: String,
+    name: Option<String>,
+    repo: String,
+    filename: Option<String>,
+    quantization: Option<String>,
+    params_b: Option<f32>,
+}
+
+#[derive(Debug, Serialize)]
+struct HfProofMatrixEntryReport {
+    label: String,
+    model_id: String,
+    repo: String,
+    report: Option<HfModelProofReport>,
+    error: Option<String>,
+    passed: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct HfProofMatrixReport {
+    trace_id: String,
+    build_profile: String,
+    entries: Vec<HfProofMatrixEntryReport>,
+    passed: bool,
+}
+
+fn parse_hf_proof_model_spec(value: &str) -> Result<HfProofModelSpec, String> {
+    let mut segments = value
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty());
+    let head = segments
+        .next()
+        .ok_or_else(|| "HF matrix model spec cannot be empty".to_string())?;
+    let (id, repo) = head
+        .split_once('=')
+        .ok_or_else(|| "HF matrix model spec must start with id=repo".to_string())?;
+    let mut spec = HfProofModelSpec {
+        id: required_spec_field("id", id)?,
+        name: None,
+        repo: required_spec_field("repo", repo)?,
+        filename: None,
+        quantization: None,
+        params_b: None,
+    };
+
+    for segment in segments {
+        let (key, raw_value) = segment
+            .split_once('=')
+            .ok_or_else(|| format!("HF matrix spec option must be key=value: {segment}"))?;
+        let parsed_value = required_spec_field(key, raw_value)?;
+        match key {
+            "name" => spec.name = Some(parsed_value),
+            "filename" => spec.filename = Some(parsed_value),
+            "quantization" => spec.quantization = Some(parsed_value),
+            "params_b" => {
+                spec.params_b =
+                    Some(parsed_value.parse::<f32>().map_err(|error| {
+                        format!("Invalid params_b value {parsed_value}: {error}")
+                    })?);
+            }
+            _ => return Err(format!("Unsupported HF matrix spec option: {key}")),
+        }
+    }
+
+    Ok(spec)
+}
+
+fn required_spec_field(name: &str, value: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Err(format!("HF matrix spec {name} cannot be empty"))
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
+fn sanitize_hf_backend_id_part(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    if sanitized.is_empty() {
+        "model".into()
+    } else {
+        sanitized
+    }
+}
+
+fn build_hf_proof_matrix_report(
+    trace_id: Option<String>,
+    entries: Vec<HfProofMatrixEntryReport>,
+) -> HfProofMatrixReport {
+    let passed = entries.iter().all(|entry| entry.passed);
+    HfProofMatrixReport {
+        trace_id: trace_id.unwrap_or_else(|| Ulid::new().to_string()),
+        build_profile: build_profile().to_string(),
+        entries,
+        passed,
+    }
+}
+
+async fn run_hf_model_proof(
+    config: &CrytexConfig,
+    model_manager: &ModelManagerImpl,
+    spec: HfProofModelSpec,
+    backend_id: &str,
+    trace_id: Option<String>,
+    max_tokens: usize,
+    timeout_seconds: u64,
+) -> Result<HfModelProofReport, String> {
+    let preferred_quantization = spec
+        .quantization
+        .as_deref()
+        .map(str::parse::<Quantization>)
+        .transpose()
+        .map_err(|error| format!("Failed to parse quantization: {error}"))?;
+    let resolved_gguf = if spec.filename.is_none() {
+        Some(
+            model_manager
+                .resolve_hf_gguf(HfGgufResolveRequest {
+                    repo: spec.repo.clone(),
+                    preferred_quantization,
+                    params_b: spec.params_b,
+                })
+                .await
+                .map_err(|error| format!("Failed to resolve HF GGUF: {error}"))?,
+        )
+    } else {
+        None
+    };
+    let entry = build_hf_proof_manifest_entry(
+        spec.id.clone(),
+        spec.name.clone().or_else(|| Some(spec.id.clone())),
+        spec.repo.clone(),
+        spec.filename.clone(),
+        spec.quantization.clone(),
+        spec.params_b,
+        resolved_gguf.as_ref(),
+    )
+    .map_err(|error| format!("Failed to build HF model manifest entry: {error}"))?;
+    model_manager
+        .add_model(entry)
+        .map_err(|error| format!("Failed to add HF model: {error}"))?;
+    let model = model_manager
+        .download_model(&spec.id)
+        .await
+        .map_err(|error| format!("Failed to download HF model: {error}"))?;
+    let recommendation = model_manager
+        .recommend_config(&spec.id)
+        .map_err(|error| format!("Failed to recommend HF runtime config: {error}"))?;
+    let backend_config = build_downloaded_model_backend_config(backend_id, &model, &recommendation)
+        .map_err(|error| format!("Failed to build HF backend config: {error}"))?;
+    let mut active_config = config.clone();
+    active_config
+        .inference
+        .backends
+        .retain(|backend| backend.id != backend_config.id);
+    active_config.inference.default_backend = Some(backend_config.id.clone());
+    active_config.inference.backends.push(backend_config);
+    active_config
+        .save()
+        .map_err(|error| format!("Failed to save activated HF backend config: {error}"))?;
+    let inference = create_inference_service(&active_config)
+        .map_err(|error| format!("Failed to create inference service for HF proof: {error}"))?;
+    let detector = SystemHardwareDetector::new();
+    let device = crytex_core::services::HardwareDetector::detect(&detector);
+    let runtime = RuntimeFeatureSet::from_device(&device);
+    let model_name = model
+        .local_path
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| spec.id.clone());
+    let runtime_probe = ModelRuntimeProbe::new(inference)
+        .probe(
+            &model,
+            &device,
+            &runtime,
+            ModelRuntimeProbeRequest {
+                backend_id: Some(backend_id.to_string()),
+                model_name,
+                trace_id,
+                max_tokens,
+                timeout_seconds: Some(timeout_seconds),
+                lora_adapter_id: None,
+            },
+        )
+        .await;
+    Ok(build_hf_model_proof_report(
+        backend_id.to_string(),
+        &model,
+        recommendation,
+        runtime_probe,
+    ))
 }
 
 fn build_hf_model_proof_report(
@@ -1184,102 +1406,27 @@ async fn main() {
             event_service,
             Arc::new(SystemHardwareDetector::new()),
         );
-        let preferred_quantization = quantization
-            .as_deref()
-            .map(str::parse::<Quantization>)
-            .transpose()
-            .unwrap_or_else(|e| {
-                eprintln!("Failed to parse quantization: {}", e);
-                std::process::exit(1);
-            });
-        let resolved_gguf = if filename.is_none() {
-            Some(
-                model_manager
-                    .resolve_hf_gguf(HfGgufResolveRequest {
-                        repo: repo.clone(),
-                        preferred_quantization,
-                        params_b: *params_b,
-                    })
-                    .await
-                    .unwrap_or_else(|e| {
-                        eprintln!("Failed to resolve HF GGUF: {}", e);
-                        std::process::exit(1);
-                    }),
-            )
-        } else {
-            None
-        };
-        let entry = build_hf_proof_manifest_entry(
-            id.clone(),
-            name.clone().or_else(|| Some(id.clone())),
-            repo.clone(),
-            filename.clone(),
-            quantization.clone(),
-            *params_b,
-            resolved_gguf.as_ref(),
+        let report = run_hf_model_proof(
+            &config,
+            &model_manager,
+            HfProofModelSpec {
+                id: id.clone(),
+                name: name.clone(),
+                repo: repo.clone(),
+                filename: filename.clone(),
+                quantization: quantization.clone(),
+                params_b: *params_b,
+            },
+            backend_id,
+            trace_id.clone(),
+            *max_tokens,
+            *timeout_seconds,
         )
-        .unwrap_or_else(|e| {
-            eprintln!("Failed to build HF model manifest entry: {}", e);
+        .await
+        .unwrap_or_else(|error| {
+            eprintln!("{error}");
             std::process::exit(1);
         });
-        let _model = model_manager.add_model(entry).unwrap_or_else(|e| {
-            eprintln!("Failed to add HF model: {}", e);
-            std::process::exit(1);
-        });
-        let model = model_manager.download_model(id).await.unwrap_or_else(|e| {
-            eprintln!("Failed to download HF model: {}", e);
-            std::process::exit(1);
-        });
-        let recommendation = model_manager.recommend_config(id).unwrap_or_else(|e| {
-            eprintln!("Failed to recommend HF runtime config: {}", e);
-            std::process::exit(1);
-        });
-        let backend_config =
-            build_downloaded_model_backend_config(backend_id, &model, &recommendation)
-                .unwrap_or_else(|e| {
-                    eprintln!("Failed to build HF backend config: {}", e);
-                    std::process::exit(1);
-                });
-        let mut active_config = config.clone();
-        active_config
-            .inference
-            .backends
-            .retain(|backend| backend.id != backend_config.id);
-        active_config.inference.default_backend = Some(backend_config.id.clone());
-        active_config.inference.backends.push(backend_config);
-        if let Err(e) = active_config.save() {
-            eprintln!("Failed to save activated HF backend config: {}", e);
-            std::process::exit(1);
-        }
-        let inference = create_inference_service(&active_config).unwrap_or_else(|e| {
-            eprintln!("Failed to create inference service for HF proof: {}", e);
-            std::process::exit(1);
-        });
-        let detector = SystemHardwareDetector::new();
-        let device = crytex_core::services::HardwareDetector::detect(&detector);
-        let runtime = RuntimeFeatureSet::from_device(&device);
-        let model_name = model
-            .local_path
-            .as_ref()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| id.clone());
-        let runtime_probe = ModelRuntimeProbe::new(inference)
-            .probe(
-                &model,
-                &device,
-                &runtime,
-                ModelRuntimeProbeRequest {
-                    backend_id: Some(backend_id.clone()),
-                    model_name,
-                    trace_id: trace_id.clone(),
-                    max_tokens: *max_tokens,
-                    timeout_seconds: Some(*timeout_seconds),
-                    lora_adapter_id: None,
-                },
-            )
-            .await;
-        let report =
-            build_hf_model_proof_report(backend_id.clone(), &model, recommendation, runtime_probe);
         let json = unwrap_or_exit!(
             serde_json::to_string_pretty(&report),
             "Failed to serialize HF proof report"
@@ -1293,6 +1440,105 @@ async fn main() {
             }
             if let Err(e) = std::fs::write(path, &json) {
                 eprintln!("Failed to write HF proof report: {}", e);
+                std::process::exit(1);
+            }
+        }
+        println!("{}", json);
+        if !report.passed {
+            std::process::exit(2);
+        }
+        return;
+    }
+
+    if let Commands::ProveHfRuntimeMatrix {
+        model,
+        backend_id_prefix,
+        trace_id,
+        max_tokens,
+        timeout_seconds,
+        report_path,
+    } = &cli.command
+    {
+        if model.is_empty() {
+            eprintln!("At least one --model spec is required");
+            std::process::exit(1);
+        }
+        let specs = model
+            .iter()
+            .map(|value| parse_hf_proof_model_spec(value))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_or_else(|error| {
+                eprintln!("{error}");
+                std::process::exit(1);
+            });
+        let event_bus = Arc::new(crytex_core::EventBus::new());
+        let event_service = Arc::new(EventServiceImpl::new(event_bus));
+        let config_dir = CrytexConfig::config_path()
+            .parent()
+            .expect("config path must have a parent")
+            .to_path_buf();
+        let model_manager = ModelManagerImpl::new_standard(
+            &config_dir,
+            &config.paths.data_dir,
+            event_service,
+            Arc::new(SystemHardwareDetector::new()),
+        );
+        let mut entries = Vec::new();
+        for spec in specs {
+            let backend_id = format!(
+                "{}-{}",
+                backend_id_prefix,
+                sanitize_hf_backend_id_part(&spec.id)
+            );
+            let entry_trace_id = trace_id
+                .as_ref()
+                .map(|trace_id| format!("{trace_id}:{}", spec.id));
+            let label = spec.id.clone();
+            let model_id = spec.id.clone();
+            let repo = spec.repo.clone();
+            let result = run_hf_model_proof(
+                &config,
+                &model_manager,
+                spec,
+                &backend_id,
+                entry_trace_id,
+                *max_tokens,
+                *timeout_seconds,
+            )
+            .await;
+            entries.push(match result {
+                Ok(report) => HfProofMatrixEntryReport {
+                    label,
+                    model_id,
+                    repo,
+                    passed: report.passed && report.proof_gate.passed,
+                    report: Some(report),
+                    error: None,
+                },
+                Err(error) => HfProofMatrixEntryReport {
+                    label,
+                    model_id,
+                    repo,
+                    report: None,
+                    error: Some(error),
+                    passed: false,
+                },
+            });
+        }
+        let report = build_hf_proof_matrix_report(trace_id.clone(), entries);
+        let json = unwrap_or_exit!(
+            serde_json::to_string_pretty(&report),
+            "Failed to serialize HF proof matrix report"
+        );
+        if let Some(path) = report_path {
+            if let Some(parent) = path.parent()
+                && let Err(e) = std::fs::create_dir_all(parent)
+            {
+                eprintln!("Failed to create HF proof matrix report directory: {}", e);
+                std::process::exit(1);
+            }
+            if let Err(e) = std::fs::write(path, &json) {
+                eprintln!("Failed to write HF proof matrix report: {}", e);
                 std::process::exit(1);
             }
         }
@@ -2389,6 +2635,9 @@ async fn main() {
         Commands::ProveHfModel { .. } => {
             unreachable!("prove-hf-model is handled before AppContext initialization")
         }
+        Commands::ProveHfRuntimeMatrix { .. } => {
+            unreachable!("prove-hf-runtime-matrix is handled before AppContext initialization")
+        }
         Commands::ShowModel { id } => {
             let model = model_manager.get_model(&id).unwrap_or_else(|e| {
                 eprintln!("Failed to get model: {}", e);
@@ -3213,6 +3462,57 @@ mod tests {
                     && !requirement.passed
                     && requirement.evidence == "missing local model path")
         );
+    }
+
+    #[test]
+    fn hf_proof_matrix_model_spec_parses_required_and_optional_fields() {
+        let spec = parse_hf_proof_model_spec(
+            "tiny=TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF,quantization=Q2_K,params_b=1.1,filename=tiny.Q2_K.gguf,name=Tiny",
+        )
+        .unwrap();
+
+        assert_eq!(spec.id, "tiny");
+        assert_eq!(spec.repo, "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF");
+        assert_eq!(spec.quantization.as_deref(), Some("Q2_K"));
+        assert_eq!(spec.params_b, Some(1.1));
+        assert_eq!(spec.filename.as_deref(), Some("tiny.Q2_K.gguf"));
+        assert_eq!(spec.name.as_deref(), Some("Tiny"));
+    }
+
+    #[test]
+    fn hf_proof_matrix_model_spec_rejects_missing_repo() {
+        let error = parse_hf_proof_model_spec("tiny=,quantization=Q2_K").unwrap_err();
+
+        assert!(error.contains("repo"));
+    }
+
+    #[test]
+    fn hf_proof_matrix_report_fails_when_any_entry_fails() {
+        let entries = vec![
+            HfProofMatrixEntryReport {
+                label: "tiny-q2".into(),
+                model_id: "tiny-q2".into(),
+                repo: "owner/tiny".into(),
+                report: None,
+                error: None,
+                passed: true,
+            },
+            HfProofMatrixEntryReport {
+                label: "tiny-q4".into(),
+                model_id: "tiny-q4".into(),
+                repo: "owner/tiny".into(),
+                report: None,
+                error: Some("runtime timeout".into()),
+                passed: false,
+            },
+        ];
+
+        let report = build_hf_proof_matrix_report(Some("trace-matrix".into()), entries);
+
+        assert_eq!(report.trace_id, "trace-matrix");
+        assert!(!report.passed);
+        assert_eq!(report.entries.len(), 2);
+        assert_eq!(report.entries[1].error.as_deref(), Some("runtime timeout"));
     }
 
     #[test]
