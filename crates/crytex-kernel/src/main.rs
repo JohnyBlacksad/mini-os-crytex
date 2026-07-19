@@ -480,8 +480,17 @@ struct HfModelProofReport {
     local_path: Option<String>,
     backend_id: String,
     recommendation: crytex_core::services::RecommendedConfig,
+    runtime_placement: HfRuntimePlacementProof,
     runtime_probe: crytex_core::services::ModelRuntimeProbeReport,
     passed: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct HfRuntimePlacementProof {
+    kind: String,
+    gpu_layers: Option<usize>,
+    compatibility_strategy: String,
+    evidence: String,
 }
 
 fn build_hf_model_proof_report(
@@ -490,6 +499,7 @@ fn build_hf_model_proof_report(
     recommendation: crytex_core::services::RecommendedConfig,
     runtime_probe: crytex_core::services::ModelRuntimeProbeReport,
 ) -> HfModelProofReport {
+    let runtime_placement = build_hf_runtime_placement_proof(&recommendation, &runtime_probe);
     HfModelProofReport {
         trace_id: runtime_probe.trace_id.clone(),
         model_id: model.id.clone(),
@@ -501,8 +511,50 @@ fn build_hf_model_proof_report(
             .map(|path| path.display().to_string()),
         backend_id,
         recommendation,
+        runtime_placement,
         passed: runtime_probe.passed,
         runtime_probe,
+    }
+}
+
+fn build_hf_runtime_placement_proof(
+    recommendation: &crytex_core::services::RecommendedConfig,
+    runtime_probe: &crytex_core::services::ModelRuntimeProbeReport,
+) -> HfRuntimePlacementProof {
+    let strategy = format!("{:?}", runtime_probe.compatibility.strategy);
+    let (kind, evidence) = match (
+        recommendation.backend,
+        recommendation.gpu_layers,
+        runtime_probe.compatibility.strategy,
+    ) {
+        (
+            BackendKind::MistralRs,
+            None,
+            crytex_core::services::ExecutionStrategy::CudaFused
+            | crytex_core::services::ExecutionStrategy::CudaWithFallback,
+        ) => (
+            "cuda_auto_device_mapping",
+            "mistral.rs selected a CUDA execution strategy; gpu_layers=None means automatic device mapping",
+        ),
+        (BackendKind::MistralRs, Some(0), _) => (
+            "cpu",
+            "gpu_layers=0 explicitly selects CPU execution for the local GGUF backend",
+        ),
+        (BackendKind::MistralRs, Some(_), _) => (
+            "manual_gpu_layers",
+            "gpu_layers is explicitly pinned for the local GGUF backend",
+        ),
+        _ => (
+            "backend_default",
+            "runtime placement is delegated to the selected backend",
+        ),
+    };
+
+    HfRuntimePlacementProof {
+        kind: kind.into(),
+        gpu_layers: recommendation.gpu_layers,
+        compatibility_strategy: strategy,
+        evidence: evidence.into(),
     }
 }
 
@@ -2718,5 +2770,56 @@ mod tests {
             report.runtime_probe.generated_preview.as_deref(),
             Some("ok")
         );
+    }
+
+    #[test]
+    fn hf_runtime_placement_marks_mistral_cuda_none_gpu_layers_as_auto_mapping() {
+        let model = crytex_core::services::ManagedModel {
+            id: "hf-tiny".into(),
+            name: "HF Tiny".into(),
+            repo: Some("owner/repo".into()),
+            filename: Some("model.gguf".into()),
+            local_path: Some(PathBuf::from("B:/crytex-data/models/tiny/model.gguf")),
+            quantization: Some(crytex_core::services::Quantization::Q2K),
+            preferred_backend: BackendKind::MistralRs,
+            params_b: Some(1.1),
+            status: crytex_core::services::ModelStatus::Downloaded,
+        };
+        let recommendation = crytex_core::services::RecommendedConfig {
+            backend: BackendKind::MistralRs,
+            quantization: crytex_core::services::Quantization::Q2K,
+            gpu_layers: None,
+            context_size: 4096,
+        };
+        let runtime_probe = crytex_core::services::ModelRuntimeProbeReport {
+            trace_id: "trace-hf-proof".into(),
+            model_id: "hf-tiny".into(),
+            backend_id: Some("local-hf-proof".into()),
+            backend_capability: None,
+            compatibility: crytex_core::services::ModelCompatibilityPlan {
+                format: crytex_core::services::ModelFormat::Gguf,
+                features: vec![crytex_core::services::ModelFeature::Dense],
+                strategy: crytex_core::services::ExecutionStrategy::CudaFused,
+                status: crytex_core::services::CompatibilityStatus::Ready,
+                actions: vec!["use CudaFused execution strategy".into()],
+                warnings: Vec::new(),
+                blockers: Vec::new(),
+            },
+            stages: Vec::new(),
+            generated_preview: Some("ok".into()),
+            passed: true,
+        };
+
+        let report = build_hf_model_proof_report(
+            "local-hf-proof".into(),
+            &model,
+            recommendation,
+            runtime_probe,
+        );
+
+        assert_eq!(report.runtime_placement.kind, "cuda_auto_device_mapping");
+        assert_eq!(report.runtime_placement.gpu_layers, None);
+        assert_eq!(report.runtime_placement.compatibility_strategy, "CudaFused");
+        assert!(report.runtime_placement.evidence.contains("automatic device mapping"));
     }
 }

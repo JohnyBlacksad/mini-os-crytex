@@ -591,10 +591,12 @@ impl ModelRecommender for HardwareModelRecommender {
                     Quantization::Q2K,
                 ];
 
-                let quantization = candidates
-                    .into_iter()
-                    .find(|q| Self::approximate_size_gib(model, *q) <= usable_gib)
-                    .unwrap_or(Quantization::Q4KM);
+                let quantization = model.quantization.unwrap_or_else(|| {
+                    candidates
+                        .into_iter()
+                        .find(|q| Self::approximate_size_gib(model, *q) <= usable_gib)
+                        .unwrap_or(Quantization::Q4KM)
+                });
 
                 let context_size = if vram_mb >= 24_000 { 8192 } else { 4096 };
 
@@ -1094,6 +1096,36 @@ mod tests {
         assert_eq!(cfg.quantization, Quantization::FP16);
         assert_eq!(cfg.gpu_layers, None);
         assert_eq!(cfg.context_size, 8192);
+    }
+
+    #[test]
+    fn recommend_config_preserves_explicit_gguf_quantization_on_cuda() {
+        let manifest = Manifest {
+            models: vec![ManifestEntry {
+                id: Some("tinyllama-q2".into()),
+                name: Some("TinyLlama Q2".into()),
+                repo: Some("TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF".into()),
+                filename: Some("tinyllama-1.1b-chat-v1.0.Q2_K.gguf".into()),
+                quantization: Some("Q2_K".into()),
+                backend: Some("mistral_rs".into()),
+                params_b: Some(1.1),
+            }],
+        };
+        let (mgr, _) = manager_with(
+            manifest,
+            Registry::default(),
+            DeviceKind::Cuda {
+                name: "RTX 5080".into(),
+                vram_mb: 16_000,
+                driver_version: "581".into(),
+            },
+        );
+
+        let cfg = mgr.recommend_config("tinyllama-q2").unwrap();
+
+        assert_eq!(cfg.quantization, Quantization::Q2K);
+        assert_eq!(cfg.gpu_layers, None);
+        assert_eq!(cfg.context_size, 4096);
     }
 
     #[test]
