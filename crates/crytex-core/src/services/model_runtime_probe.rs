@@ -2,10 +2,10 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use std::{fs, io};
 
-use crytex_inference::{BackendCapabilityReport, InferenceRequest, Message};
+use crytex_inference::{BackendCapabilityReport, InferenceError, InferenceRequest, Message};
 use serde::{Deserialize, Serialize};
 
 use crate::services::hardware::DeviceKind;
@@ -58,6 +58,7 @@ pub struct ModelRuntimeProbeRequest {
     pub model_name: String,
     pub trace_id: Option<String>,
     pub max_tokens: usize,
+    pub timeout_seconds: Option<u64>,
     pub lora_adapter_id: Option<String>,
 }
 
@@ -68,6 +69,7 @@ impl ModelRuntimeProbeRequest {
             model_name: model_name.into(),
             trace_id: None,
             max_tokens: 16,
+            timeout_seconds: None,
             lora_adapter_id: None,
         }
     }
@@ -140,11 +142,19 @@ impl ModelRuntimeProbe {
         ));
 
         let started = Instant::now();
-        let generation = self
-            .inference
-            .generate(smoke_request(&request))
-            .await
-            .map(|response| response.content);
+        let generate = self.inference.generate(smoke_request(&request));
+        let generation = match request.timeout_seconds {
+            Some(seconds) => tokio::time::timeout(Duration::from_secs(seconds), generate)
+                .await
+                .map_err(|_| {
+                    InferenceServiceError::Inference(InferenceError::GenerationFailed(format!(
+                        "generation timed out after {seconds}s"
+                    )))
+                })
+                .and_then(|result| result)
+                .map(|response| response.content),
+            None => generate.await.map(|response| response.content),
+        };
         let duration_ms = started.elapsed().as_millis();
 
         match generation {
@@ -308,6 +318,7 @@ impl ModelRuntimeMatrixProbe {
                         model_name: entry.model_name,
                         trace_id: Some(format!("{trace_id}:{}", entry.label)),
                         max_tokens: entry.max_tokens,
+                        timeout_seconds: None,
                         lora_adapter_id: entry.lora_adapter_id.clone(),
                     },
                 )
@@ -482,6 +493,7 @@ mod tests {
                     model_name: "tiny-random/qwen3-next-moe".into(),
                     trace_id: Some("trace-probe".into()),
                     max_tokens: 8,
+                    timeout_seconds: None,
                     lora_adapter_id: None,
                 },
             )
@@ -516,6 +528,7 @@ mod tests {
                     model_name: "tiny-random/qwen3-next-moe".into(),
                     trace_id: Some("trace-ok".into()),
                     max_tokens: 128,
+                    timeout_seconds: None,
                     lora_adapter_id: None,
                 },
             )
@@ -551,10 +564,12 @@ mod tests {
             .await;
 
         assert!(report.passed);
-        assert!(report
-            .generated_preview
-            .as_deref()
-            .is_some_and(|preview| preview.contains("CRYTEx_PROBE_OK")));
+        assert!(
+            report
+                .generated_preview
+                .as_deref()
+                .is_some_and(|preview| preview.contains("CRYTEx_PROBE_OK"))
+        );
     }
 
     #[tokio::test]
@@ -573,6 +588,7 @@ mod tests {
                     model_name: "tiny-coder".into(),
                     trace_id: Some("trace-lora".into()),
                     max_tokens: 16,
+                    timeout_seconds: None,
                     lora_adapter_id: Some("coder-lora-v1".into()),
                 },
             )
@@ -581,7 +597,40 @@ mod tests {
         let requests = inference.requests.lock().unwrap();
         assert!(report.passed);
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].lora_adapter_id.as_deref(), Some("coder-lora-v1"));
+        assert_eq!(
+            requests[0].lora_adapter_id.as_deref(),
+            Some("coder-lora-v1")
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_fails_generation_when_backend_exceeds_timeout() {
+        let inference = Arc::new(RecordingInference::with_delay(50));
+        let probe = ModelRuntimeProbe::new(inference);
+        let model = model("tiny-coder");
+
+        let report = probe
+            .probe(
+                &model,
+                &cuda_device(),
+                &RuntimeFeatureSet::fully_enabled_cuda(),
+                ModelRuntimeProbeRequest {
+                    backend_id: Some("mistralrs".into()),
+                    model_name: "tiny-coder".into(),
+                    trace_id: Some("trace-timeout".into()),
+                    max_tokens: 16,
+                    timeout_seconds: Some(0),
+                    lora_adapter_id: None,
+                },
+            )
+            .await;
+
+        assert!(!report.passed);
+        assert!(report.stages.iter().any(|stage| {
+            stage.name == ProbeStageName::Generation
+                && stage.status == ProbeStageStatus::Failed
+                && stage.message.contains("timed out")
+        }));
     }
 
     #[tokio::test]
@@ -634,7 +683,10 @@ mod tests {
         );
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].lora_adapter_id, None);
-        assert_eq!(requests[1].lora_adapter_id.as_deref(), Some("coder-lora-v1"));
+        assert_eq!(
+            requests[1].lora_adapter_id.as_deref(),
+            Some("coder-lora-v1")
+        );
         assert!(report.entries.iter().all(|entry| entry.report.passed));
     }
 
@@ -711,7 +763,8 @@ mod tests {
             passed: true,
         };
 
-        let path = RuntimeMatrixReportWriter::write_pretty_json(&report, report_dir.path()).unwrap();
+        let path =
+            RuntimeMatrixReportWriter::write_pretty_json(&report, report_dir.path()).unwrap();
         let json = std::fs::read_to_string(&path).unwrap();
 
         assert_eq!(
@@ -730,6 +783,7 @@ mod tests {
     enum RecordingResponse {
         Success(String),
         Error,
+        Delay(u64),
     }
 
     impl RecordingInference {
@@ -744,6 +798,13 @@ mod tests {
             Self {
                 requests: Mutex::new(Vec::new()),
                 response: RecordingResponse::Error,
+            }
+        }
+
+        fn with_delay(delay_ms: u64) -> Self {
+            Self {
+                requests: Mutex::new(Vec::new()),
+                response: RecordingResponse::Delay(delay_ms),
             }
         }
     }
@@ -768,6 +829,18 @@ mod tests {
                 RecordingResponse::Error => Err(InferenceServiceError::Inference(
                     InferenceError::GenerationFailed("backend exploded".into()),
                 )),
+                RecordingResponse::Delay(delay_ms) => {
+                    tokio::time::sleep(Duration::from_millis(*delay_ms)).await;
+                    Ok(InferenceResponse {
+                        content: "CRYTEX_PROBE_OK".into(),
+                        usage: TokenUsage {
+                            prompt_tokens: 1,
+                            completion_tokens: 1,
+                            total_tokens: 2,
+                        },
+                        finish_reason: "stop".into(),
+                    })
+                }
             }
         }
 

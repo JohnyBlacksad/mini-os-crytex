@@ -157,7 +157,7 @@ enum Commands {
         #[arg(short, long)]
         repo: String,
         #[arg(short, long)]
-        filename: String,
+        filename: Option<String>,
         #[arg(short, long)]
         quantization: Option<String>,
         #[arg(long)]
@@ -168,6 +168,8 @@ enum Commands {
         trace_id: Option<String>,
         #[arg(long, default_value = "16")]
         max_tokens: usize,
+        #[arg(long, default_value = "120")]
+        timeout_seconds: u64,
         #[arg(long)]
         report_path: Option<PathBuf>,
     },
@@ -219,6 +221,8 @@ enum Commands {
         trace_id: Option<String>,
         #[arg(long, default_value = "16")]
         max_tokens: usize,
+        #[arg(long)]
+        timeout_seconds: Option<u64>,
     },
     /// Run baseline and LoRA runtime probe matrix for a managed model
     ProbeRuntimeMatrix {
@@ -455,6 +459,31 @@ fn build_manifest_entry(
         backend: Some(backend),
         params_b,
     })
+}
+
+fn build_hf_proof_manifest_entry(
+    id: String,
+    name: Option<String>,
+    repo: String,
+    filename: Option<String>,
+    quantization: Option<String>,
+    params_b: Option<f32>,
+    resolution: Option<&crytex_core::services::HfGgufResolution>,
+) -> Result<crytex_core::services::ManifestEntry, String> {
+    let resolved_filename =
+        filename.or_else(|| resolution.map(|resolution| resolution.selected.filename.clone()));
+    let resolved_quantization = quantization.or_else(|| {
+        resolution.map(|resolution| resolution.selected.quantization.as_str().to_string())
+    });
+    build_manifest_entry(
+        id,
+        name,
+        Some(repo),
+        resolved_filename,
+        resolved_quantization,
+        "mistralrs".into(),
+        params_b,
+    )
 }
 
 fn build_downloaded_model_backend_config(
@@ -1014,6 +1043,7 @@ async fn main() {
         backend_id,
         trace_id,
         max_tokens,
+        timeout_seconds,
         report_path,
     } = &cli.command
     {
@@ -1029,14 +1059,39 @@ async fn main() {
             event_service,
             Arc::new(SystemHardwareDetector::new()),
         );
-        let entry = build_manifest_entry(
+        let preferred_quantization = quantization
+            .as_deref()
+            .map(str::parse::<Quantization>)
+            .transpose()
+            .unwrap_or_else(|e| {
+                eprintln!("Failed to parse quantization: {}", e);
+                std::process::exit(1);
+            });
+        let resolved_gguf = if filename.is_none() {
+            Some(
+                model_manager
+                    .resolve_hf_gguf(HfGgufResolveRequest {
+                        repo: repo.clone(),
+                        preferred_quantization,
+                        params_b: *params_b,
+                    })
+                    .await
+                    .unwrap_or_else(|e| {
+                        eprintln!("Failed to resolve HF GGUF: {}", e);
+                        std::process::exit(1);
+                    }),
+            )
+        } else {
+            None
+        };
+        let entry = build_hf_proof_manifest_entry(
             id.clone(),
             name.clone().or_else(|| Some(id.clone())),
-            Some(repo.clone()),
-            Some(filename.clone()),
+            repo.clone(),
+            filename.clone(),
             quantization.clone(),
-            "mistralrs".into(),
             *params_b,
+            resolved_gguf.as_ref(),
         )
         .unwrap_or_else(|e| {
             eprintln!("Failed to build HF model manifest entry: {}", e);
@@ -1093,6 +1148,7 @@ async fn main() {
                     model_name,
                     trace_id: trace_id.clone(),
                     max_tokens: *max_tokens,
+                    timeout_seconds: Some(*timeout_seconds),
                     lora_adapter_id: None,
                 },
             )
@@ -1175,6 +1231,7 @@ async fn main() {
         model,
         trace_id,
         max_tokens,
+        timeout_seconds,
     } = &cli.command
     {
         let event_bus = Arc::new(crytex_core::EventBus::new());
@@ -1249,6 +1306,7 @@ async fn main() {
                     model_name,
                     trace_id: trace_id.clone(),
                     max_tokens: *max_tokens,
+                    timeout_seconds: *timeout_seconds,
                     lora_adapter_id: None,
                 },
             )
@@ -2733,6 +2791,42 @@ mod tests {
         assert_eq!(entry.quantization.as_deref(), Some("Q2_K"));
         assert_eq!(entry.backend.as_deref(), Some("mistralrs"));
         assert_eq!(entry.params_b, Some(1.1));
+    }
+
+    #[test]
+    fn prove_hf_model_manifest_entry_uses_resolved_gguf_when_filename_is_omitted() {
+        let resolution = crytex_core::services::HfGgufResolution {
+            selected: crytex_core::services::HfGgufVariant {
+                repo: "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF".into(),
+                filename: "tinyllama-1.1b-chat-v1.0.Q2_K.gguf".into(),
+                quantization: crytex_core::services::Quantization::Q2K,
+            },
+            variants: Vec::new(),
+            recommendation: crytex_core::services::RecommendedConfig {
+                backend: BackendKind::MistralRs,
+                quantization: crytex_core::services::Quantization::Q2K,
+                gpu_layers: None,
+                context_size: 4096,
+            },
+        };
+
+        let entry = build_hf_proof_manifest_entry(
+            "hf-tinyllama-chat-q2-gguf".into(),
+            None,
+            "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF".into(),
+            None,
+            None,
+            Some(1.1),
+            Some(&resolution),
+        )
+        .unwrap();
+
+        assert_eq!(
+            entry.filename.as_deref(),
+            Some("tinyllama-1.1b-chat-v1.0.Q2_K.gguf")
+        );
+        assert_eq!(entry.quantization.as_deref(), Some("Q2_K"));
+        assert_eq!(entry.backend.as_deref(), Some("mistralrs"));
     }
 
     #[test]
