@@ -191,7 +191,8 @@ impl ModelRuntimeProbe {
                     content.chars().take(120).collect::<String>()
                 ),
                 duration_ms,
-            ),
+            )
+            .with_generated_preview(content.chars().take(512).collect::<String>()),
             Ok(_) => failed_generation_report(
                 FailedProbeContext::new(
                     trace_id,
@@ -244,9 +245,13 @@ fn smoke_request(request: &ModelRuntimeProbeRequest) -> InferenceRequest {
         model: request.model_name.clone(),
         messages: vec![Message {
             role: "user".into(),
-            content: "Reply with exactly: CRYTEX_PROBE_OK".into(),
+            content: "No preamble. No explanation. Output exactly one token: CRYTEX_PROBE_OK"
+                .into(),
         }],
-        system_prompt: Some("You are running a short runtime smoke test.".into()),
+        system_prompt: Some(
+            "You are a deterministic runtime probe. The only valid response is CRYTEX_PROBE_OK."
+                .into(),
+        ),
         temperature: Some(0.0),
         max_tokens: Some(request.max_tokens.clamp(1, 32)),
         lora_adapter_id: request.lora_adapter_id.clone(),
@@ -440,6 +445,13 @@ fn failed_generation_report(
     }
 }
 
+impl ModelRuntimeProbeReport {
+    fn with_generated_preview(mut self, preview: String) -> Self {
+        self.generated_preview = Some(preview);
+        self
+    }
+}
+
 fn generation_error_message(error: InferenceServiceError) -> String {
     format!("smoke generation failed: {error}")
 }
@@ -541,6 +553,7 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].backend_id.as_deref(), Some("mistralrs"));
         assert_eq!(requests[0].max_tokens, Some(32));
+        assert!(requests[0].messages[0].content.contains("No preamble"));
         assert!(report.stages.iter().any(|stage| {
             stage.name == ProbeStageName::Generation && stage.status == ProbeStageStatus::Passed
         }));
@@ -729,7 +742,10 @@ mod tests {
             .await;
 
         assert!(!report.passed);
-        assert_eq!(report.generated_preview, None);
+        assert_eq!(
+            report.generated_preview.as_deref(),
+            Some("hello from a model")
+        );
         assert!(report.stages.iter().any(|stage| {
             stage.name == ProbeStageName::Generation
                 && stage.status == ProbeStageStatus::Failed

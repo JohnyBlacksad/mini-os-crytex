@@ -517,6 +517,7 @@ struct HfModelProofReport {
     filename: Option<String>,
     local_path: Option<String>,
     backend_id: String,
+    build_profile: String,
     recommendation: crytex_core::services::RecommendedConfig,
     runtime_placement: HfRuntimePlacementProof,
     runtime_probe: crytex_core::services::ModelRuntimeProbeReport,
@@ -548,10 +549,19 @@ fn build_hf_model_proof_report(
             .as_ref()
             .map(|path| path.display().to_string()),
         backend_id,
+        build_profile: build_profile().to_string(),
         recommendation,
         runtime_placement,
         passed: runtime_probe.passed,
         runtime_probe,
+    }
+}
+
+fn build_profile() -> &'static str {
+    if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
     }
 }
 
@@ -2921,6 +2931,7 @@ mod tests {
             Some(model_path.to_str().unwrap())
         );
         assert_eq!(report.backend_id, "local-hf-proof");
+        assert!(matches!(report.build_profile.as_str(), "debug" | "release"));
         assert_eq!(
             report.runtime_probe.generated_preview.as_deref(),
             Some("ok")
