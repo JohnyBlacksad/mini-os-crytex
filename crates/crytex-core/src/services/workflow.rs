@@ -743,6 +743,7 @@ impl AgentWorkflowNodeExecutor {
             "upstream_artifact": state.get(input).cloned().unwrap_or_default(),
             "agent_session": {
                 "session_id": session_id,
+                "trace_id": trace_id,
                 "role": agent,
                 "node_id": id,
                 "input_key": input,
@@ -1195,6 +1196,121 @@ task_kind = "codegen"
             "write minimal patch"
         );
         assert!(task.payload.get("scratchpad").is_none());
+    }
+
+    struct ChainedAgentService {
+        seen: Mutex<Vec<Task>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentService for ChainedAgentService {
+        async fn register(&self, _agent: Arc<dyn crate::services::Agent>) {}
+
+        async fn find(&self, _name: &str) -> Option<Arc<dyn crate::services::Agent>> {
+            None
+        }
+
+        async fn list(&self) -> Vec<String> {
+            vec![]
+        }
+
+        fn route(&self, task: &Task) -> Option<String> {
+            task.assigned_agent.clone()
+        }
+
+        async fn execute(
+            &self,
+            task: &Task,
+            _inference: Arc<dyn InferenceService>,
+            _tools: Arc<dyn ToolService>,
+        ) -> Result<serde_json::Value, crate::services::AgentServiceError> {
+            self.seen.lock().unwrap().push(task.clone());
+            Ok(serde_json::json!({
+                "agent": task.assigned_agent,
+                "artifact": task.payload["upstream_artifact"],
+                "session_id": task.payload["agent_session"]["session_id"]
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_workflow_chain_uses_clean_sessions_and_passes_only_artifacts() {
+        let agent_service = Arc::new(ChainedAgentService {
+            seen: Mutex::new(Vec::new()),
+        });
+        let executor = Arc::new(AgentWorkflowNodeExecutor::new(
+            agent_service.clone(),
+            Arc::new(NoopInference),
+            Arc::new(NoopToolService),
+        ));
+        let engine = WorkflowEngine::new(executor);
+        let workflow = WorkflowDefinition {
+            id: "agent-chain".to_string(),
+            entry: "architect".to_string(),
+            max_concurrency: 1,
+            nodes: vec![
+                WorkflowNode::Agent {
+                    id: "architect".to_string(),
+                    agent: "architect".to_string(),
+                    task_kind: Some("architecture".to_string()),
+                    input: "task".to_string(),
+                    output: "design_artifact".to_string(),
+                    timeout_seconds: None,
+                    retry: WorkflowRetryPolicy::default(),
+                },
+                WorkflowNode::Agent {
+                    id: "coder".to_string(),
+                    agent: "coder".to_string(),
+                    task_kind: Some("codegen".to_string()),
+                    input: "design_artifact".to_string(),
+                    output: "patch_artifact".to_string(),
+                    timeout_seconds: None,
+                    retry: WorkflowRetryPolicy::default(),
+                },
+            ],
+            edges: vec![edge("architect", "coder")],
+            ..Default::default()
+        };
+
+        let result = engine
+            .run(
+                &workflow,
+                serde_json::json!({
+                    "project_id": "p1",
+                    "trace_id": "trace-chain",
+                    "task": "build a token optimizer",
+                    "architect_private_scratchpad": "must not leak"
+                }),
+            )
+            .await
+            .unwrap();
+
+        let tasks = agent_service.seen.lock().unwrap().clone();
+        assert_eq!(tasks.len(), 2);
+        assert_ne!(
+            tasks[0].payload["agent_session"]["session_id"],
+            tasks[1].payload["agent_session"]["session_id"]
+        );
+        assert_eq!(
+            tasks[0].payload["agent_session"]["trace_id"],
+            "trace-chain"
+        );
+        assert_eq!(
+            tasks[1].payload["agent_session"]["trace_id"],
+            "trace-chain"
+        );
+        assert_eq!(
+            tasks[1].payload["upstream_artifact"],
+            result.state["design_artifact"]
+        );
+        assert!(tasks[1]
+            .payload
+            .get("architect_private_scratchpad")
+            .is_none());
+        assert_eq!(
+            result.state["patch_artifact"]["artifact"],
+            result.state["design_artifact"]
+        );
     }
 
     #[derive(Default)]
