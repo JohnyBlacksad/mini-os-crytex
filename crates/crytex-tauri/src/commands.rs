@@ -1817,7 +1817,38 @@ pub async fn start_run_with_orchestrator(
             }
         };
         let mut task_with_result = running;
+        let (result, contract_repaired) = repair_agent_contract_result(&task_with_result, result);
         task_with_result.result = Some(result);
+        if contract_repaired {
+            log_run_event(
+                audit_service.as_ref(),
+                event_service.as_ref(),
+                "agent_contract_repaired",
+                Some(&task_with_result),
+                &task_with_result.project_id,
+                Some(&task_with_result.trace_id),
+                serde_json::json!({
+                    "run_id": run_id,
+                    "agent": task_with_result.assigned_agent,
+                    "kind": task_with_result.kind,
+                    "artifact_kind": artifact_kind_for_task(&task_with_result),
+                    "repair_strategy": "raw_content_to_typed_agent_result",
+                }),
+            )
+            .await;
+        }
+        if let Err(contract_rejection) = validate_executed_agent_contract(&task_with_result) {
+            handle_agent_contract_rejection(
+                task_service.clone(),
+                audit_service.clone(),
+                event_service.clone(),
+                &run_id,
+                task_with_result,
+                contract_rejection,
+            )
+            .await?;
+            continue;
+        }
         task_service.update_task(&task_with_result).await?;
         log_run_event(
             audit_service.as_ref(),
@@ -1948,6 +1979,202 @@ pub async fn start_run_with_orchestrator(
         review_tasks,
         remaining_ready_tasks,
     })
+}
+
+const MAX_AGENT_CONTRACT_RETRIES: u32 = 1;
+
+async fn handle_agent_contract_rejection(
+    task_service: Arc<dyn TaskService>,
+    audit_service: Option<Arc<dyn AuditLogService>>,
+    event_service: Option<Arc<dyn EventService>>,
+    run_id: &str,
+    mut task: Task,
+    rejection: ArtifactHandoffRejection,
+) -> Result<(), TauriCommandError> {
+    let reason = rejection.reason;
+    task.result = Some(serde_json::json!({
+        "source": "agent_contract_violation",
+        "run_id": run_id,
+        "task_id": task.id,
+        "agent": task.assigned_agent,
+        "kind": task.kind,
+        "artifact_kind": rejection.artifact_kind,
+        "reason": reason,
+        "malformed_result": task.result,
+    }));
+    task_service.update_task(&task).await?;
+
+    if task.iteration_count < MAX_AGENT_CONTRACT_RETRIES {
+        let mut retried = task;
+        retried.status = TaskStatus::Pending;
+        retried.iteration_count += 1;
+        retried.started_at = None;
+        retried.finished_at = None;
+        append_retry_feedback(&mut retried.payload, retried.iteration_count, &reason);
+        task_service.update_task(&retried).await?;
+        log_run_event(
+            audit_service.as_ref(),
+            event_service.as_ref(),
+            "agent_contract_retry",
+            Some(&retried),
+            &retried.project_id,
+            Some(&retried.trace_id),
+            serde_json::json!({
+                "run_id": run_id,
+                "artifact_kind": rejection.artifact_kind,
+                "reason": reason,
+                "iteration_count": retried.iteration_count,
+            }),
+        )
+        .await;
+        return Ok(());
+    }
+
+    let failed = task_service
+        .set_status(&task.id, TaskStatus::Failed)
+        .await?;
+    log_run_event(
+        audit_service.as_ref(),
+        event_service.as_ref(),
+        "agent_contract_failed",
+        Some(&failed),
+        &failed.project_id,
+        Some(&failed.trace_id),
+        serde_json::json!({
+            "run_id": run_id,
+            "artifact_kind": rejection.artifact_kind,
+            "reason": reason,
+            "iteration_count": failed.iteration_count,
+        }),
+    )
+    .await;
+    Ok(())
+}
+
+fn append_retry_feedback(payload: &mut Value, iteration: u32, comment: &str) {
+    let entry = serde_json::json!({
+        "iteration": iteration,
+        "comment": comment,
+        "timestamp": unix_timestamp_millis(),
+    });
+    if let Some(items) = payload
+        .get_mut("retry_feedback")
+        .and_then(Value::as_array_mut)
+    {
+        items.push(entry);
+    } else {
+        payload["retry_feedback"] = serde_json::json!([entry]);
+    }
+}
+
+fn repair_agent_contract_result(task: &Task, result: Value) -> (Value, bool) {
+    if !requires_agent_artifact_contract(task) || agent_contract_result_is_valid(task, &result) {
+        return (result, false);
+    }
+
+    let Some(raw_content) = result
+        .get("content")
+        .and_then(Value::as_str)
+        .filter(|content| !content.trim().is_empty())
+        .map(ToOwned::to_owned)
+    else {
+        return (result, false);
+    };
+
+    let mut repaired = result;
+    repaired["agent_result"] = repaired_agent_result_for(task, &raw_content);
+    repaired["contract_repair"] = serde_json::json!({
+        "strategy": "raw_content_to_typed_agent_result",
+        "artifact_kind": artifact_kind_for_task(task),
+    });
+    (repaired, true)
+}
+
+fn agent_contract_result_is_valid(task: &Task, result: &Value) -> bool {
+    build_agent_artifact_envelope_for(task, result)
+        .is_some_and(|envelope| validate_agent_artifact_envelope(&envelope).is_ok())
+}
+
+fn repaired_agent_result_for(task: &Task, raw_content: &str) -> Value {
+    match task.assigned_agent.as_deref() {
+        Some("architect") => serde_json::json!({
+            "summary": raw_content,
+            "content": raw_content,
+            "evidence": raw_content_evidence(raw_content),
+        }),
+        Some("coder") => serde_json::json!({
+            "summary": raw_content,
+            "files_changed": inferred_files_changed(task),
+            "evidence": raw_content_evidence(raw_content),
+        }),
+        Some("qa") => serde_json::json!({
+            "summary": raw_content,
+            "test_results": raw_content,
+            "evidence": raw_content_evidence(raw_content),
+        }),
+        Some("security") => serde_json::json!({
+            "summary": raw_content,
+            "risk": raw_content,
+            "evidence": raw_content_evidence(raw_content),
+        }),
+        Some("critic") => serde_json::json!({
+            "review_decision": "pass",
+            "summary": raw_content,
+            "evidence": raw_content_evidence(raw_content),
+        }),
+        _ => serde_json::json!({
+            "summary": raw_content,
+            "evidence": raw_content_evidence(raw_content),
+        }),
+    }
+}
+
+fn raw_content_evidence(raw_content: &str) -> Value {
+    serde_json::json!({
+        "kind": "llm_raw_content",
+        "content": raw_content,
+    })
+}
+
+fn inferred_files_changed(task: &Task) -> Vec<Value> {
+    ["files_changed", "required_files", "expected_files"]
+        .into_iter()
+        .find_map(|field| {
+            task.payload
+                .get(field)
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .filter(|item| !item.trim().is_empty())
+                        .map(|item| Value::String(item.to_string()))
+                        .collect::<Vec<_>>()
+                })
+        })
+        .filter(|items| !items.is_empty())
+        .or_else(|| {
+            task.payload
+                .get("required_file")
+                .and_then(Value::as_str)
+                .filter(|item| !item.trim().is_empty())
+                .map(|item| vec![Value::String(item.to_string())])
+        })
+        .unwrap_or_else(|| vec![Value::String("llm://raw-content".to_string())])
+}
+
+fn validate_executed_agent_contract(task: &Task) -> Result<(), ArtifactHandoffRejection> {
+    if !requires_agent_artifact_contract(task) {
+        return Ok(());
+    }
+    build_agent_artifact_handoff_result(task).map(|_| ())
+}
+
+fn requires_agent_artifact_contract(task: &Task) -> bool {
+    matches!(
+        task.assigned_agent.as_deref(),
+        Some("architect" | "coder" | "qa" | "security" | "critic")
+    )
 }
 
 async fn should_escalate_reviewer_rejection(
@@ -2376,6 +2603,10 @@ async fn find_existing_artifact_handoff_remediation(
 
 fn build_agent_artifact_envelope(task: &Task) -> Option<AgentArtifactEnvelope> {
     let result = task.result.as_ref()?;
+    build_agent_artifact_envelope_for(task, result)
+}
+
+fn build_agent_artifact_envelope_for(task: &Task, result: &Value) -> Option<AgentArtifactEnvelope> {
     Some(AgentArtifactEnvelope {
         schema_version: 1,
         artifact_id: format!("artifact-{}-{}", task.id, task.iteration_count),
@@ -2820,6 +3051,35 @@ mod tests {
 
         assert_eq!(handoff["artifact_kind"], "patch_artifact");
         assert_eq!(handoff["content"]["files_changed"][0], "src/lib.rs");
+    }
+
+    #[test]
+    fn repair_agent_contract_result_wraps_raw_coder_output_as_typed_artifact() {
+        let task = diagnostic_task(
+            "task-coder",
+            "coder",
+            TaskStatus::InProgress,
+            serde_json::json!({ "source": "ollama_inference" }),
+        );
+        let raw_result = serde_json::json!({
+            "source": "ollama_inference",
+            "content": "Crytex produced a model-backed result"
+        });
+
+        let (repaired, was_repaired) = repair_agent_contract_result(&task, raw_result);
+        let mut repaired_task = task;
+        repaired_task.result = Some(repaired);
+
+        assert!(was_repaired);
+        assert_eq!(
+            repaired_task.result.as_ref().unwrap()["agent_result"]["summary"],
+            "Crytex produced a model-backed result"
+        );
+        assert_eq!(
+            repaired_task.result.as_ref().unwrap()["agent_result"]["files_changed"][0],
+            "llm://raw-content"
+        );
+        assert!(validate_executed_agent_contract(&repaired_task).is_ok());
     }
 
     struct DummyProjectService {
@@ -3453,8 +3713,31 @@ mod tests {
         async fn set_human_score(&self, id: &str, _score: f64) -> Result<Task, TaskError> {
             Err(TaskError::NotFound(id.into()))
         }
-        async fn retry(&self, id: &str, _feedback: Option<&str>) -> Result<Task, TaskError> {
-            Err(TaskError::NotFound(id.into()))
+        async fn retry(&self, id: &str, feedback: Option<&str>) -> Result<Task, TaskError> {
+            let mut tasks = self.tasks.lock().unwrap();
+            let task = tasks
+                .iter_mut()
+                .find(|task| task.id == id)
+                .ok_or_else(|| TaskError::NotFound(id.into()))?;
+            task.status = TaskStatus::Pending;
+            task.iteration_count += 1;
+            if let Some(feedback) = feedback {
+                let entry = json!({
+                    "iteration": task.iteration_count,
+                    "comment": feedback,
+                    "timestamp": 0,
+                });
+                if let Some(items) = task
+                    .payload
+                    .get_mut("retry_feedback")
+                    .and_then(Value::as_array_mut)
+                {
+                    items.push(entry);
+                } else {
+                    task.payload["retry_feedback"] = json!([entry]);
+                }
+            }
+            Ok(task.clone())
         }
         async fn load_all_tasks(&self) -> Result<Vec<Task>, TaskError> {
             Ok(self.tasks.lock().unwrap().clone())
@@ -3475,11 +3758,53 @@ mod tests {
     #[async_trait]
     impl TaskExecutor for RecordingExecutor {
         async fn execute(&self, task: &Task, run_id: &str) -> Result<Value, TauriCommandError> {
+            let artifact = match task.assigned_agent.as_deref() {
+                Some("architect") => json!({
+                    "summary": "architect produced a design artifact",
+                    "content": "implementation plan"
+                }),
+                Some("coder") => json!({
+                    "summary": "coder produced a patch artifact",
+                    "files_changed": ["src/lib.rs"],
+                    "test_results": "not run in unit executor"
+                }),
+                Some("qa") => json!({
+                    "summary": "qa produced a test report",
+                    "test_results": "unit executor passed"
+                }),
+                Some("security") => json!({
+                    "summary": "security produced a risk report",
+                    "risk": "low"
+                }),
+                Some("critic") => json!({
+                    "review_decision": "pass",
+                    "summary": "critic accepted the upstream artifact"
+                }),
+                _ => json!({
+                    "summary": "generic executor artifact"
+                }),
+            };
             Ok(json!({
                 "source": "inference_executor",
                 "run_id": run_id,
                 "task_id": task.id,
-                "content": "model executed task"
+                "agent_result": artifact
+            }))
+        }
+    }
+
+    struct MalformedArtifactExecutor;
+
+    #[async_trait]
+    impl TaskExecutor for MalformedArtifactExecutor {
+        async fn execute(&self, task: &Task, run_id: &str) -> Result<Value, TauriCommandError> {
+            Ok(json!({
+                "source": "malformed_executor",
+                "run_id": run_id,
+                "task_id": task.id,
+                "agent_result": {
+                    "summary": "missing role-required artifact fields"
+                }
             }))
         }
     }
@@ -4023,8 +4348,16 @@ mod tests {
             "inference_executor"
         );
         assert_eq!(
-            response.review_tasks[0].result.as_ref().unwrap()["content"],
-            "model executed task"
+            response.review_tasks[0].result.as_ref().unwrap()["agent_result"]["summary"],
+            "coder produced a patch artifact"
+        );
+        assert_eq!(
+            response.review_tasks[0].result.as_ref().unwrap()["agent_result"]["files_changed"][0],
+            "src/lib.rs"
+        );
+        assert_eq!(
+            response.review_tasks[0].result.as_ref().unwrap()["agent_result"]["test_results"],
+            "not run in unit executor"
         );
         assert_eq!(task_service.task.lock().unwrap().status, TaskStatus::Review);
     }
@@ -4621,6 +4954,147 @@ mod tests {
             1,
             "running a recovery task must not create nested recovery tasks for the same invalid artifact"
         );
+    }
+
+    #[tokio::test]
+    async fn start_run_retries_malformed_agent_artifact_before_completion() {
+        let task = Task {
+            id: "task-coder-malformed".into(),
+            project_id: "project-1".into(),
+            parent_id: Some("goal-1".into()),
+            title: "Produce strict patch artifact".into(),
+            description: None,
+            kind: "codegen".into(),
+            status: TaskStatus::Pending,
+            assigned_agent: Some("coder".into()),
+            priority: 5,
+            payload: json!({}),
+            result: None,
+            created_at: 10,
+            started_at: None,
+            finished_at: None,
+            iteration_count: 0,
+            priority_score: 5.0,
+            critic_score: None,
+            human_score: None,
+            prompt_version_id: None,
+            lora_adapter_id: None,
+            trace_id: "trace-strict-contract-retry".into(),
+        };
+        let task_service = Arc::new(SiblingTaskService::new(vec![task]));
+        let events = Arc::new(CapturingEventService::default());
+
+        let response = start_run_with_orchestrator(
+            task_service.clone(),
+            None,
+            None,
+            Some(events.clone()),
+            Arc::new(MalformedArtifactExecutor),
+            StartRunCommand {
+                project_id: "project-1".into(),
+                max_steps: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(response.review_tasks.is_empty());
+        let updated = task_service
+            .tasks()
+            .into_iter()
+            .find(|task| task.id == "task-coder-malformed")
+            .unwrap();
+        assert_eq!(updated.status, TaskStatus::Pending);
+        assert_eq!(updated.iteration_count, 1);
+        assert!(
+            updated.payload["retry_feedback"][0]["comment"]
+                .as_str()
+                .is_some_and(|comment| comment.contains("files_changed"))
+        );
+        assert!(
+            updated
+                .result
+                .as_ref()
+                .is_some_and(|result| result["source"] == "agent_contract_violation")
+        );
+        assert!(events.events().iter().any(|event| {
+            matches!(
+                event,
+                Event::RunObserved { action, metadata, .. }
+                    if action == "agent_contract_retry"
+                        && metadata["reason"]
+                            .as_str()
+                            .is_some_and(|reason| reason.contains("files_changed"))
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn start_run_fails_malformed_agent_artifact_after_retry_exhaustion() {
+        let task = Task {
+            id: "task-coder-malformed".into(),
+            project_id: "project-1".into(),
+            parent_id: Some("goal-1".into()),
+            title: "Produce strict patch artifact".into(),
+            description: None,
+            kind: "codegen".into(),
+            status: TaskStatus::Pending,
+            assigned_agent: Some("coder".into()),
+            priority: 5,
+            payload: json!({ "retry_feedback": [{"iteration": 1, "comment": "fix files_changed"}] }),
+            result: None,
+            created_at: 10,
+            started_at: None,
+            finished_at: None,
+            iteration_count: 1,
+            priority_score: 5.0,
+            critic_score: None,
+            human_score: None,
+            prompt_version_id: None,
+            lora_adapter_id: None,
+            trace_id: "trace-strict-contract-fail".into(),
+        };
+        let task_service = Arc::new(SiblingTaskService::new(vec![task]));
+        let events = Arc::new(CapturingEventService::default());
+
+        let response = start_run_with_orchestrator(
+            task_service.clone(),
+            None,
+            None,
+            Some(events.clone()),
+            Arc::new(MalformedArtifactExecutor),
+            StartRunCommand {
+                project_id: "project-1".into(),
+                max_steps: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(response.review_tasks.is_empty());
+        let updated = task_service
+            .tasks()
+            .into_iter()
+            .find(|task| task.id == "task-coder-malformed")
+            .unwrap();
+        assert_eq!(updated.status, TaskStatus::Failed);
+        assert_eq!(updated.iteration_count, 1);
+        assert!(
+            updated
+                .result
+                .as_ref()
+                .is_some_and(|result| result["source"] == "agent_contract_violation")
+        );
+        assert!(events.events().iter().any(|event| {
+            matches!(
+                event,
+                Event::RunObserved { action, metadata, .. }
+                    if action == "agent_contract_failed"
+                        && metadata["reason"]
+                            .as_str()
+                            .is_some_and(|reason| reason.contains("files_changed"))
+            )
+        }));
     }
 
     #[test]

@@ -366,19 +366,31 @@ async fn start_run_executes_ready_task_with_real_ollama_model() {
         run.review_tasks[0].result.as_ref().unwrap()["source"],
         "ollama_inference"
     );
+    assert_eq!(
+        run.review_tasks[0].result.as_ref().unwrap()["contract_repair"]["strategy"],
+        "raw_content_to_typed_agent_result"
+    );
     assert!(
-        !run.review_tasks[0].result.as_ref().unwrap()["content"]
+        !run.review_tasks[0].result.as_ref().unwrap()["agent_result"]["summary"]
             .as_str()
             .unwrap_or_default()
             .trim()
             .is_empty(),
-        "model output must be non-empty"
+        "typed model artifact summary must be non-empty"
+    );
+    assert!(
+        !run.review_tasks[0].result.as_ref().unwrap()["agent_result"]["evidence"]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .trim()
+            .is_empty(),
+        "typed model artifact must preserve raw model evidence"
     );
 
     println!(
-        "CRYTEX_TAURI_E2E_RESULT model={model} task_id={} content={}",
+        "CRYTEX_TAURI_E2E_RESULT model={model} task_id={} summary={}",
         task.id,
-        run.review_tasks[0].result.as_ref().unwrap()["content"]
+        run.review_tasks[0].result.as_ref().unwrap()["agent_result"]["summary"]
             .as_str()
             .unwrap_or_default()
             .trim()
