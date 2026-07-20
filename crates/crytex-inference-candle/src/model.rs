@@ -357,8 +357,13 @@ impl CausalSelfAttention {
     ) -> CandleResult<()> {
         let q_prefix = format!("{prefix}.self_attn.q_proj");
         let v_prefix = format!("{prefix}.self_attn.v_proj");
-        load_lora_linear_adapter(&mut self.q_proj, &q_prefix, tensors)?;
-        load_lora_linear_adapter(&mut self.v_proj, &v_prefix, tensors)
+        if has_lora_linear_adapter(&q_prefix, tensors) {
+            load_lora_linear_adapter(&mut self.q_proj, &q_prefix, tensors)?;
+        }
+        if has_lora_linear_adapter(&v_prefix, tensors) {
+            load_lora_linear_adapter(&mut self.v_proj, &v_prefix, tensors)?;
+        }
+        Ok(())
     }
 
     fn forward_with_cache(&self, x: &Tensor, cache: &mut Option<KvCache>) -> CandleResult<Tensor> {
@@ -410,11 +415,13 @@ impl CausalSelfAttention {
             flash_attention(&q, &k_full, &v_full, self.head_dim)?
         } else {
             let scores = (q.matmul(&k_full.t()?)? / (self.head_dim as f64).sqrt())?;
-            let mask = causal_mask(seq_len, start_pos, x.device())?.broadcast_as(scores.shape())?;
-            let neg_inf = Tensor::new(f32::NEG_INFINITY, x.device())?
+            let mask = causal_mask(seq_len, start_pos, x.device())?
                 .to_dtype(scores.dtype())?
                 .broadcast_as(scores.shape())?;
-            let scores = mask.where_cond(&neg_inf, &scores)?;
+            let mask_penalty = Tensor::new(-1.0e9f32, x.device())?
+                .to_dtype(scores.dtype())?
+                .broadcast_as(scores.shape())?;
+            let scores = (scores + mask.broadcast_mul(&mask_penalty)?)?;
             let attn = softmax_last_dim(&scores)?;
             attn.matmul(&v_full.contiguous()?)?
         };
@@ -496,6 +503,7 @@ pub struct LoraCausalLM {
     embed_tokens: Embedding,
     norm: RmsNorm,
     lm_head: Linear,
+    lm_head_lora: Option<LoraLinear>,
     blocks: Vec<Block>,
     lora_layers: Vec<(String, LoraLinear)>,
     vocab_size: usize,
@@ -547,10 +555,21 @@ impl LoraCausalLM {
             });
         }
 
+        let target_lm_head = cfg
+            .target_modules
+            .iter()
+            .any(|module| module == "lm_head" || module == "output");
+        let lm_head_base = vb
+            .pp("lm_head")
+            .get((cfg.vocab_size, cfg.hidden_size), "weight")?;
+        let lm_head_lora = target_lm_head
+            .then(|| LoraLinear::from_base(lm_head_base.clone(), cfg.rank, cfg.alpha))
+            .transpose()?;
         Ok(Self {
             embed_tokens: embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("model.embed_tokens"))?,
             norm: rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("model.norm"))?,
-            lm_head: linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?,
+            lm_head: Linear::new(lm_head_base, None),
+            lm_head_lora,
             blocks,
             lora_layers,
             vocab_size: cfg.vocab_size,
@@ -572,7 +591,10 @@ impl LoraCausalLM {
             x = block.forward_with_cache(&x, block_cache)?;
         }
         let x = self.norm.forward(&x)?;
-        self.lm_head.forward(&x)
+        self.lm_head_lora
+            .as_ref()
+            .map(|head| head.forward(&x))
+            .unwrap_or_else(|| self.lm_head.forward(&x))
     }
 
     pub fn generate(
@@ -613,6 +635,11 @@ impl LoraCausalLM {
         for (layer, block) in self.blocks.iter_mut().enumerate() {
             block.load_adapter(&format!("model.layers.{layer}"), &tensors)?;
         }
+        if let Some(head) = &mut self.lm_head_lora
+            && has_lora_linear_adapter("lm_head", &tensors)
+        {
+            load_lora_linear_adapter(head, "lm_head", &tensors)?;
+        }
         Ok(())
     }
 
@@ -621,26 +648,49 @@ impl LoraCausalLM {
     }
 
     pub fn lora_vars(&self) -> Vec<Var> {
-        self.blocks.iter().flat_map(Block::lora_vars).collect()
+        let mut vars: Vec<Var> = self.blocks.iter().flat_map(Block::lora_vars).collect();
+        if let Some(head) = &self.lm_head_lora {
+            vars.extend(head.vars());
+        }
+        vars
     }
 
     pub fn lora_tensors(&self) -> HashMap<String, Tensor> {
-        self.blocks
+        let mut tensors: HashMap<String, Tensor> = self
+            .blocks
             .iter()
             .enumerate()
             .flat_map(|(layer, block)| block.lora_tensors(&format!("model.layers.{layer}")))
-            .collect()
+            .collect();
+        if let Some(head) = &self.lm_head_lora {
+            tensors.extend(head.named_tensors("lm_head"));
+        }
+        tensors
     }
 
     pub fn lora_detached_tensors(&self) -> HashMap<String, Tensor> {
-        self.blocks
+        let mut tensors: HashMap<String, Tensor> = self
+            .blocks
             .iter()
             .enumerate()
             .flat_map(|(layer, block)| {
                 block.lora_detached_tensors(&format!("model.layers.{layer}"))
             })
-            .collect()
+            .collect();
+        if let Some(head) = &self.lm_head_lora {
+            tensors.extend(head.detached_named_tensors("lm_head"));
+        }
+        tensors
     }
+}
+
+fn has_lora_linear_adapter(name: &str, tensors: &HashMap<String, Tensor>) -> bool {
+    let a_key = format!("{name}.lora_A.weight");
+    let b_key = format!("{name}.lora_B.weight");
+    let legacy_a_key = format!("{name}.lora_a");
+    let legacy_b_key = format!("{name}.lora_b");
+    (tensors.contains_key(&a_key) || tensors.contains_key(&legacy_a_key))
+        && (tensors.contains_key(&b_key) || tensors.contains_key(&legacy_b_key))
 }
 
 fn load_lora_linear_adapter(

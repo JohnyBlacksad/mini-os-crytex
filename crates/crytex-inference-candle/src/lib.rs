@@ -17,6 +17,7 @@ use crytex_core::models::TrainingExample;
 use crytex_core::services::{
     LoraMetrics, LoraTrainer, LoraTrainingConfig, LoraTrainingError, LoraTrainingResult,
 };
+use serde::Serialize;
 use tracing::{debug, info};
 use ulid::Ulid;
 
@@ -129,6 +130,151 @@ impl CandleLoraTrainer {
     pub fn new() -> Self {
         Self
     }
+}
+
+pub async fn prove_tiny_lora_learning(
+    output_dir: &Path,
+) -> Result<CandleLoraLearningProofReport, LoraTrainingError> {
+    tokio::fs::create_dir_all(output_dir).await?;
+    let base_dir = output_dir.join("base");
+    let adapter_dir = output_dir.join("adapters");
+    let _ = tokio::fs::remove_dir_all(&base_dir).await;
+    let _ = tokio::fs::remove_dir_all(&adapter_dir).await;
+    tokio::fs::create_dir_all(&base_dir).await?;
+    tokio::fs::create_dir_all(&adapter_dir).await?;
+
+    let device = Device::Cpu;
+    let cfg = ModelConfig::tiny_for_tests(4, 8, 64).with_lora(4, 8, vec!["lm_head".into()]);
+    write_tiny_base_model(&base_dir, &cfg, &device)?;
+    let tokenizer = tokenizer::ByteTokenizer::new(cfg.vocab_size);
+    let prompt = "Implement a distillation marker function:";
+    let prompt_tokens = tokenizer
+        .encode(prompt)
+        .map_err(|error| LoraTrainingError::Backend(error.to_string()))?;
+
+    let baseline_output = generate_from_base(&base_dir, &cfg, &tokenizer, &prompt_tokens, None)?;
+    let examples = lora_learning_proof_examples();
+    let trainer = CandleLoraTrainer::new();
+    let result = trainer
+        .train(
+            examples,
+            LoraTrainingConfig {
+                rank: 4,
+                alpha: 8,
+                epochs: 40,
+                learning_rate: 0.05,
+                validation_ratio: 0.25,
+                max_seq_len: 64,
+                base_model_path: Some(base_dir.clone()),
+                target_modules: vec!["lm_head".into()],
+                ..Default::default()
+            },
+            &adapter_dir,
+        )
+        .await?;
+    let adapted_output = generate_from_base(
+        &base_dir,
+        &cfg,
+        &tokenizer,
+        &prompt_tokens,
+        Some(&result.adapter_path.join("adapter_model.safetensors")),
+    )?;
+    let training_proof = read_adapter_training_proof_sync(&result.adapter_path)?;
+    let learning_proven = training_proof
+        .get("learning_proven")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let adapter_delta_l2 = training_proof
+        .get("adapter_delta_l2")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.0);
+    let output_changed = baseline_output != adapted_output;
+    let pre_train_loss = training_proof
+        .get("pre_train_loss")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(f64::NAN);
+    let post_train_loss = training_proof
+        .get("post_train_loss")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(f64::NAN);
+    let train_loss_improved = post_train_loss.is_finite() && post_train_loss < pre_train_loss;
+    let gates = vec![
+        candle_proof_gate(
+            "adapter_artifact_written",
+            result
+                .adapter_path
+                .join("adapter_model.safetensors")
+                .is_file(),
+            &result.adapter_path.display().to_string(),
+        ),
+        candle_proof_gate(
+            "learning_proven",
+            learning_proven && adapter_delta_l2 > 0.0,
+            &format!("adapter_delta_l2={adapter_delta_l2:.8}"),
+        ),
+        candle_proof_gate(
+            "train_loss_improved",
+            train_loss_improved,
+            &format!("pre_train_loss={pre_train_loss:.8}; post_train_loss={post_train_loss:.8}"),
+        ),
+        candle_proof_gate(
+            "baseline_generated",
+            !baseline_output.trim().is_empty(),
+            &baseline_output,
+        ),
+        candle_proof_gate(
+            "adapted_generated",
+            !adapted_output.trim().is_empty(),
+            &adapted_output,
+        ),
+        candle_proof_gate("output_changed", output_changed, "baseline != adapted"),
+    ];
+    let passed = gates.iter().all(|gate| gate.passed);
+    Ok(CandleLoraLearningProofReport {
+        proof_outcome: if passed {
+            "CANDLE_LORA_LEARNING_PROOF_PASSED".into()
+        } else {
+            "CANDLE_LORA_LEARNING_PROOF_FAILED".into()
+        },
+        adapter_id: result.adapter_id,
+        adapter_path: result.adapter_path.display().to_string(),
+        baseline_output,
+        adapted_output,
+        output_changed,
+        training_proof,
+        learning_proven,
+        gates,
+        passed,
+    })
+}
+
+fn candle_proof_gate(name: &str, passed: bool, evidence: &str) -> CandleLoraLearningProofGate {
+    CandleLoraLearningProofGate {
+        name: name.to_string(),
+        passed,
+        evidence: evidence.to_string(),
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CandleLoraLearningProofReport {
+    pub proof_outcome: String,
+    pub adapter_id: String,
+    pub adapter_path: String,
+    pub baseline_output: String,
+    pub adapted_output: String,
+    pub output_changed: bool,
+    pub training_proof: serde_json::Value,
+    pub learning_proven: bool,
+    pub gates: Vec<CandleLoraLearningProofGate>,
+    pub passed: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CandleLoraLearningProofGate {
+    pub name: String,
+    pub passed: bool,
+    pub evidence: String,
 }
 
 #[async_trait]
@@ -468,6 +614,95 @@ fn random_tiny_base_tensors(
     Ok(tensors)
 }
 
+fn write_tiny_base_model(
+    dir: &Path,
+    cfg: &ModelConfig,
+    device: &Device,
+) -> Result<(), LoraTrainingError> {
+    let tensors = random_tiny_base_tensors(cfg, device)
+        .map_err(|error| LoraTrainingError::Backend(error.to_string()))?;
+    candle_core::safetensors::save(&tensors, dir.join("model.safetensors"))
+        .map_err(|error| LoraTrainingError::AdapterSerialization(error.to_string()))?;
+    let config_json = serde_json::json!({
+        "vocab_size": cfg.vocab_size,
+        "hidden_size": cfg.hidden_size,
+        "num_hidden_layers": cfg.num_layers,
+        "num_attention_heads": cfg.num_heads,
+        "num_key_value_heads": cfg.num_key_value_heads,
+        "intermediate_size": cfg.intermediate_size,
+        "max_position_embeddings": cfg.max_seq_len,
+        "rms_norm_eps": cfg.rms_norm_eps,
+        "rope_theta": cfg.rope_theta,
+    });
+    std::fs::write(dir.join("config.json"), config_json.to_string())?;
+    Ok(())
+}
+
+fn generate_from_base(
+    base_dir: &Path,
+    cfg: &ModelConfig,
+    tokenizer: &dyn Tokenizer,
+    prompt_tokens: &[u32],
+    adapter_path: Option<&Path>,
+) -> Result<String, LoraTrainingError> {
+    let device = Device::Cpu;
+    let files = safetensor_files(base_dir)?;
+    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files, cfg.dtype, &device) }
+        .map_err(|error| LoraTrainingError::Backend(error.to_string()))?;
+    let mut model = LoraCausalLM::load(vb, cfg)
+        .map_err(|error| LoraTrainingError::Backend(error.to_string()))?;
+    if let Some(adapter_path) = adapter_path {
+        model
+            .load_adapter(adapter_path)
+            .map_err(|error| LoraTrainingError::Backend(error.to_string()))?;
+    }
+    let generated = model
+        .generate(prompt_tokens, 16, Some(0.0), &device)
+        .map_err(|error| LoraTrainingError::Backend(error.to_string()))?;
+    tokenizer
+        .decode(&generated)
+        .map_err(|error| LoraTrainingError::Backend(error.to_string()))
+}
+
+fn read_adapter_training_proof_sync(
+    adapter_path: &Path,
+) -> Result<serde_json::Value, LoraTrainingError> {
+    let config_path = adapter_path.join("adapter_config.json");
+    let raw = std::fs::read_to_string(&config_path)?;
+    let config: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|error| LoraTrainingError::Backend(error.to_string()))?;
+    Ok(config
+        .get("crytex_training_proof")
+        .cloned()
+        .unwrap_or_else(|| {
+            serde_json::json!({
+                "learning_proven": false,
+                "reason": "adapter_config.json missing crytex_training_proof"
+            })
+        }))
+}
+
+fn lora_learning_proof_examples() -> Vec<TrainingExample> {
+    ["alpha", "beta", "gamma", "delta", "epsilon", "zeta"]
+        .iter()
+        .enumerate()
+        .map(|(idx, name)| TrainingExample {
+            id: format!("proof-ex-{idx}"),
+            task_id: format!("proof-task-{idx}"),
+            project_id: Some("candle-learning-proof".into()),
+            prompt_version_id: Some("proof-prompt-v1".into()),
+            task_kind: "codegen".into(),
+            agent_role: Some("coder".into()),
+            input_text: format!("Implement a distillation marker function for {name}"),
+            output_text: format!(
+                "fn distill_{name}() -> &'static str {{ \"CRYTEX_LORA_DISTILL_OK_{idx}\" }}"
+            ),
+            reward: 5.0,
+            created_at: idx as i64,
+        })
+        .collect()
+}
+
 fn lora_value_snapshot(
     tensors: &HashMap<String, Tensor>,
 ) -> CandleResult<HashMap<String, Vec<f32>>> {
@@ -796,6 +1031,73 @@ mod tests {
         assert!(proof["post_validation_loss"].as_f64().unwrap().is_finite());
 
         let _ = tokio::fs::remove_dir_all(&output).await;
+    }
+
+    #[tokio::test]
+    async fn candle_lora_learning_proof_exports_before_after_artifact() {
+        let output = PathBuf::from(format!(
+            "{}/candle-lora-learning-proof",
+            std::env::temp_dir().to_string_lossy()
+        ));
+        let _ = tokio::fs::remove_dir_all(&output).await;
+
+        let report = prove_tiny_lora_learning(&output).await.unwrap();
+
+        assert!(report.passed);
+        assert!(report.learning_proven);
+        assert!(report.output_changed);
+        assert!(!report.baseline_output.trim().is_empty());
+        assert!(!report.adapted_output.trim().is_empty());
+        assert_eq!(report.training_proof["kind"], "candle_lora_train_loop");
+        assert_eq!(
+            report.training_proof["optimizer_calibration_used"], false,
+            "learning proof must come from causal training, not calibration"
+        );
+        assert!(
+            report.training_proof["post_train_loss"].as_f64().unwrap()
+                < report.training_proof["pre_train_loss"].as_f64().unwrap(),
+            "training loss must improve during the proof run"
+        );
+        assert!(report.training_proof["adapter_delta_l2"].as_f64().unwrap() > 0.0);
+        assert!(
+            report
+                .gates
+                .iter()
+                .any(|gate| gate.name == "learning_proven" && gate.passed)
+        );
+
+        let _ = tokio::fs::remove_dir_all(&output).await;
+    }
+
+    #[test]
+    fn causal_loss_backward_step_updates_lora_adapter_tensors() {
+        let device = Device::Cpu;
+        let cfg = ModelConfig::tiny_for_tests(4, 8, 32).with_lora(4, 8, vec!["lm_head".into()]);
+        let vb = VarBuilder::from_tensors(
+            random_tiny_base_tensors(&cfg, &device).unwrap(),
+            cfg.dtype,
+            &device,
+        );
+        let model = LoraCausalLM::load(vb, &cfg).unwrap();
+        let tokenizer = tokenizer::ByteTokenizer::new(cfg.vocab_size);
+        let ex = example("aaaa", "bbbbbbbb", 5.0);
+        let before = lora_value_snapshot(&model.lora_tensors()).unwrap();
+        let mut optimizer = AdamW::new(
+            model.lora_vars(),
+            ParamsAdamW {
+                lr: 1.0,
+                ..ParamsAdamW::default()
+            },
+        )
+        .unwrap();
+
+        let loss = train_step(&model, &tokenizer, &ex, &device, &cfg)
+            .unwrap()
+            .unwrap();
+        optimizer.backward_step(&loss).unwrap();
+
+        let delta = lora_delta_l2(&before, &model.lora_tensors()).unwrap();
+        assert!(delta > 0.0, "causal loss must update LoRA tensors");
     }
 
     #[tokio::test]

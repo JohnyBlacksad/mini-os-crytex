@@ -247,6 +247,13 @@ enum Commands {
         #[arg(long)]
         report_path: Option<PathBuf>,
     },
+    /// Prove Candle LoRA train loop with before/after generation on the same tiny base model
+    ProveLoraCandleLearning {
+        #[arg(long)]
+        output_dir: Option<PathBuf>,
+        #[arg(long)]
+        report_path: Option<PathBuf>,
+    },
     /// Add or update a managed HuggingFace/local model entry
     AddModel {
         #[arg(short, long)]
@@ -3856,6 +3863,44 @@ async fn async_main() {
         return;
     }
 
+    if let Commands::ProveLoraCandleLearning {
+        output_dir,
+        report_path,
+    } = &cli.command
+    {
+        let output_dir = output_dir.clone().unwrap_or_else(|| {
+            config
+                .paths
+                .data_dir
+                .join("proofs")
+                .join(format!("lora-candle-learning-{}", Ulid::new()))
+        });
+        let report = crytex_inference_candle::prove_tiny_lora_learning(&output_dir)
+            .await
+            .unwrap_or_else(|error| {
+                eprintln!("Candle LoRA learning proof failed: {error}");
+                std::process::exit(1);
+            });
+        let payload = serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into());
+        if let Some(report_path) = report_path {
+            if let Some(parent) = report_path.parent()
+                && let Err(error) = tokio::fs::create_dir_all(parent).await
+            {
+                eprintln!("Failed to create Candle LoRA learning report directory: {error}");
+                std::process::exit(1);
+            }
+            if let Err(error) = tokio::fs::write(report_path, &payload).await {
+                eprintln!("Failed to write Candle LoRA learning report: {error}");
+                std::process::exit(1);
+            }
+        }
+        println!("{payload}");
+        if !report.passed {
+            std::process::exit(2);
+        }
+        return;
+    }
+
     let inference = create_inference_service(&config).expect("Failed to create inference service");
 
     if let Commands::ProbeModel {
@@ -4372,6 +4417,9 @@ async fn async_main() {
         Commands::ProveLoraLiveE2e { .. } => {
             unreachable!("prove-lora-live-e2e is handled before full AppContext initialization")
         }
+        Commands::ProveLoraCandleLearning { .. } => unreachable!(
+            "prove-lora-candle-learning is handled before full AppContext initialization"
+        ),
         Commands::Submit {
             project,
             prompt,
