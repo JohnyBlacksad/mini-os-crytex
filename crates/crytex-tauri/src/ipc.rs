@@ -4,7 +4,8 @@ use crate::app_state::CrytexAppState;
 use crate::commands::{
     AddManagedModelCommand, BackendE2eMatrixCommand, BackendE2eMatrixReport, CreateProjectCommand,
     DownloadManagedModelCommand, ExportRunDiagnosticsCommand, GoalPlanResponse, ManagedModelRecord,
-    ManagedModelsResponse, OllamaModelsResponse, PlanDecisionCommand, PlanDecisionResponse,
+    ManagedModelRuntimeProofReport, ManagedModelsResponse, OllamaModelsResponse,
+    PlanDecisionCommand, PlanDecisionResponse, ProveManagedModelRuntimeCommand,
     RunDiagnosticsReport, RuntimeStatus, SearchProjectContextCommand, SearchProjectContextResponse,
     SetActiveManagedModelCommand, SetActiveOllamaModelCommand, SetTaskStatusCommand,
     StartRunCommand, StartRunResponse, SubmitGoalCommand, SubmitTaskCommand,
@@ -266,6 +267,17 @@ pub async fn set_active_managed_model(
 ) -> Result<RuntimeStatus, IpcError> {
     state
         .set_active_managed_model(request)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn prove_managed_model_runtime(
+    state: State<'_, CrytexAppState>,
+    request: ProveManagedModelRuntimeCommand,
+) -> Result<ManagedModelRuntimeProofReport, IpcError> {
+    state
+        .prove_managed_model_runtime(request)
         .await
         .map_err(Into::into)
 }

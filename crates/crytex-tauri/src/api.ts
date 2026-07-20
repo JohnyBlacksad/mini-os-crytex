@@ -10,11 +10,13 @@ import type {
   GoalPlanResponse,
   KanbanState,
   ManagedModelRecord,
+  ManagedModelRuntimeProofReport,
   ManagedModelsResponse,
   OllamaModelsResponse,
   PlanDecisionRequest,
   PlanDecisionResponse,
   Project,
+  ProveManagedModelRuntimeRequest,
   SearchProjectContextRequest,
   SearchProjectContextResponse,
   ProjectState,
@@ -100,6 +102,8 @@ export function createCrytexApi(sink: CommandSink) {
       callCommand<RuntimeStatus>("set_active_ollama_model", { request }, sink),
     setActiveManagedModel: (request: SetActiveManagedModelRequest) =>
       callCommand<RuntimeStatus>("set_active_managed_model", { request }, sink),
+    proveManagedModelRuntime: (request: ProveManagedModelRuntimeRequest) =>
+      callCommand<ManagedModelRuntimeProofReport>("prove_managed_model_runtime", { request }, sink),
     listProjects: () => callCommand<Project[]>("list_projects", {}, sink),
     createProject: (request: CreateProjectRequest) =>
       callCommand<Project>("create_project", { request }, sink),

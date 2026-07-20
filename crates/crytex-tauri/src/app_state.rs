@@ -4,9 +4,10 @@ use crate::commands::{
     self, AddManagedModelCommand, AgentTaskExecutor, BackendE2eEvidenceGate,
     BackendE2eMatrixCommand, BackendE2eMatrixReport, BackendE2eScenarioKind,
     BackendE2eScenarioReport, CreateProjectCommand, DownloadManagedModelCommand,
-    ExportRunDiagnosticsCommand, GoalPlanResponse, ManagedModelRecord, ManagedModelsResponse,
-    OllamaModelsResponse, PlanDecisionCommand, PlanDecisionResponse, RunDiagnosticsReport,
-    RuntimeStatus, SearchProjectContextCommand, SearchProjectContextResponse,
+    ExportRunDiagnosticsCommand, GoalPlanResponse, ManagedModelRecord,
+    ManagedModelRuntimeProofReport, ManagedModelsResponse, OllamaModelsResponse,
+    PlanDecisionCommand, PlanDecisionResponse, ProveManagedModelRuntimeCommand,
+    RunDiagnosticsReport, RuntimeStatus, SearchProjectContextCommand, SearchProjectContextResponse,
     SetActiveManagedModelCommand, SetActiveOllamaModelCommand, SetTaskStatusCommand,
     StartRunCommand, StartRunResponse, StubTaskExecutor, SubmitGoalCommand, SubmitTaskCommand,
     TaskExecutor, TaskReviewDecisionCommand, TaskReviewDecisionResponse, TauriCommandError,
@@ -62,6 +63,7 @@ pub struct CrytexAppState {
     model_manager: Arc<dyn ModelManager>,
     orchestrator: Arc<dyn Orchestrator>,
     task_executor: Arc<RwLock<Arc<dyn TaskExecutor>>>,
+    active_inference: Arc<RwLock<Option<Arc<dyn InferenceService>>>>,
     reward_service: Arc<RewardService>,
     runtime_status: Arc<RwLock<RuntimeStatus>>,
     embedder: Arc<dyn Embedder>,
@@ -323,6 +325,7 @@ impl CrytexAppState {
             model_manager,
             orchestrator,
             task_executor: Arc::new(RwLock::new(task_executor)),
+            active_inference: Arc::new(RwLock::new(None)),
             reward_service,
             runtime_status: Arc::new(RwLock::new(runtime_status)),
             embedder,
@@ -786,7 +789,23 @@ impl CrytexAppState {
         &self,
         request: DownloadManagedModelCommand,
     ) -> Result<ManagedModelRecord, TauriCommandError> {
-        commands::download_managed_model(self.model_manager.clone(), request).await
+        let record = commands::download_managed_model(self.model_manager.clone(), request).await?;
+        self.event_service.publish(Event::RunObserved {
+            project_id: "runtime".to_string(),
+            task_id: None,
+            trace_id: format!("model-download-{}", record.id),
+            action: "managed_model_downloaded".to_string(),
+            metadata: serde_json::json!({
+                "model_id": record.id.clone(),
+                "repo": record.repo.clone(),
+                "filename": record.filename.clone(),
+                "local_path": record.local_path.clone(),
+                "status": record.status.clone(),
+                "preferred_backend": record.preferred_backend.clone(),
+                "recommended": record.recommended.clone(),
+            }),
+        });
+        Ok(record)
     }
 
     pub async fn add_managed_model(
@@ -813,6 +832,7 @@ impl CrytexAppState {
             recommended.context_size,
             recommended.gpu_layers,
         );
+        let active_inference = inference.clone();
         let executor = Arc::new(
             AgentTaskExecutor::new_project_scoped(
                 Arc::new(
@@ -831,17 +851,71 @@ impl CrytexAppState {
         );
 
         *self.task_executor.write().await = executor;
+        *self.active_inference.write().await = Some(active_inference);
         *self.runtime_status.write().await = status.clone();
         self.event_service.publish(Event::RuntimeSelected {
             backend: "mistralrs".to_string(),
-            model_id: model.id,
+            model_id: model.id.clone(),
             model_path: Some(local_path.display().to_string()),
             endpoint_url: None,
             context_size: Some(recommended.context_size),
             gpu_layers: recommended.gpu_layers,
             quantization: Some(recommended.quantization.as_str().to_string()),
         });
+        self.event_service.publish(Event::RunObserved {
+            project_id: "runtime".to_string(),
+            task_id: None,
+            trace_id: format!("model-activate-{}", model.id),
+            action: "managed_model_activated".to_string(),
+            metadata: serde_json::json!({
+                "model_id": model.id,
+                "backend": status.active_backend.clone(),
+                "model_path": status.active_model.clone(),
+                "executor_mode": status.executor_mode.clone(),
+                "planning_mode": status.planning_mode.clone(),
+                "real_agent_execution": status.real_agent_execution,
+                "recommended_context_size": recommended.context_size,
+                "recommended_gpu_layers": recommended.gpu_layers,
+                "recommended_quantization": recommended.quantization.as_str(),
+            }),
+        });
         commands::runtime_status(status).await
+    }
+
+    pub async fn prove_managed_model_runtime(
+        &self,
+        request: ProveManagedModelRuntimeCommand,
+    ) -> Result<ManagedModelRuntimeProofReport, TauriCommandError> {
+        let inference = self.active_inference.read().await.clone().ok_or_else(|| {
+            TauriCommandError::Bootstrap(
+                "no active inference runtime configured for managed model proof".to_string(),
+            )
+        })?;
+        let runtime = self.runtime_status.read().await.clone();
+        let report = commands::prove_managed_model_runtime(
+            self.model_manager.clone(),
+            inference,
+            runtime,
+            request,
+        )
+        .await?;
+        self.event_service.publish(Event::RunObserved {
+            project_id: "runtime".to_string(),
+            task_id: None,
+            trace_id: report.trace_id.clone(),
+            action: "model_runtime_proved".to_string(),
+            metadata: serde_json::json!({
+                "model_id": report.model.id.clone(),
+                "backend": report.runtime.active_backend.clone(),
+                "downloaded": report.downloaded,
+                "activated": report.activated,
+                "generated": report.generated,
+                "passed": report.runtime_probe.passed,
+                "failure_reasons": report.failure_reasons.clone(),
+                "generated_preview": report.runtime_probe.generated_preview.clone(),
+            }),
+        });
+        Ok(report)
     }
 
     pub async fn set_active_ollama_model(
@@ -850,6 +924,7 @@ impl CrytexAppState {
         model: &str,
     ) -> Result<RuntimeStatus, TauriCommandError> {
         let inference = ollama_inference_service(ollama_url.to_string(), model.to_string());
+        let active_inference = inference.clone();
         let executor = Arc::new(
             AgentTaskExecutor::new_project_scoped(
                 Arc::new(
@@ -868,6 +943,7 @@ impl CrytexAppState {
         );
 
         *self.task_executor.write().await = executor;
+        *self.active_inference.write().await = Some(active_inference);
         *self.runtime_status.write().await = status.clone();
         self.event_service.publish(Event::RuntimeSelected {
             backend: "ollama".to_string(),
@@ -2118,6 +2194,53 @@ mod tests {
         }
     }
 
+    struct RuntimeProofInference;
+
+    #[async_trait]
+    impl InferenceService for RuntimeProofInference {
+        async fn generate(
+            &self,
+            _request: InferenceRequest,
+        ) -> Result<InferenceResponse, InferenceServiceError> {
+            Ok(InferenceResponse {
+                content: "CRYTEX_PROBE_OK managed model generated through mistral.rs".into(),
+                usage: TokenUsage {
+                    prompt_tokens: 11,
+                    completion_tokens: 7,
+                    total_tokens: 18,
+                },
+                finish_reason: "stop".into(),
+            })
+        }
+
+        async fn embed(&self, _text: &str) -> Result<Vec<f32>, InferenceServiceError> {
+            Ok(vec![])
+        }
+
+        fn available_backends(&self) -> Vec<BackendInfo> {
+            vec![BackendInfo {
+                id: "mistralrs".into(),
+                name: "mistral.rs".into(),
+                capabilities: vec!["generate".into(), "chat".into()],
+            }]
+        }
+
+        async fn register_lora(&self, _lora: LoRAAdapter) -> Result<(), InferenceServiceError> {
+            Ok(())
+        }
+
+        async fn swap_lora(&self, _lora_id: &str) -> Result<(), InferenceServiceError> {
+            Ok(())
+        }
+
+        async fn list_models(
+            &self,
+            _backend_id: Option<&str>,
+        ) -> Result<Vec<ModelInfo>, InferenceServiceError> {
+            Ok(vec![])
+        }
+    }
+
     #[derive(Debug)]
     struct PreferRerankTarget;
 
@@ -2713,6 +2836,193 @@ mod tests {
         assert!(status.backend_capabilities[0].generate);
         assert!(status.backend_capabilities[0].chat);
         assert!(!status.backend_capabilities[0].hot_swap);
+    }
+
+    #[tokio::test]
+    async fn sqlite_state_exports_download_and_activation_diagnostics_for_managed_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("crytex-ui.db");
+        let model_path = dir.path().join("hf-cache").join("local-qwen.gguf");
+        let model_manager = Arc::new(DownloadableManagedModelManager::new(model_path.clone()));
+        let state = CrytexAppState::new_sqlite_with_executor_factory_and_planning(
+            &db_path,
+            Box::new(|_, _, _| Arc::new(StubTaskExecutor)),
+            None,
+            None,
+            None,
+            None,
+            Some(model_manager),
+            None,
+            stub_runtime_status(),
+        )
+        .await
+        .unwrap();
+        let mut events = state.subscribe_to_events().await.unwrap();
+
+        state
+            .add_managed_model(AddManagedModelCommand {
+                id: "local-qwen".into(),
+                name: "Local Qwen".into(),
+                repo: "Qwen/Qwen2.5-Coder-9B-Instruct-GGUF".into(),
+                filename: "local-qwen.gguf".into(),
+                quantization: Some("Q4_K_M".into()),
+                backend: Some("mistral_rs".into()),
+                params_b: Some(9.0),
+            })
+            .await
+            .unwrap();
+        state
+            .download_managed_model(DownloadManagedModelCommand {
+                model_id: "local-qwen".into(),
+            })
+            .await
+            .unwrap();
+        state
+            .set_active_managed_model(SetActiveManagedModelCommand {
+                model_id: "local-qwen".into(),
+            })
+            .await
+            .unwrap();
+
+        let mut observed_actions = Vec::new();
+        while observed_actions.len() < 2 {
+            if let crytex_core::bus::Event::RunObserved {
+                action, metadata, ..
+            } = events.recv().await.unwrap()
+            {
+                observed_actions.push((action, metadata));
+            }
+        }
+
+        let downloaded = observed_actions
+            .iter()
+            .find(|(action, _)| action == "managed_model_downloaded")
+            .expect("download diagnostics should be emitted");
+        assert_eq!(downloaded.1["model_id"], "local-qwen");
+        assert_eq!(downloaded.1["local_path"], model_path.display().to_string());
+
+        let activated = observed_actions
+            .iter()
+            .find(|(action, _)| action == "managed_model_activated")
+            .expect("activation diagnostics should be emitted");
+        assert_eq!(activated.1["model_id"], "local-qwen");
+        assert_eq!(activated.1["backend"], "mistralrs");
+        assert_eq!(activated.1["model_path"], model_path.display().to_string());
+        assert_eq!(activated.1["real_agent_execution"], true);
+    }
+
+    #[tokio::test]
+    async fn sqlite_state_proves_downloaded_active_managed_model_generates_and_exports_diagnostics()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("crytex-ui.db");
+        let model_path = dir.path().join("hf-cache").join("local-qwen.gguf");
+        let model_manager = Arc::new(DownloadableManagedModelManager::new(model_path.clone()));
+        let state = CrytexAppState::new_sqlite_with_executor_factory_and_planning(
+            &db_path,
+            Box::new(|_, _, _| Arc::new(StubTaskExecutor)),
+            None,
+            None,
+            None,
+            None,
+            Some(model_manager),
+            None,
+            stub_runtime_status(),
+        )
+        .await
+        .unwrap();
+
+        state
+            .add_managed_model(AddManagedModelCommand {
+                id: "local-qwen".into(),
+                name: "Local Qwen".into(),
+                repo: "Qwen/Qwen2.5-Coder-9B-Instruct-GGUF".into(),
+                filename: "local-qwen.gguf".into(),
+                quantization: Some("Q4_K_M".into()),
+                backend: Some("mistral_rs".into()),
+                params_b: Some(9.0),
+            })
+            .await
+            .unwrap();
+        state
+            .download_managed_model(DownloadManagedModelCommand {
+                model_id: "local-qwen".into(),
+            })
+            .await
+            .unwrap();
+        let status = state
+            .set_active_managed_model(SetActiveManagedModelCommand {
+                model_id: "local-qwen".into(),
+            })
+            .await
+            .unwrap();
+        *state.active_inference.write().await = Some(Arc::new(RuntimeProofInference));
+        let mut events = state.subscribe_to_events().await.unwrap();
+
+        let report = state
+            .prove_managed_model_runtime(ProveManagedModelRuntimeCommand {
+                model_id: "local-qwen".into(),
+                trace_id: Some("trace-managed-proof".into()),
+                max_tokens: Some(16),
+                timeout_seconds: Some(5),
+            })
+            .await
+            .unwrap();
+
+        assert!(report.downloaded);
+        assert!(report.activated);
+        assert!(report.generated);
+        assert!(report.runtime_probe.passed);
+        assert!(report.failure_reasons.is_empty());
+        assert_eq!(report.trace_id, "trace-managed-proof");
+        assert_eq!(report.runtime, status);
+        assert_eq!(report.runtime.active_backend.as_deref(), Some("mistralrs"));
+        assert_eq!(
+            report.runtime.active_model.as_deref(),
+            Some(model_path.display().to_string().as_str())
+        );
+        assert_eq!(
+            report.runtime_probe.generated_preview.as_deref(),
+            Some("CRYTEX_PROBE_OK managed model generated through mistral.rs")
+        );
+
+        let event = loop {
+            let event = events.recv().await.unwrap();
+            if matches!(
+                event,
+                crytex_core::bus::Event::RunObserved {
+                    ref action,
+                    ..
+                } if action == "model_runtime_proved"
+            ) {
+                break event;
+            }
+        };
+        let crytex_core::bus::Event::RunObserved {
+            project_id,
+            task_id,
+            trace_id,
+            action,
+            metadata,
+        } = event
+        else {
+            unreachable!("event was filtered to model_runtime_proved");
+        };
+
+        assert_eq!(project_id, "runtime");
+        assert_eq!(task_id, None);
+        assert_eq!(trace_id, "trace-managed-proof");
+        assert_eq!(action, "model_runtime_proved");
+        assert_eq!(metadata["model_id"], "local-qwen");
+        assert_eq!(metadata["backend"], "mistralrs");
+        assert_eq!(metadata["downloaded"], true);
+        assert_eq!(metadata["activated"], true);
+        assert_eq!(metadata["generated"], true);
+        assert_eq!(metadata["passed"], true);
+        assert_eq!(
+            metadata["generated_preview"],
+            "CRYTEX_PROBE_OK managed model generated through mistral.rs"
+        );
     }
 
     #[tokio::test]

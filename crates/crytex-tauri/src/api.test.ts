@@ -53,6 +53,45 @@ describe("createCrytexApi", () => {
     }));
   });
 
+  it("should prove managed model runtime through tauri ipc", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", {
+      configurable: true,
+      value: {},
+    });
+    vi.mocked(invoke).mockResolvedValue({
+      trace_id: "trace-managed-proof",
+      downloaded: true,
+      activated: true,
+      generated: true,
+      failure_reasons: [],
+      runtime_probe: {
+        passed: true,
+        generated_preview: "CRYTEX_PROBE_OK",
+      },
+    });
+
+    const sink = vi.fn();
+    const api = createCrytexApi(sink);
+    await api.proveManagedModelRuntime({
+      model_id: "local-qwen",
+      trace_id: "trace-managed-proof",
+      max_tokens: 16,
+      timeout_seconds: 5,
+    });
+
+    expect(invoke).toHaveBeenCalledWith("prove_managed_model_runtime", {
+      request: {
+        model_id: "local-qwen",
+        trace_id: "trace-managed-proof",
+        max_tokens: 16,
+        timeout_seconds: 5,
+      },
+    });
+    expect(sink).toHaveBeenCalledWith(expect.objectContaining({
+      name: "prove_managed_model_runtime",
+    }));
+  });
+
   it("should forward backend event payloads from tauri event stream", async () => {
     const unlisten = vi.fn();
     const backendEvent: BackendEvent = {

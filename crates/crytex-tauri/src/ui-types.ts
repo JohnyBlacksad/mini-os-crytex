@@ -203,6 +203,13 @@ export type SetActiveManagedModelRequest = {
   model_id: string;
 };
 
+export type ProveManagedModelRuntimeRequest = {
+  model_id: string;
+  trace_id: string | null;
+  max_tokens: number | null;
+  timeout_seconds: number | null;
+};
+
 export type AddManagedModelRequest = {
   id: string;
   name: string;
@@ -211,6 +218,36 @@ export type AddManagedModelRequest = {
   quantization: string | null;
   backend: string | null;
   params_b: number | null;
+};
+
+export type ProbeStageReport = {
+  name: string;
+  status: string;
+  message: string;
+  duration_ms: number;
+};
+
+export type ModelRuntimeProbeReport = {
+  trace_id: string;
+  model_id: string;
+  backend_id: string | null;
+  backend_capability: BackendCapabilityReport | null;
+  compatibility: unknown;
+  stages: ProbeStageReport[];
+  failure_reasons: string[];
+  generated_preview: string | null;
+  passed: boolean;
+};
+
+export type ManagedModelRuntimeProofReport = {
+  trace_id: string;
+  model: ManagedModelRecord;
+  runtime: RuntimeStatus;
+  downloaded: boolean;
+  activated: boolean;
+  generated: boolean;
+  failure_reasons: string[];
+  runtime_probe: ModelRuntimeProbeReport;
 };
 
 export type CreateProjectRequest = {

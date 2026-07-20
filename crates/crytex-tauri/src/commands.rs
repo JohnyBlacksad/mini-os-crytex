@@ -10,12 +10,13 @@ use crytex_core::persistence::ProjectSnapshotRepository;
 use crytex_core::services::agent_service::capabilities_for_task;
 use crytex_core::services::{
     AgentService, AgentServiceError, AuditLogEntry, AuditLogLevel, AuditLogService,
-    CreateProjectRequest, CreateTaskRequest, CudaToolchainStatus, Embedder, EventService,
-    InferenceService, LoraEvolutionError, ManagedModel, ManifestEntry, ModelCompatibilityPlan,
-    ModelManager, ModelManagerError, ModelStatus, Orchestrator, OrchestratorError, ProjectError,
-    ProjectService, Quantization, RecommendedConfig, RewardServiceError, TaskError, TaskService,
-    ToolDescription, ToolService, ToolServiceError, VectorStore, VectorStoreError,
-    validate_artifact_content,
+    CreateProjectRequest, CreateTaskRequest, CudaToolchainStatus, DeviceKind, Embedder,
+    EventService, InferenceService, LoraEvolutionError, ManagedModel, ManifestEntry,
+    ModelCompatibilityPlan, ModelManager, ModelManagerError, ModelRuntimeProbe,
+    ModelRuntimeProbeReport, ModelRuntimeProbeRequest, ModelStatus, Orchestrator,
+    OrchestratorError, ProjectError, ProjectService, Quantization, RecommendedConfig,
+    RewardServiceError, RuntimeFeatureSet, TaskError, TaskService, ToolDescription, ToolService,
+    ToolServiceError, VectorStore, VectorStoreError, validate_artifact_content,
 };
 use crytex_core::state_export::{ProjectState, StateExportError, export_project_state};
 use crytex_inference::{
@@ -399,6 +400,28 @@ pub struct AddManagedModelCommand {
     pub quantization: Option<String>,
     pub backend: Option<String>,
     pub params_b: Option<f32>,
+}
+
+/// Payload for proving a downloaded managed model can generate through the active runtime.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProveManagedModelRuntimeCommand {
+    pub model_id: String,
+    pub trace_id: Option<String>,
+    pub max_tokens: Option<usize>,
+    pub timeout_seconds: Option<u64>,
+}
+
+/// End-to-end proof that a managed model is downloaded, active, and generation-capable.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ManagedModelRuntimeProofReport {
+    pub trace_id: String,
+    pub model: ManagedModelRecord,
+    pub runtime: RuntimeStatus,
+    pub downloaded: bool,
+    pub activated: bool,
+    pub generated: bool,
+    pub failure_reasons: Vec<String>,
+    pub runtime_probe: ModelRuntimeProbeReport,
 }
 
 /// Payload for searching indexed project context from the UI.
@@ -1376,6 +1399,62 @@ pub async fn add_managed_model(
     };
     let model = model_manager.add_model(entry)?;
     managed_model_record(model_manager.as_ref(), model)
+}
+
+/// Prove that a managed model is downloaded, active, and able to generate.
+pub async fn prove_managed_model_runtime(
+    model_manager: Arc<dyn ModelManager>,
+    inference: Arc<dyn InferenceService>,
+    runtime: RuntimeStatus,
+    request: ProveManagedModelRuntimeCommand,
+) -> Result<ManagedModelRuntimeProofReport, TauriCommandError> {
+    let model = model_manager.get_model(&request.model_id)?;
+    let record = managed_model_record(model_manager.as_ref(), model.clone())?;
+    let downloaded = model.local_path.as_ref().is_some_and(|path| path.exists())
+        && matches!(model.status, ModelStatus::Downloaded);
+    let local_model_path = model
+        .local_path
+        .as_ref()
+        .map(|path| path.display().to_string());
+    let activated = runtime.active_backend.as_deref() == Some("mistralrs")
+        && runtime.ready_to_run
+        && runtime.active_model == local_model_path;
+    let probe = ModelRuntimeProbe::new(inference);
+    let runtime_probe = probe
+        .probe(
+            &model,
+            &DeviceKind::Cpu,
+            &RuntimeFeatureSet::from_device(&DeviceKind::Cpu),
+            ModelRuntimeProbeRequest {
+                backend_id: Some("mistralrs".to_string()),
+                model_name: local_model_path.unwrap_or_else(|| model.id.clone()),
+                trace_id: request.trace_id,
+                max_tokens: request.max_tokens.unwrap_or(16),
+                timeout_seconds: request.timeout_seconds,
+                lora_adapter_id: None,
+            },
+        )
+        .await;
+    let generated = runtime_probe.generated_preview.is_some();
+    let mut failure_reasons = Vec::new();
+    if !downloaded {
+        failure_reasons.push("managed model is not downloaded".to_string());
+    }
+    if !activated {
+        failure_reasons.push("managed model is not the active mistral.rs runtime".to_string());
+    }
+    failure_reasons.extend(runtime_probe.failure_reasons.clone());
+
+    Ok(ManagedModelRuntimeProofReport {
+        trace_id: runtime_probe.trace_id.clone(),
+        model: record,
+        runtime,
+        downloaded,
+        activated,
+        generated,
+        failure_reasons,
+        runtime_probe,
+    })
 }
 
 fn required_field(field: &str, value: String) -> Result<String, TauriCommandError> {

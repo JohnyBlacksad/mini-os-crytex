@@ -76,7 +76,8 @@ pub fn run() {
             ipc::download_managed_model,
             ipc::add_managed_model,
             ipc::set_active_ollama_model,
-            ipc::set_active_managed_model
+            ipc::set_active_managed_model,
+            ipc::prove_managed_model_runtime
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Crytex desktop UI");
