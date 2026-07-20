@@ -4,13 +4,14 @@ use crate::commands::{
     self, AddManagedModelCommand, AgentTaskExecutor, BackendE2eEvidenceGate,
     BackendE2eMatrixCommand, BackendE2eMatrixReport, BackendE2eScenarioKind,
     BackendE2eScenarioReport, CreateProjectCommand, DownloadManagedModelCommand,
-    ExportRunDiagnosticsCommand, GoalPlanResponse, ManagedModelRecord,
-    ManagedModelRuntimeProofReport, ManagedModelsResponse, OllamaModelsResponse,
-    PlanDecisionCommand, PlanDecisionResponse, ProveManagedModelRuntimeCommand,
-    RunDiagnosticsReport, RuntimeStatus, SearchProjectContextCommand, SearchProjectContextResponse,
-    SetActiveManagedModelCommand, SetActiveOllamaModelCommand, SetTaskStatusCommand,
-    StartRunCommand, StartRunResponse, StubTaskExecutor, SubmitGoalCommand, SubmitTaskCommand,
-    TaskExecutor, TaskReviewDecisionCommand, TaskReviewDecisionResponse, TauriCommandError,
+    EvaluatePromptChallengerCommand, EvaluatePromptChallengerResponse, ExportRunDiagnosticsCommand,
+    GoalPlanResponse, ManagedModelRecord, ManagedModelRuntimeProofReport, ManagedModelsResponse,
+    OllamaModelsResponse, PlanDecisionCommand, PlanDecisionResponse,
+    ProveManagedModelRuntimeCommand, RunDiagnosticsReport, RuntimeStatus,
+    SearchProjectContextCommand, SearchProjectContextResponse, SetActiveManagedModelCommand,
+    SetActiveOllamaModelCommand, SetTaskStatusCommand, StartRunCommand, StartRunResponse,
+    StubTaskExecutor, SubmitGoalCommand, SubmitTaskCommand, TaskExecutor,
+    TaskReviewDecisionCommand, TaskReviewDecisionResponse, TauriCommandError,
     TrainLoraAdapterCommand, TrainLoraAdapterResponse,
 };
 use async_trait::async_trait;
@@ -29,10 +30,10 @@ use crytex_core::services::{
     HardwareDetector, InferenceService, InferenceServiceError, InferenceServiceImpl,
     LoraBenchmarkGate, LoraEvolutionService, LoraEvolutionServiceImpl, MockEmbedder,
     MockSparseEmbedder, ModelCompatibilityPlanner, ModelManager, ModelManagerImpl, Orchestrator,
-    OrchestratorImpl, ProjectService, ProjectServiceImpl, ProjectWatcher, RagChunkEvidence,
-    RecordRewardRequest, RewardService, RuntimeFeatureSet, SparseEmbedder, SystemHardwareDetector,
-    TaskService, TaskServiceImpl, ToolDescription, ToolService, ToolServiceError, VectorStore,
-    detect_cuda_toolchain_status,
+    OrchestratorImpl, ProjectService, ProjectServiceImpl, ProjectWatcher, PromptBenchmarkGate,
+    PromptEvolutionService, RagChunkEvidence, RecordRewardRequest, RewardService,
+    RuntimeFeatureSet, SparseEmbedder, SystemHardwareDetector, TaskService, TaskServiceImpl,
+    ToolDescription, ToolService, ToolServiceError, VectorStore, detect_cuda_toolchain_status,
 };
 use crytex_core::state_export::ProjectState;
 use crytex_inference::{
@@ -72,6 +73,8 @@ pub struct CrytexAppState {
     project_indexer: ProjectIndexer,
     context_assembler: Arc<ContextAssembler>,
     lora_evolution: Arc<dyn LoraEvolutionService>,
+    prompt_evolution: Arc<PromptEvolutionService<Storage, Storage>>,
+    prompt_benchmark_gate: Option<Arc<dyn PromptBenchmarkGate>>,
     watcher_shutdowns: Arc<RwLock<HashMap<String, oneshot::Sender<()>>>>,
     watcher_tasks: Arc<RwLock<HashMap<String, JoinHandle<()>>>>,
 }
@@ -153,6 +156,7 @@ impl CrytexAppState {
             None,
             None,
             None,
+            None,
             reranker,
             runtime_status,
         )
@@ -183,6 +187,7 @@ impl CrytexAppState {
             None,
             None,
             None,
+            None,
             reranker,
             runtime_status,
         )
@@ -205,6 +210,7 @@ impl CrytexAppState {
             None,
             None,
             None,
+            None,
             Some(reranker),
             runtime_status,
         )
@@ -219,6 +225,7 @@ impl CrytexAppState {
         planning_tools: Option<Arc<dyn ToolService>>,
         lora_evolution: Option<Arc<dyn LoraEvolutionService>>,
         lora_benchmark_gate: Option<Arc<dyn LoraBenchmarkGate>>,
+        prompt_benchmark_gate: Option<Arc<dyn PromptBenchmarkGate>>,
         model_manager: Option<Arc<dyn ModelManager>>,
         reranker: Option<Arc<dyn crytex_core::services::Reranker>>,
         runtime_status: RuntimeStatus,
@@ -281,6 +288,10 @@ impl CrytexAppState {
             context_assembler.clone(),
         );
         let reward_service = Arc::new(RewardService::new(storage.clone()));
+        let prompt_evolution = Arc::new(PromptEvolutionService::new(
+            storage.clone(),
+            storage.clone(),
+        ));
         let lora_evolution = lora_evolution.unwrap_or_else(|| {
             let mut service = LoraEvolutionServiceImpl::new(
                 task_service.clone(),
@@ -334,6 +345,8 @@ impl CrytexAppState {
             project_indexer,
             context_assembler,
             lora_evolution,
+            prompt_evolution,
+            prompt_benchmark_gate,
             watcher_shutdowns: Arc::new(RwLock::new(HashMap::new())),
             watcher_tasks: Arc::new(RwLock::new(HashMap::new())),
         })
@@ -1053,6 +1066,105 @@ impl CrytexAppState {
             benchmark_gate,
             metrics: adapter.metrics.clone(),
             adapter,
+        })
+    }
+
+    pub async fn evaluate_prompt_challenger(
+        &self,
+        request: EvaluatePromptChallengerCommand,
+    ) -> Result<EvaluatePromptChallengerResponse, TauriCommandError> {
+        let gate = self.prompt_benchmark_gate.clone().ok_or_else(|| {
+            TauriCommandError::Bootstrap(
+                "prompt benchmark gate is not configured for this runtime".to_string(),
+            )
+        })?;
+        let baseline = self
+            .prompt_evolution
+            .active_version(&request.agent)
+            .await?
+            .ok_or_else(|| {
+                TauriCommandError::Bootstrap(format!(
+                    "no active baseline prompt for agent: {}",
+                    request.agent
+                ))
+            })?;
+        let decision = self
+            .prompt_evolution
+            .evaluate_challenger_with_benchmark(
+                &request.challenger_prompt_version_id,
+                gate.as_ref(),
+            )
+            .await?;
+        let versions = self.prompt_evolution.list_versions(&request.agent).await?;
+        let challenger = versions
+            .iter()
+            .find(|version| version.id == request.challenger_prompt_version_id)
+            .cloned()
+            .ok_or_else(|| {
+                TauriCommandError::Bootstrap(format!(
+                    "prompt version not found after benchmark: {}",
+                    request.challenger_prompt_version_id
+                ))
+            })?;
+        let active = self
+            .prompt_evolution
+            .active_version(&request.agent)
+            .await?
+            .ok_or_else(|| {
+                TauriCommandError::Bootstrap(format!(
+                    "no active prompt after benchmark for agent: {}",
+                    request.agent
+                ))
+            })?;
+        let benchmark_gate = challenger
+            .metrics
+            .get("prompt_benchmark_gate")
+            .cloned()
+            .unwrap_or_else(|| decision.metadata.clone());
+        let action = if decision.accepted {
+            "prompt_evolution_promoted"
+        } else {
+            "prompt_evolution_rejected"
+        };
+        let trace_id = request
+            .trace_id
+            .clone()
+            .unwrap_or_else(|| format!("prompt-evolution-{}", challenger.id));
+        let project_id = request.project_id;
+        let task_id = request.task_id;
+        let metadata = serde_json::json!({
+            "run_id": request.run_id,
+            "trace_id": trace_id.clone(),
+            "agent": request.agent,
+            "baseline_prompt_version_id": baseline.id,
+            "challenger_prompt_version_id": challenger.id,
+            "prompt_benchmark_gate": benchmark_gate,
+        });
+        let mut entry = crytex_core::services::AuditLogEntry::new("event", action)
+            .project_id(&project_id)
+            .trace_id(&trace_id)
+            .level(crytex_core::models::AuditLogLevel::Info)
+            .metadata(metadata.clone());
+        if let Some(task_id) = task_id.as_deref() {
+            entry = entry.task_id(task_id);
+        }
+        self.audit_service
+            .log(entry)
+            .await
+            .map_err(|error| TauriCommandError::Bootstrap(error.to_string()))?;
+        self.event_service.publish(Event::RunObserved {
+            project_id,
+            task_id,
+            trace_id: trace_id.clone(),
+            action: action.to_string(),
+            metadata,
+        });
+
+        Ok(EvaluatePromptChallengerResponse {
+            promoted: decision.accepted,
+            benchmark_gate,
+            challenger,
+            active,
         })
     }
 }
@@ -1839,8 +1951,8 @@ mod tests {
     use crytex_core::services::{
         AgentRole, InferenceService, InferenceServiceError, LoraBenchmarkDecision,
         LoraBenchmarkRequest, LoraEvolutionError, ManagedModel, ManifestEntry, ModelManagerError,
-        ModelStatus, Quantization, RecommendedConfig, ToolDescription, ToolService,
-        ToolServiceError,
+        ModelStatus, PromptBenchmarkDecision, PromptBenchmarkGate, PromptBenchmarkRequest,
+        Quantization, RecommendedConfig, ToolDescription, ToolService, ToolServiceError,
     };
     use crytex_inference::{
         BackendInfo, InferenceRequest, InferenceResponse, LoRAAdapter, ModelInfo, TokenUsage,
@@ -2411,6 +2523,37 @@ mod tests {
     }
 
     #[derive(Default)]
+    struct AcceptingPromptBenchmarkGate {
+        requests: Mutex<Vec<PromptBenchmarkRequest>>,
+    }
+
+    #[async_trait]
+    impl PromptBenchmarkGate for AcceptingPromptBenchmarkGate {
+        async fn evaluate(
+            &self,
+            request: PromptBenchmarkRequest,
+        ) -> Result<PromptBenchmarkDecision, crytex_core::services::PromptEvolutionError> {
+            self.requests.lock().unwrap().push(request.clone());
+            Ok(PromptBenchmarkDecision {
+                accepted: true,
+                reason: "challenger passed held-out prompt benchmark".into(),
+                baseline_score: 0.25,
+                challenger_score: 0.75,
+                metadata: json!({
+                    "held_out": true,
+                    "baseline_run_id": "prompt-baseline-run",
+                    "challenger_run_id": "prompt-challenger-run",
+                    "winner": "Challenger",
+                    "delta_pass_rate": 0.5,
+                    "mc_nemar_p_value": 0.03125,
+                    "baseline_pass_rate": 0.25,
+                    "challenger_pass_rate": 0.75
+                }),
+            })
+        }
+    }
+
+    #[derive(Default)]
     struct AcceptingLoraBenchmarkGate {
         requests: Mutex<Vec<LoraBenchmarkRequest>>,
     }
@@ -2805,6 +2948,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Some(model_manager),
             None,
             stub_runtime_status(),
@@ -2883,6 +3027,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Some(model_manager),
             None,
             stub_runtime_status(),
@@ -2953,6 +3098,7 @@ mod tests {
         let state = CrytexAppState::new_sqlite_with_executor_factory_and_planning(
             &db_path,
             Box::new(|_, _, _| Arc::new(StubTaskExecutor)),
+            None,
             None,
             None,
             None,
@@ -3366,6 +3512,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             custom_executor_runtime_status(),
         )
         .await
@@ -3576,6 +3723,7 @@ mod tests {
                     .with_audit(audit_service),
                 ) as Arc<dyn TaskExecutor>
             }),
+            None,
             None,
             None,
             None,
@@ -4358,6 +4506,7 @@ pub fn payment_retry_caller() -> bool {
             None,
             None,
             None,
+            None,
             custom_executor_runtime_status(),
         )
         .await
@@ -4426,6 +4575,7 @@ pub fn payment_retry_caller() -> bool {
             None,
             None,
             Some(lora_evolution.clone()),
+            None,
             None,
             None,
             None,
@@ -4640,6 +4790,110 @@ pub fn payment_retry_caller() -> bool {
     }
 
     #[tokio::test]
+    async fn sqlite_state_prompt_benchmark_gate_promotes_and_reaches_diagnostics() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("crytex-ui.db");
+        let gate = Arc::new(AcceptingPromptBenchmarkGate::default());
+        let state = CrytexAppState::new_sqlite_with_executor_factory_and_planning(
+            &db_path,
+            Box::new(|_, _, _| Arc::new(StubTaskExecutor)),
+            None,
+            None,
+            None,
+            None,
+            Some(gate.clone()),
+            None,
+            None,
+            custom_executor_runtime_status(),
+        )
+        .await
+        .unwrap();
+
+        let project_root = dir.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let project = state
+            .project_service
+            .create(crytex_core::services::CreateProjectRequest {
+                name: "Prompt Benchmark Diagnostics",
+                root_path: &project_root,
+            })
+            .await
+            .unwrap();
+        let baseline = state
+            .prompt_evolution
+            .seed_agent("coder", "baseline prompt")
+            .await
+            .unwrap();
+        let challenger = state
+            .prompt_evolution
+            .mutate(
+                &baseline.id,
+                crytex_core::services::MutationOperator::AddConstraint,
+            )
+            .await
+            .unwrap();
+
+        let response = state
+            .evaluate_prompt_challenger(EvaluatePromptChallengerCommand {
+                project_id: project.id.clone(),
+                run_id: Some("run-prompt".into()),
+                trace_id: Some("trace-prompt".into()),
+                task_id: None,
+                agent: "coder".into(),
+                challenger_prompt_version_id: challenger.id.clone(),
+            })
+            .await
+            .unwrap();
+
+        assert!(response.promoted);
+        assert_eq!(response.active.id, challenger.id);
+        assert_eq!(
+            response.benchmark_gate["winner"],
+            serde_json::Value::String("Challenger".into())
+        );
+        {
+            let requests = gate.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].baseline_prompt_version_id, baseline.id);
+            assert_eq!(requests[0].challenger_prompt_version_id, challenger.id);
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let report = state
+            .export_run_diagnostics(ExportRunDiagnosticsCommand {
+                project_id: project.id.clone(),
+                run_id: "run-prompt".into(),
+                trace_id: Some("trace-prompt".into()),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(report.prompt_evolution.len(), 1);
+        let decision = &report.prompt_evolution[0];
+        assert_eq!(decision.task_id, None);
+        assert_eq!(decision.agent.as_deref(), Some("coder"));
+        assert_eq!(
+            decision.baseline_prompt_version_id.as_deref(),
+            Some(baseline.id.as_str())
+        );
+        assert_eq!(
+            decision.challenger_prompt_version_id.as_deref(),
+            Some(challenger.id.as_str())
+        );
+        assert_eq!(decision.accepted, Some(true));
+        assert_eq!(
+            decision.baseline_run_id.as_deref(),
+            Some("prompt-baseline-run")
+        );
+        assert_eq!(
+            decision.challenger_run_id.as_deref(),
+            Some("prompt-challenger-run")
+        );
+        assert_eq!(decision.baseline_pass_rate, Some(0.25));
+        assert_eq!(decision.challenger_pass_rate, Some(0.75));
+    }
+
+    #[tokio::test]
     async fn sqlite_state_approval_triggered_lora_benchmark_gate_reaches_diagnostics() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("crytex-ui.db");
@@ -4651,6 +4905,7 @@ pub fn payment_retry_caller() -> bool {
             None,
             None,
             Some(gate.clone()),
+            None,
             None,
             None,
             custom_executor_runtime_status(),
@@ -4797,6 +5052,7 @@ pub fn payment_retry_caller() -> bool {
             None,
             None,
             Some(gate),
+            None,
             None,
             None,
             custom_executor_runtime_status(),
@@ -5001,6 +5257,7 @@ pub fn payment_retry_caller() -> bool {
             None,
             None,
             Some(lora_evolution.clone()),
+            None,
             None,
             None,
             None,

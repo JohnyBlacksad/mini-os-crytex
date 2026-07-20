@@ -6,7 +6,8 @@ use crytex_core::config::{BackendKind, SecurityConfig};
 use crytex_core::indexer::{IndexerError, search_chunks};
 use crytex_core::metrics::MetricsService;
 use crytex_core::models::{
-    KanbanState, LoraAdapter as StoredLoraAdapter, Project, Task, TaskDependency, TaskStatus,
+    KanbanState, LoraAdapter as StoredLoraAdapter, Project, PromptVersion, Task, TaskDependency,
+    TaskStatus,
 };
 use crytex_core::persistence::ProjectSnapshotRepository;
 use crytex_core::services::agent_service::capabilities_for_task;
@@ -16,9 +17,10 @@ use crytex_core::services::{
     EventService, InferenceService, LoraEvolutionError, ManagedModel, ManifestEntry,
     ModelCompatibilityPlan, ModelManager, ModelManagerError, ModelRuntimeProbe,
     ModelRuntimeProbeReport, ModelRuntimeProbeRequest, ModelStatus, Orchestrator,
-    OrchestratorError, ProjectError, ProjectService, Quantization, RecommendedConfig,
-    RewardServiceError, RuntimeFeatureSet, TaskError, TaskService, ToolDescription, ToolService,
-    ToolServiceError, VectorStore, VectorStoreError, validate_artifact_content,
+    OrchestratorError, ProjectError, ProjectService, PromptEvolutionError, Quantization,
+    RecommendedConfig, RewardServiceError, RuntimeFeatureSet, TaskError, TaskService,
+    ToolDescription, ToolService, ToolServiceError, VectorStore, VectorStoreError,
+    validate_artifact_content,
 };
 use crytex_core::state_export::{ProjectState, StateExportError, export_project_state};
 use crytex_inference::{
@@ -62,6 +64,8 @@ pub enum TauriCommandError {
     ModelManager(#[from] ModelManagerError),
     #[error("lora evolution error: {0}")]
     LoraEvolution(#[from] LoraEvolutionError),
+    #[error("prompt evolution error: {0}")]
+    PromptEvolution(#[from] PromptEvolutionError),
 }
 
 impl From<ProjectError> for TauriCommandError {
@@ -210,6 +214,24 @@ pub struct RunDiagnosticLoraEvolution {
     pub metadata: Value,
 }
 
+/// One prompt evolution decision included in a run diagnostic report.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RunDiagnosticPromptEvolution {
+    pub task_id: Option<String>,
+    pub agent: Option<String>,
+    pub baseline_prompt_version_id: Option<String>,
+    pub challenger_prompt_version_id: Option<String>,
+    pub accepted: Option<bool>,
+    pub reason: Option<String>,
+    pub baseline_run_id: Option<String>,
+    pub challenger_run_id: Option<String>,
+    pub winner: Option<String>,
+    pub mc_nemar_p_value: Option<f64>,
+    pub baseline_pass_rate: Option<f64>,
+    pub challenger_pass_rate: Option<f64>,
+    pub metadata: Value,
+}
+
 /// One rejected artifact handoff included in a run diagnostic report.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RunDiagnosticArtifactHandoffRejection {
@@ -249,6 +271,7 @@ pub struct RunDiagnosticsReport {
     pub artifact_handoff_rejections: Vec<RunDiagnosticArtifactHandoffRejection>,
     pub remediation_events: Vec<RunDiagnosticEvent>,
     pub lora_evolution: Vec<RunDiagnosticLoraEvolution>,
+    pub prompt_evolution: Vec<RunDiagnosticPromptEvolution>,
     pub rag_context_sent_to_model: bool,
     pub human_reward_recorded: bool,
 }
@@ -267,6 +290,26 @@ pub struct TrainLoraAdapterResponse {
     pub promoted: bool,
     pub benchmark_gate: Option<Value>,
     pub metrics: Value,
+}
+
+/// Payload for evaluating a mutated prompt before activation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvaluatePromptChallengerCommand {
+    pub project_id: String,
+    pub run_id: Option<String>,
+    pub trace_id: Option<String>,
+    pub task_id: Option<String>,
+    pub agent: String,
+    pub challenger_prompt_version_id: String,
+}
+
+/// Result of prompt challenger evaluation and promotion policy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvaluatePromptChallengerResponse {
+    pub challenger: PromptVersion,
+    pub active: PromptVersion,
+    pub promoted: bool,
+    pub benchmark_gate: Value,
 }
 
 /// Backend e2e scenario selected by the proof matrix runner.
@@ -1062,6 +1105,7 @@ pub fn build_run_diagnostics(
         .cloned()
         .collect::<Vec<_>>();
     let lora_evolution = diagnostic_lora_evolution(&events);
+    let prompt_evolution = diagnostic_prompt_evolution(&events);
     let rag_context_sent_to_model = events.iter().any(|event| {
         event.action == "llm_request" && metadata_contains_rag_marker(&event.metadata)
     });
@@ -1082,6 +1126,7 @@ pub fn build_run_diagnostics(
         artifact_handoff_rejections,
         remediation_events,
         lora_evolution,
+        prompt_evolution,
         rag_context_sent_to_model,
         human_reward_recorded,
     })
@@ -1182,6 +1227,89 @@ fn diagnostic_lora_evolution(events: &[RunDiagnosticEvent]) -> Vec<RunDiagnostic
                     .and_then(|gate| gate.get("challenger_run_id"))
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned),
+                winner: gate
+                    .and_then(|gate| gate.get("winner"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                mc_nemar_p_value: gate
+                    .and_then(|gate| gate.get("mc_nemar_p_value"))
+                    .and_then(Value::as_f64),
+                baseline_pass_rate: gate
+                    .and_then(|gate| gate.get("baseline_pass_rate"))
+                    .and_then(Value::as_f64),
+                challenger_pass_rate: gate
+                    .and_then(|gate| gate.get("challenger_pass_rate"))
+                    .and_then(Value::as_f64),
+                metadata: event.metadata.clone(),
+            })
+        })
+        .collect()
+}
+
+fn diagnostic_prompt_evolution(events: &[RunDiagnosticEvent]) -> Vec<RunDiagnosticPromptEvolution> {
+    let mut seen = BTreeSet::new();
+    events
+        .iter()
+        .filter_map(|event| {
+            if !event.action.starts_with("prompt_evolution_") {
+                return None;
+            }
+            let gate = event
+                .metadata
+                .get("prompt_benchmark_gate")
+                .or_else(|| event.metadata.get("benchmark_gate"));
+            let baseline_run_id = gate
+                .and_then(|gate| gate.get("baseline_run_id"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            let challenger_run_id = gate
+                .and_then(|gate| gate.get("challenger_run_id"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            let challenger_prompt_version_id = event
+                .metadata
+                .get("challenger_prompt_version_id")
+                .or_else(|| event.metadata.get("prompt_version_id"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            let key = (
+                event.action.clone(),
+                event.task_id.clone(),
+                challenger_prompt_version_id.clone(),
+                baseline_run_id.clone(),
+                challenger_run_id.clone(),
+            );
+            if !seen.insert(key) {
+                return None;
+            }
+            Some(RunDiagnosticPromptEvolution {
+                task_id: event.task_id.clone(),
+                agent: event
+                    .metadata
+                    .get("agent")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                baseline_prompt_version_id: event
+                    .metadata
+                    .get("baseline_prompt_version_id")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                challenger_prompt_version_id,
+                accepted: gate
+                    .and_then(|gate| gate.get("accepted"))
+                    .and_then(Value::as_bool)
+                    .or(match event.action.as_str() {
+                        "prompt_evolution_promoted" => Some(true),
+                        "prompt_evolution_rejected" => Some(false),
+                        _ => None,
+                    }),
+                reason: gate
+                    .and_then(|gate| gate.get("reason"))
+                    .or_else(|| event.metadata.get("reason"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                baseline_run_id,
+                challenger_run_id,
                 winner: gate
                     .and_then(|gate| gate.get("winner"))
                     .and_then(Value::as_str)
@@ -5603,6 +5731,95 @@ mod tests {
         assert_eq!(decision.winner.as_deref(), Some("Challenger"));
         assert_eq!(decision.mc_nemar_p_value, Some(0.03125));
         assert_eq!(decision.baseline_pass_rate, Some(0.0));
+        assert_eq!(decision.challenger_pass_rate, Some(1.0));
+    }
+
+    #[test]
+    fn build_run_diagnostics_exports_prompt_evolution_benchmark_decision() {
+        let runtime = RuntimeStatus {
+            tauri_runtime: true,
+            executor_mode: "ollama_agent".into(),
+            planning_mode: "deterministic".into(),
+            active_backend: Some("ollama".into()),
+            active_model: Some("qwen3.5:9b".into()),
+            ollama_url: Some("http://127.0.0.1:11434".into()),
+            real_agent_execution: true,
+            ready_to_run: true,
+            missing_requirements: vec![],
+            backend_capabilities: vec![],
+            cuda_toolchain: None,
+            compatibility_notes: vec![],
+            model_compatibility: None,
+        };
+        let state = ProjectState {
+            project: dummy_project("p1"),
+            kanban: KanbanState {
+                project_id: "p1".into(),
+                columns: vec![],
+            },
+            tasks: vec![diagnostic_task(
+                "task-coder",
+                "coder",
+                TaskStatus::Completed,
+                json!({ "source": "agent_service" }),
+            )],
+            recent_logs: vec![diagnostic_log(
+                "prompt_evolution_promoted",
+                Some("task-coder"),
+                json!({
+                    "run_id": "run-1",
+                    "trace_id": "trace-1",
+                    "agent": "coder",
+                    "baseline_prompt_version_id": "prompt-v1",
+                    "challenger_prompt_version_id": "prompt-v2",
+                    "prompt_benchmark_gate": {
+                        "accepted": true,
+                        "reason": "winner=Challenger, delta_pass_rate=0.5000, p_value=0.0313",
+                        "baseline_run_id": "prompt-baseline",
+                        "challenger_run_id": "prompt-challenger",
+                        "winner": "Challenger",
+                        "mc_nemar_p_value": 0.03125,
+                        "baseline_pass_rate": 0.5,
+                        "challenger_pass_rate": 1.0
+                    }
+                }),
+            )],
+            latest_snapshot: None,
+            metrics: MetricsSnapshot::default(),
+        };
+
+        let report = build_run_diagnostics(
+            ExportRunDiagnosticsCommand {
+                project_id: "p1".into(),
+                run_id: "run-1".into(),
+                trace_id: None,
+            },
+            state,
+            runtime,
+        )
+        .unwrap();
+
+        assert_eq!(report.prompt_evolution.len(), 1);
+        let decision = &report.prompt_evolution[0];
+        assert_eq!(decision.task_id.as_deref(), Some("task-coder"));
+        assert_eq!(decision.agent.as_deref(), Some("coder"));
+        assert_eq!(
+            decision.baseline_prompt_version_id.as_deref(),
+            Some("prompt-v1")
+        );
+        assert_eq!(
+            decision.challenger_prompt_version_id.as_deref(),
+            Some("prompt-v2")
+        );
+        assert_eq!(decision.accepted, Some(true));
+        assert_eq!(decision.baseline_run_id.as_deref(), Some("prompt-baseline"));
+        assert_eq!(
+            decision.challenger_run_id.as_deref(),
+            Some("prompt-challenger")
+        );
+        assert_eq!(decision.winner.as_deref(), Some("Challenger"));
+        assert_eq!(decision.mc_nemar_p_value, Some(0.03125));
+        assert_eq!(decision.baseline_pass_rate, Some(0.5));
         assert_eq!(decision.challenger_pass_rate, Some(1.0));
     }
 

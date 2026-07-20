@@ -6,6 +6,8 @@ import type {
   CommandRecord,
   CreateProjectRequest,
   DownloadManagedModelRequest,
+  EvaluatePromptChallengerRequest,
+  EvaluatePromptChallengerResponse,
   ExportRunDiagnosticsRequest,
   GoalPlanResponse,
   KanbanState,
@@ -108,6 +110,12 @@ export function createCrytexApi(sink: CommandSink) {
       callCommand<ManagedModelRuntimeProofReport>("prove_managed_model_runtime", { request }, sink),
     trainLoraAdapter: (request: TrainLoraAdapterRequest) =>
       callCommand<TrainLoraAdapterResponse>("train_lora_adapter", { request }, sink),
+    evaluatePromptChallenger: (request: EvaluatePromptChallengerRequest) =>
+      callCommand<EvaluatePromptChallengerResponse>(
+        "evaluate_prompt_challenger",
+        { request },
+        sink,
+      ),
     listProjects: () => callCommand<Project[]>("list_projects", {}, sink),
     createProject: (request: CreateProjectRequest) =>
       callCommand<Project>("create_project", { request }, sink),

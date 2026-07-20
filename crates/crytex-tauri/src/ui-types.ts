@@ -275,6 +275,34 @@ export type TrainLoraAdapterResponse = {
   metrics: unknown;
 };
 
+export type PromptVersionRecord = {
+  id: string;
+  agent: string;
+  project_id: string | null;
+  system_prompt: string;
+  fitness: number | null;
+  parent_id: string | null;
+  metrics: unknown;
+  created_at: number;
+  active: boolean;
+};
+
+export type EvaluatePromptChallengerRequest = {
+  project_id: string;
+  run_id: string | null;
+  trace_id: string | null;
+  task_id: string | null;
+  agent: string;
+  challenger_prompt_version_id: string;
+};
+
+export type EvaluatePromptChallengerResponse = {
+  challenger: PromptVersionRecord;
+  active: PromptVersionRecord;
+  promoted: boolean;
+  benchmark_gate: unknown;
+};
+
 export type CreateProjectRequest = {
   name: string;
   root_path: string;
@@ -381,6 +409,22 @@ export type RunDiagnosticLoraEvolution = {
   metadata: unknown;
 };
 
+export type RunDiagnosticPromptEvolution = {
+  task_id: string | null;
+  agent: string | null;
+  baseline_prompt_version_id: string | null;
+  challenger_prompt_version_id: string | null;
+  accepted: boolean | null;
+  reason: string | null;
+  baseline_run_id: string | null;
+  challenger_run_id: string | null;
+  winner: string | null;
+  mc_nemar_p_value: number | null;
+  baseline_pass_rate: number | null;
+  challenger_pass_rate: number | null;
+  metadata: unknown;
+};
+
 export type AgentArtifactEnvelope = {
   schema_version: number;
   artifact_id: string;
@@ -414,6 +458,7 @@ export type RunDiagnosticsReport = {
   artifact_handoff_rejections: RunDiagnosticArtifactHandoffRejection[];
   remediation_events: RunDiagnosticEvent[];
   lora_evolution: RunDiagnosticLoraEvolution[];
+  prompt_evolution: RunDiagnosticPromptEvolution[];
   rag_context_sent_to_model: boolean;
   human_reward_recorded: boolean;
 };

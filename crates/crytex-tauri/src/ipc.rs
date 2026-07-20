@@ -3,7 +3,8 @@
 use crate::app_state::CrytexAppState;
 use crate::commands::{
     AddManagedModelCommand, BackendE2eMatrixCommand, BackendE2eMatrixReport, CreateProjectCommand,
-    DownloadManagedModelCommand, ExportRunDiagnosticsCommand, GoalPlanResponse, ManagedModelRecord,
+    DownloadManagedModelCommand, EvaluatePromptChallengerCommand, EvaluatePromptChallengerResponse,
+    ExportRunDiagnosticsCommand, GoalPlanResponse, ManagedModelRecord,
     ManagedModelRuntimeProofReport, ManagedModelsResponse, OllamaModelsResponse,
     PlanDecisionCommand, PlanDecisionResponse, ProveManagedModelRuntimeCommand,
     RunDiagnosticsReport, RuntimeStatus, SearchProjectContextCommand, SearchProjectContextResponse,
@@ -289,6 +290,17 @@ pub async fn train_lora_adapter(
     request: TrainLoraAdapterCommand,
 ) -> Result<TrainLoraAdapterResponse, IpcError> {
     state.train_lora_adapter(request).await.map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn evaluate_prompt_challenger(
+    state: State<'_, CrytexAppState>,
+    request: EvaluatePromptChallengerCommand,
+) -> Result<EvaluatePromptChallengerResponse, IpcError> {
+    state
+        .evaluate_prompt_challenger(request)
+        .await
+        .map_err(Into::into)
 }
 
 #[cfg(test)]

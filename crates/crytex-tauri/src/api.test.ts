@@ -28,8 +28,12 @@ describe("createCrytexApi", () => {
       events: [],
       review_task_ids: [],
       critic_feedback: [],
+      artifact_lineage: [],
+      artifact_handoff_rejections: [],
       remediation_events: [],
       rag_context_sent_to_model: false,
+      lora_evolution: [],
+      prompt_evolution: [],
       human_reward_recorded: false,
     });
 
@@ -89,6 +93,66 @@ describe("createCrytexApi", () => {
     });
     expect(sink).toHaveBeenCalledWith(expect.objectContaining({
       name: "prove_managed_model_runtime",
+    }));
+  });
+
+  it("should evaluate prompt challenger through tauri ipc", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", {
+      configurable: true,
+      value: {},
+    });
+    vi.mocked(invoke).mockResolvedValue({
+      challenger: {
+        id: "prompt-v2",
+        agent: "coder",
+        project_id: null,
+        system_prompt: "challenger",
+        fitness: 1,
+        parent_id: "prompt-v1",
+        metrics: {},
+        created_at: 1,
+        active: true,
+      },
+      active: {
+        id: "prompt-v2",
+        agent: "coder",
+        project_id: null,
+        system_prompt: "challenger",
+        fitness: 1,
+        parent_id: "prompt-v1",
+        metrics: {},
+        created_at: 1,
+        active: true,
+      },
+      promoted: true,
+      benchmark_gate: {
+        accepted: true,
+      },
+    });
+
+    const sink = vi.fn();
+    const api = createCrytexApi(sink);
+    await api.evaluatePromptChallenger({
+      project_id: "project-1",
+      run_id: "run-1",
+      trace_id: "trace-1",
+      task_id: "task-coder",
+      agent: "coder",
+      challenger_prompt_version_id: "prompt-v2",
+    });
+
+    expect(invoke).toHaveBeenCalledWith("evaluate_prompt_challenger", {
+      request: {
+        project_id: "project-1",
+        run_id: "run-1",
+        trace_id: "trace-1",
+        task_id: "task-coder",
+        agent: "coder",
+        challenger_prompt_version_id: "prompt-v2",
+      },
+    });
+    expect(sink).toHaveBeenCalledWith(expect.objectContaining({
+      name: "evaluate_prompt_challenger",
     }));
   });
 
