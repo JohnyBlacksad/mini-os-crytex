@@ -185,6 +185,8 @@ pub struct RunDiagnosticTask {
     pub critic_feedback: Option<String>,
     pub critic_score: Option<f64>,
     pub human_score: Option<f64>,
+    pub prompt_version_id: Option<String>,
+    pub lora_adapter_id: Option<String>,
 }
 
 /// One observable event included in a run diagnostic report.
@@ -232,6 +234,93 @@ pub struct RunDiagnosticPromptEvolution {
     pub metadata: Value,
 }
 
+/// One backend/model routing decision included in a run diagnostic report.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RunDiagnosticModelDecision {
+    pub task_id: Option<String>,
+    pub backend_id: Option<String>,
+    pub model: Option<String>,
+    pub reason: String,
+    pub source: String,
+    pub metadata: Value,
+}
+
+/// One RAG rerank decision included in a run diagnostic report.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RunDiagnosticRerankDecision {
+    pub task_id: Option<String>,
+    pub query: Option<String>,
+    pub rerank_applied: bool,
+    pub before: Vec<Value>,
+    pub after: Vec<Value>,
+    pub selected: Vec<Value>,
+    pub reason: String,
+    pub metadata: Value,
+}
+
+/// One context-compression decision included in a run diagnostic report.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RunDiagnosticContextCompression {
+    pub task_id: Option<String>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub compression_ratio: Option<f64>,
+    pub preserved_facts: Vec<String>,
+    pub reason: String,
+    pub metadata: Value,
+}
+
+/// One prompt-selection decision included in a run diagnostic report.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RunDiagnosticPromptDecision {
+    pub task_id: String,
+    pub agent: Option<String>,
+    pub prompt_version_id: Option<String>,
+    pub reason: String,
+    pub benchmark: Option<Value>,
+}
+
+/// One LoRA-selection decision included in a run diagnostic report.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RunDiagnosticLoraDecision {
+    pub task_id: String,
+    pub agent: Option<String>,
+    pub adapter_id: Option<String>,
+    pub reason: String,
+    pub benchmark: Option<Value>,
+}
+
+/// One benchmark result included in a run diagnostic report.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RunDiagnosticBenchmarkResult {
+    pub task_id: Option<String>,
+    pub kind: String,
+    pub accepted: Option<bool>,
+    pub winner: Option<String>,
+    pub baseline_run_id: Option<String>,
+    pub challenger_run_id: Option<String>,
+    pub baseline_pass_rate: Option<f64>,
+    pub challenger_pass_rate: Option<f64>,
+    pub mc_nemar_p_value: Option<f64>,
+    pub reason: Option<String>,
+    pub held_out: Option<bool>,
+    pub metadata: Value,
+}
+
+/// One A/B test decision included in a run diagnostic report.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RunDiagnosticAbTestResult {
+    pub task_id: Option<String>,
+    pub kind: String,
+    pub baseline_run_id: Option<String>,
+    pub challenger_run_id: Option<String>,
+    pub winner: Option<String>,
+    pub delta_pass_rate: Option<f64>,
+    pub accepted: Option<bool>,
+    pub reason: Option<String>,
+    pub metadata: Value,
+}
+
 /// One rejected artifact handoff included in a run diagnostic report.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RunDiagnosticArtifactHandoffRejection {
@@ -270,6 +359,13 @@ pub struct RunDiagnosticsReport {
     pub artifact_lineage: Vec<AgentArtifactEnvelope>,
     pub artifact_handoff_rejections: Vec<RunDiagnosticArtifactHandoffRejection>,
     pub remediation_events: Vec<RunDiagnosticEvent>,
+    pub model_decisions: Vec<RunDiagnosticModelDecision>,
+    pub rerank_decisions: Vec<RunDiagnosticRerankDecision>,
+    pub context_compression: Vec<RunDiagnosticContextCompression>,
+    pub prompt_decisions: Vec<RunDiagnosticPromptDecision>,
+    pub lora_decisions: Vec<RunDiagnosticLoraDecision>,
+    pub benchmark_results: Vec<RunDiagnosticBenchmarkResult>,
+    pub ab_test_results: Vec<RunDiagnosticAbTestResult>,
     pub lora_evolution: Vec<RunDiagnosticLoraEvolution>,
     pub prompt_evolution: Vec<RunDiagnosticPromptEvolution>,
     pub rag_context_sent_to_model: bool,
@@ -1104,8 +1200,15 @@ pub fn build_run_diagnostics(
         .filter(|event| event.action.contains("remediation"))
         .cloned()
         .collect::<Vec<_>>();
+    let model_decisions = diagnostic_model_decisions(&events, &runtime);
+    let rerank_decisions = diagnostic_rerank_decisions(&events);
+    let context_compression = diagnostic_context_compression(&events);
     let lora_evolution = diagnostic_lora_evolution(&events);
     let prompt_evolution = diagnostic_prompt_evolution(&events);
+    let prompt_decisions = diagnostic_prompt_decisions(&tasks, &prompt_evolution);
+    let lora_decisions = diagnostic_lora_decisions(&tasks, &lora_evolution);
+    let benchmark_results = diagnostic_benchmark_results(&events);
+    let ab_test_results = diagnostic_ab_test_results(&benchmark_results);
     let rag_context_sent_to_model = events.iter().any(|event| {
         event.action == "llm_request" && metadata_contains_rag_marker(&event.metadata)
     });
@@ -1125,6 +1228,13 @@ pub fn build_run_diagnostics(
         artifact_lineage,
         artifact_handoff_rejections,
         remediation_events,
+        model_decisions,
+        rerank_decisions,
+        context_compression,
+        prompt_decisions,
+        lora_decisions,
+        benchmark_results,
+        ab_test_results,
         lora_evolution,
         prompt_evolution,
         rag_context_sent_to_model,
@@ -1179,6 +1289,139 @@ fn diagnostic_review_task_ids(
         }
     }
     ids
+}
+
+fn diagnostic_model_decisions(
+    events: &[RunDiagnosticEvent],
+    runtime: &RuntimeStatus,
+) -> Vec<RunDiagnosticModelDecision> {
+    let mut decisions = events
+        .iter()
+        .filter(|event| event.action == "llm_request" || event.action == "model_runtime_proved")
+        .map(|event| {
+            let backend_id = event
+                .metadata
+                .get("backend_id")
+                .or_else(|| event.metadata.get("backend"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+                .or_else(|| runtime.active_backend.clone());
+            let model = event
+                .metadata
+                .get("model")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+                .or_else(|| runtime.active_model.clone());
+            RunDiagnosticModelDecision {
+                task_id: event.task_id.clone(),
+                backend_id,
+                model,
+                reason: match event.action.as_str() {
+                    "llm_request" => "llm_request selected backend/model for generation".into(),
+                    "model_runtime_proved" => "runtime proof validated backend/model".into(),
+                    _ => "runtime selected backend/model".into(),
+                },
+                source: event.action.clone(),
+                metadata: event.metadata.clone(),
+            }
+        })
+        .collect::<Vec<_>>();
+    if decisions.is_empty() && (runtime.active_backend.is_some() || runtime.active_model.is_some())
+    {
+        decisions.push(RunDiagnosticModelDecision {
+            task_id: None,
+            backend_id: runtime.active_backend.clone(),
+            model: runtime.active_model.clone(),
+            reason: "runtime_status exposes active backend/model".into(),
+            source: "runtime_status".into(),
+            metadata: serde_json::json!({
+                "executor_mode": runtime.executor_mode,
+                "planning_mode": runtime.planning_mode,
+                "real_agent_execution": runtime.real_agent_execution,
+                "ready_to_run": runtime.ready_to_run,
+            }),
+        });
+    }
+    decisions
+}
+
+fn diagnostic_rerank_decisions(events: &[RunDiagnosticEvent]) -> Vec<RunDiagnosticRerankDecision> {
+    events
+        .iter()
+        .filter(|event| event.action == "rag_context_assembled")
+        .map(|event| {
+            let before = value_array(event.metadata.get("retrieval_candidates"));
+            let reranked = value_array(event.metadata.get("reranked_chunks"));
+            let selected = value_array(event.metadata.get("chunks"));
+            let after = if reranked.is_empty() {
+                selected.clone()
+            } else {
+                reranked
+            };
+            let rerank_applied = event
+                .metadata
+                .get("rerank_applied")
+                .and_then(Value::as_bool)
+                .unwrap_or(!after.is_empty() && before != after);
+            RunDiagnosticRerankDecision {
+                task_id: event.task_id.clone(),
+                query: event
+                    .metadata
+                    .get("query")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                rerank_applied,
+                before,
+                after,
+                selected,
+                reason: if rerank_applied {
+                    "RAG context selected after retrieval and rerank evidence".into()
+                } else {
+                    "RAG context selected from retrieval evidence without rerank".into()
+                },
+                metadata: event.metadata.clone(),
+            }
+        })
+        .collect()
+}
+
+fn diagnostic_context_compression(
+    events: &[RunDiagnosticEvent],
+) -> Vec<RunDiagnosticContextCompression> {
+    events
+        .iter()
+        .filter(|event| {
+            event.action == "context_compression_applied"
+                || event.metadata.get("context_compression").is_some()
+                || event.metadata.get("compression").is_some()
+        })
+        .map(|event| {
+            let metadata = event
+                .metadata
+                .get("context_compression")
+                .or_else(|| event.metadata.get("compression"))
+                .unwrap_or(&event.metadata);
+            let input_tokens = number_u64(metadata, "input_tokens");
+            let output_tokens = number_u64(metadata, "output_tokens");
+            let compression_ratio = metadata
+                .get("compression_ratio")
+                .or_else(|| metadata.get("ratio"))
+                .and_then(Value::as_f64)
+                .or_else(|| match (input_tokens, output_tokens) {
+                    (Some(input), Some(output)) if input > 0 => Some(output as f64 / input as f64),
+                    _ => None,
+                });
+            RunDiagnosticContextCompression {
+                task_id: event.task_id.clone(),
+                input_tokens,
+                output_tokens,
+                compression_ratio,
+                preserved_facts: string_array(metadata.get("preserved_facts")),
+                reason: "context compression preserved selected facts within token budget".into(),
+                metadata: metadata.clone(),
+            }
+        })
+        .collect()
 }
 
 fn diagnostic_lora_evolution(events: &[RunDiagnosticEvent]) -> Vec<RunDiagnosticLoraEvolution> {
@@ -1329,6 +1572,146 @@ fn diagnostic_prompt_evolution(events: &[RunDiagnosticEvent]) -> Vec<RunDiagnost
         .collect()
 }
 
+fn diagnostic_prompt_decisions(
+    tasks: &[RunDiagnosticTask],
+    prompt_evolution: &[RunDiagnosticPromptEvolution],
+) -> Vec<RunDiagnosticPromptDecision> {
+    tasks
+        .iter()
+        .map(|task| {
+            let benchmark = prompt_evolution
+                .iter()
+                .find(|decision| {
+                    decision.task_id.as_deref() == Some(task.id.as_str())
+                        || decision.challenger_prompt_version_id == task.prompt_version_id
+                })
+                .map(|decision| decision.metadata.clone());
+            RunDiagnosticPromptDecision {
+                task_id: task.id.clone(),
+                agent: task.agent.clone(),
+                prompt_version_id: task.prompt_version_id.clone(),
+                reason: if task.prompt_version_id.is_some() {
+                    "task was created with active prompt version for its agent".into()
+                } else {
+                    "task used agent default system prompt because no prompt version was assigned"
+                        .into()
+                },
+                benchmark,
+            }
+        })
+        .collect()
+}
+
+fn diagnostic_lora_decisions(
+    tasks: &[RunDiagnosticTask],
+    lora_evolution: &[RunDiagnosticLoraEvolution],
+) -> Vec<RunDiagnosticLoraDecision> {
+    tasks
+        .iter()
+        .map(|task| {
+            let benchmark = lora_evolution
+                .iter()
+                .find(|decision| {
+                    decision.task_id.as_deref() == Some(task.id.as_str())
+                        || decision.adapter_id == task.lora_adapter_id
+                })
+                .map(|decision| decision.metadata.clone());
+            RunDiagnosticLoraDecision {
+                task_id: task.id.clone(),
+                agent: task.agent.clone(),
+                adapter_id: task.lora_adapter_id.clone(),
+                reason: if task.lora_adapter_id.is_some() {
+                    "task was routed to a role/kind LoRA adapter".into()
+                } else {
+                    "no active role/kind LoRA adapter was selected for this task".into()
+                },
+                benchmark,
+            }
+        })
+        .collect()
+}
+
+fn diagnostic_benchmark_results(
+    events: &[RunDiagnosticEvent],
+) -> Vec<RunDiagnosticBenchmarkResult> {
+    events
+        .iter()
+        .filter_map(|event| {
+            let (kind, gate) = benchmark_gate_for_event(event)?;
+            Some(RunDiagnosticBenchmarkResult {
+                task_id: event.task_id.clone(),
+                kind,
+                accepted: gate.get("accepted").and_then(Value::as_bool),
+                winner: gate
+                    .get("winner")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                baseline_run_id: gate
+                    .get("baseline_run_id")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                challenger_run_id: gate
+                    .get("challenger_run_id")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                baseline_pass_rate: gate.get("baseline_pass_rate").and_then(Value::as_f64),
+                challenger_pass_rate: gate.get("challenger_pass_rate").and_then(Value::as_f64),
+                mc_nemar_p_value: gate.get("mc_nemar_p_value").and_then(Value::as_f64),
+                reason: gate
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                held_out: gate.get("held_out").and_then(Value::as_bool),
+                metadata: gate.clone(),
+            })
+        })
+        .collect()
+}
+
+fn diagnostic_ab_test_results(
+    benchmarks: &[RunDiagnosticBenchmarkResult],
+) -> Vec<RunDiagnosticAbTestResult> {
+    benchmarks
+        .iter()
+        .filter(|benchmark| {
+            benchmark.baseline_run_id.is_some() || benchmark.challenger_run_id.is_some()
+        })
+        .map(|benchmark| RunDiagnosticAbTestResult {
+            task_id: benchmark.task_id.clone(),
+            kind: benchmark.kind.clone(),
+            baseline_run_id: benchmark.baseline_run_id.clone(),
+            challenger_run_id: benchmark.challenger_run_id.clone(),
+            winner: benchmark.winner.clone(),
+            delta_pass_rate: match (benchmark.baseline_pass_rate, benchmark.challenger_pass_rate) {
+                (Some(baseline), Some(challenger)) => Some(challenger - baseline),
+                _ => None,
+            },
+            accepted: benchmark.accepted,
+            reason: benchmark.reason.clone(),
+            metadata: benchmark.metadata.clone(),
+        })
+        .collect()
+}
+
+fn benchmark_gate_for_event(event: &RunDiagnosticEvent) -> Option<(String, Value)> {
+    let kind = if event.action.starts_with("prompt_evolution_") {
+        "prompt".to_string()
+    } else if event.action.starts_with("lora_evolution_") {
+        "lora".to_string()
+    } else if event.action.contains("benchmark") {
+        event.action.clone()
+    } else {
+        return None;
+    };
+    let gate = event
+        .metadata
+        .get("prompt_benchmark_gate")
+        .or_else(|| event.metadata.get("lora_benchmark_gate"))
+        .or_else(|| event.metadata.get("benchmark_gate"))
+        .or_else(|| event.metadata.get("benchmark"))?;
+    Some((kind, gate.clone()))
+}
+
 fn diagnostic_task_row(task: &Task) -> RunDiagnosticTask {
     RunDiagnosticTask {
         id: task.id.clone(),
@@ -1347,7 +1730,33 @@ fn diagnostic_task_row(task: &Task) -> RunDiagnosticTask {
         critic_feedback: task.result.as_ref().and_then(critic_feedback_from_result),
         critic_score: task.critic_score,
         human_score: task.human_score,
+        prompt_version_id: task.prompt_version_id.clone(),
+        lora_adapter_id: task.lora_adapter_id.clone(),
     }
+}
+
+fn value_array(value: Option<&Value>) -> Vec<Value> {
+    value
+        .and_then(Value::as_array)
+        .map(|items| items.to_vec())
+        .unwrap_or_default()
+}
+
+fn string_array(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn number_u64(metadata: &Value, key: &str) -> Option<u64> {
+    metadata.get(key).and_then(Value::as_u64)
 }
 
 fn diagnostic_artifact_lineage(tasks: &[Task]) -> Vec<AgentArtifactEnvelope> {
@@ -5821,6 +6230,170 @@ mod tests {
         assert_eq!(decision.mc_nemar_p_value, Some(0.03125));
         assert_eq!(decision.baseline_pass_rate, Some(0.5));
         assert_eq!(decision.challenger_pass_rate, Some(1.0));
+    }
+
+    #[test]
+    fn build_run_diagnostics_exports_key_observability_decisions() {
+        let runtime = RuntimeStatus {
+            tauri_runtime: true,
+            executor_mode: "ollama_agent".into(),
+            planning_mode: "deterministic".into(),
+            active_backend: Some("ollama".into()),
+            active_model: Some("qwen3.5:9b".into()),
+            ollama_url: Some("http://127.0.0.1:11434".into()),
+            real_agent_execution: true,
+            ready_to_run: true,
+            missing_requirements: vec![],
+            backend_capabilities: vec![],
+            cuda_toolchain: None,
+            compatibility_notes: vec![],
+            model_compatibility: None,
+        };
+        let mut task = diagnostic_task(
+            "task-coder",
+            "coder",
+            TaskStatus::Completed,
+            json!({ "source": "agent_service" }),
+        );
+        task.prompt_version_id = Some("prompt-coder-v2".into());
+        task.lora_adapter_id = Some("coder-lora-v1".into());
+        let state = ProjectState {
+            project: dummy_project("p1"),
+            kanban: KanbanState {
+                project_id: "p1".into(),
+                columns: vec![],
+            },
+            tasks: vec![task],
+            recent_logs: vec![
+                diagnostic_log(
+                    "llm_request",
+                    Some("task-coder"),
+                    json!({
+                        "run_id": "run-1",
+                        "trace_id": "trace-1",
+                        "backend_id": "ollama",
+                        "model": "qwen3.5:9b",
+                        "lora_adapter_id": "coder-lora-v1",
+                        "messages": [{"role": "user", "content": "selected project context"}]
+                    }),
+                ),
+                diagnostic_log(
+                    "rag_context_assembled",
+                    Some("task-coder"),
+                    json!({
+                        "run_id": "run-1",
+                        "trace_id": "trace-1",
+                        "query": "payment retry adapter",
+                        "rerank_applied": true,
+                        "retrieval_candidates": [
+                            {"id": "doc-low", "score": 0.41, "relative_path": "docs/low.md", "selection_reason": "dense candidate"},
+                            {"id": "doc-high", "score": 0.72, "relative_path": "docs/high.md", "selection_reason": "dense candidate"}
+                        ],
+                        "reranked_chunks": [
+                            {"id": "doc-high", "score": 0.93, "relative_path": "docs/high.md", "selection_reason": "reranker promoted exact task evidence"},
+                            {"id": "doc-low", "score": 0.44, "relative_path": "docs/low.md", "selection_reason": "reranker kept supporting context"}
+                        ],
+                        "chunks": [
+                            {"id": "doc-high", "score": 0.93, "relative_path": "docs/high.md", "text_preview": "retry adapter preserves idempotency", "selection_reason": "reranker promoted exact task evidence"}
+                        ]
+                    }),
+                ),
+                diagnostic_log(
+                    "context_compression_applied",
+                    Some("task-coder"),
+                    json!({
+                        "run_id": "run-1",
+                        "trace_id": "trace-1",
+                        "input_tokens": 1200,
+                        "output_tokens": 420,
+                        "compression_ratio": 0.35,
+                        "preserved_facts": ["retry adapter preserves idempotency", "human approval required"]
+                    }),
+                ),
+                diagnostic_log(
+                    "prompt_evolution_promoted",
+                    Some("task-coder"),
+                    json!({
+                        "run_id": "run-1",
+                        "trace_id": "trace-1",
+                        "agent": "coder",
+                        "baseline_prompt_version_id": "prompt-coder-v1",
+                        "challenger_prompt_version_id": "prompt-coder-v2",
+                        "prompt_benchmark_gate": {
+                            "accepted": true,
+                            "reason": "challenger improves held-out pass rate",
+                            "baseline_run_id": "prompt-a",
+                            "challenger_run_id": "prompt-b",
+                            "winner": "Challenger",
+                            "mc_nemar_p_value": 0.03125,
+                            "baseline_pass_rate": 0.5,
+                            "challenger_pass_rate": 1.0,
+                            "held_out": true
+                        }
+                    }),
+                ),
+                diagnostic_log(
+                    "lora_evolution_promoted",
+                    Some("task-coder"),
+                    json!({
+                        "run_id": "run-1",
+                        "trace_id": "trace-1",
+                        "adapter_id": "coder-lora-v1",
+                        "benchmark_gate": {
+                            "accepted": true,
+                            "reason": "adapter improves held-out code repair",
+                            "baseline_run_id": "lora-a",
+                            "challenger_run_id": "lora-b",
+                            "winner": "Challenger",
+                            "mc_nemar_p_value": 0.03125,
+                            "baseline_pass_rate": 0.25,
+                            "challenger_pass_rate": 0.75,
+                            "held_out": true
+                        }
+                    }),
+                ),
+            ],
+            latest_snapshot: None,
+            metrics: MetricsSnapshot::default(),
+        };
+
+        let report = build_run_diagnostics(
+            ExportRunDiagnosticsCommand {
+                project_id: "p1".into(),
+                run_id: "run-1".into(),
+                trace_id: None,
+            },
+            state,
+            runtime,
+        )
+        .unwrap();
+
+        assert_eq!(
+            report.model_decisions[0].model.as_deref(),
+            Some("qwen3.5:9b")
+        );
+        assert!(
+            report.model_decisions[0]
+                .reason
+                .contains("llm_request selected backend/model")
+        );
+        assert_eq!(report.rerank_decisions[0].before[0]["id"], "doc-low");
+        assert_eq!(report.rerank_decisions[0].after[0]["id"], "doc-high");
+        assert_eq!(report.context_compression[0].compression_ratio, Some(0.35));
+        assert_eq!(
+            report.context_compression[0].preserved_facts[0],
+            "retry adapter preserves idempotency"
+        );
+        assert_eq!(
+            report.prompt_decisions[0].prompt_version_id.as_deref(),
+            Some("prompt-coder-v2")
+        );
+        assert_eq!(
+            report.lora_decisions[0].adapter_id.as_deref(),
+            Some("coder-lora-v1")
+        );
+        assert_eq!(report.benchmark_results.len(), 2);
+        assert_eq!(report.ab_test_results.len(), 2);
     }
 
     #[tokio::test]
