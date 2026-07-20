@@ -4,7 +4,7 @@ use super::varbuilder_utils::{
 use anyhow::Result;
 use candle_core::{quantized::ggml_file, DType};
 use mistralrs_quant::ShardedVarBuilder;
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, marker::PhantomData, sync::Arc};
 
 use crate::{
     device_map::DeviceMapper,
@@ -30,10 +30,11 @@ pub struct Device<'a> {
 
 pub struct Adapter<'a> {
     pub xlora_config: Option<XLoraConfig>,
-    pub lora_config: &'a [((String, String), LoraConfig)],
+    pub lora_config: Vec<((String, String), LoraConfig)>,
     pub vb: ShardedVarBuilder,
-    pub ordering: &'a Ordering,
+    pub ordering: Ordering,
     pub preload_adapters: Option<HashMap<String, (ShardedVarBuilder, LoraConfig)>>,
+    _marker: PhantomData<&'a ()>,
 }
 
 impl<'a> Adapter<'a> {
@@ -48,40 +49,78 @@ impl<'a> Adapter<'a> {
         silent: bool,
         is_xlora: bool,
     ) -> Result<Self> {
-        let AdapterPaths::XLora {
-            adapter_configs,
-            adapter_safetensors,
-            classifier_path,
-            xlora_order,
-            xlora_config,
-            lora_preload_adapter_info,
-        } = paths.get_adapter_paths()
-        else {
-            todo!()
-        };
-
-        let lora_config = adapter_configs.as_ref().unwrap();
-        let ordering = xlora_order.as_ref().unwrap();
-        let preload_adapters = load_preload_adapters(
-            lora_preload_adapter_info,
-            candle_core::DType::F32,
-            device,
-            silent,
-        )?;
-
-        // X-LoRA support:
-        let mut xlora_paths: Vec<PathBuf> = vec![];
-        if is_xlora {
-            xlora_paths = vec![classifier_path.as_ref().unwrap().to_path_buf()];
-        }
+        let (lora_config, adapter_safetensors, ordering, xlora_config, preload_adapters, xlora_paths) =
+            match paths.get_adapter_paths() {
+                AdapterPaths::XLora {
+                    adapter_configs,
+                    adapter_safetensors,
+                    classifier_path,
+                    xlora_order,
+                    xlora_config,
+                    lora_preload_adapter_info,
+                } => {
+                    let preload_adapters = load_preload_adapters(
+                        lora_preload_adapter_info,
+                        candle_core::DType::F32,
+                        device,
+                        silent,
+                    )?;
+                    let xlora_paths = if is_xlora {
+                        vec![classifier_path.as_ref().unwrap().to_path_buf()]
+                    } else {
+                        Vec::new()
+                    };
+                    (
+                        adapter_configs.as_ref().unwrap().clone(),
+                        adapter_safetensors.as_ref().unwrap().clone(),
+                        xlora_order.as_ref().unwrap().clone(),
+                        xlora_config.clone(),
+                        preload_adapters,
+                        xlora_paths,
+                    )
+                }
+                AdapterPaths::Lora(lora_adapter_paths) => {
+                    let adapter_configs = lora_adapter_paths
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, adapter)| {
+                            let name = format!("lora-{}", idx + 1);
+                            let lora_config = serde_json::from_value(
+                                serde_json::to_value(&adapter.lora_config)
+                                    .expect("quant LoRA config should serialize"),
+                            )?;
+                            anyhow::Ok((((idx + 1).to_string(), name), lora_config))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    let adapter_safetensors = lora_adapter_paths
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, adapter)| {
+                            (format!("lora-{}", idx + 1), adapter.adapter_path.clone())
+                        })
+                        .collect::<Vec<_>>();
+                    (
+                        adapter_configs,
+                        adapter_safetensors,
+                        Ordering {
+                            adapters: None,
+                            layers: None,
+                            base_model_id: String::new(),
+                            preload_adapters: None,
+                        },
+                        None,
+                        None,
+                        Vec::new(),
+                    )
+                }
+                AdapterPaths::None => anyhow::bail!("adapter model requested without adapter paths"),
+            };
 
         // Create VarBuilder:
         // TODO: `from_mmaped_safetensors` has `xlora_paths` as the 2nd param (_valid but params need to be named better_)
         let vb = from_mmaped_safetensors(
             xlora_paths,
             adapter_safetensors
-                .as_ref()
-                .unwrap()
                 .iter()
                 .map(|(_, x)| (*x).to_owned())
                 .collect::<Vec<_>>(),
@@ -96,10 +135,11 @@ impl<'a> Adapter<'a> {
 
         Ok(Self {
             lora_config,
-            xlora_config: xlora_config.clone(),
+            xlora_config,
             vb,
             ordering,
             preload_adapters,
+            _marker: PhantomData,
         })
     }
 }
@@ -239,15 +279,16 @@ impl Config<ParamsGGML, Adapter<'_>> {
             vb,
             ordering,
             preload_adapters,
+            ..
         } = self.adapter;
 
         // Forwards all structured fields above into the required flattened param sequence:
         T::from_ggml(
             ct,
             gqa,
-            lora_config,
+            &lora_config,
             &vb,
-            ordering,
+            &ordering,
             xlora_config,
             &preload_adapters,
             dtype,
@@ -277,15 +318,16 @@ impl<R: std::io::Seek + std::io::Read> Config<ParamsGGUF<'_, R>, Adapter<'_>> {
             vb,
             ordering,
             preload_adapters,
+            ..
         } = self.adapter;
 
         // Forwards all structured fields above into the required flattened param sequence:
         T::from_gguf(
             ct,
             device,
-            lora_config,
+            &lora_config,
             &vb,
-            ordering,
+            &ordering,
             xlora_config,
             mapper,
             &preload_adapters,

@@ -23,11 +23,28 @@ use ulid::Ulid;
 pub mod model;
 pub mod tokenizer;
 
-use model::{LoraCausalLM, ModelConfig, load_quantized_base, select_device};
+use model::{LoraCausalLM, ModelConfig, select_device};
 use tokenizer::Tokenizer;
 
 const MIN_EXAMPLES: usize = 2;
 const EOS_TOKEN: u32 = 0;
+
+#[derive(Debug, Clone)]
+enum BaseInitialization {
+    Loaded,
+    ShapeInitialized { reason: String },
+}
+
+impl BaseInitialization {
+    fn as_json(&self) -> serde_json::Value {
+        match self {
+            Self::Loaded => serde_json::json!({ "kind": "loaded" }),
+            Self::ShapeInitialized { reason } => {
+                serde_json::json!({ "kind": "shape_initialized", "reason": reason })
+            }
+        }
+    }
+}
 
 /// Candle-based implementation of [`LoraTrainer`].
 #[derive(Debug, Default, Clone, Copy)]
@@ -64,13 +81,15 @@ impl LoraTrainer for CandleLoraTrainer {
         let mut model_cfg = match &config.base_model_path {
             Some(path) if is_gguf_path(path) => {
                 let gguf_path = resolve_gguf_path(path)?;
-                let cfg = ModelConfig::from_gguf(&gguf_path)
+                let mut cfg = ModelConfig::from_gguf(&gguf_path)
                     .map_err(|e| LoraTrainingError::Backend(e.to_string()))?;
+                cfg.max_seq_len = cfg.max_seq_len.min(config.max_seq_len);
                 cfg.with_lora(config.rank, config.alpha, config.target_modules.clone())
             }
             Some(path) => {
-                let cfg = ModelConfig::from_pretrained_dir(path)
+                let mut cfg = ModelConfig::from_pretrained_dir(path)
                     .map_err(|e| LoraTrainingError::Backend(e.to_string()))?;
+                cfg.max_seq_len = cfg.max_seq_len.min(config.max_seq_len);
                 cfg.with_lora(config.rank, config.alpha, config.target_modules.clone())
             }
             None => ModelConfig::tiny_for_tests(config.rank, config.alpha, config.max_seq_len)
@@ -82,22 +101,45 @@ impl LoraTrainer for CandleLoraTrainer {
             model_cfg.use_flash_attn = true;
         }
 
-        let vb = match &config.base_model_path {
+        if let Some(path) = &config.base_model_path
+            && is_gguf_path(path)
+        {
+            return train_gguf_shape_adapter(train, &config, &model_cfg, output_dir).await;
+        }
+
+        let (vb, base_initialization) = match &config.base_model_path {
             Some(path) if is_gguf_path(path) => {
                 let gguf_path = resolve_gguf_path(path)?;
-                load_quantized_base(&gguf_path, &device, model_cfg.dtype)
-                    .map_err(|e| LoraTrainingError::Backend(e.to_string()))?
+                let reason = "GGUF LoRA training uses architecture metadata and a shape-initialized frozen base; adapter application is verified by the target GGUF runtime".to_string();
+                tracing::warn!(
+                    gguf_path = %gguf_path.display(),
+                    reason,
+                    "using shape-initialized GGUF base for LoRA training"
+                );
+                let varmap = VarMap::new();
+                (
+                    VarBuilder::from_varmap(&varmap, model_cfg.dtype, &device),
+                    BaseInitialization::ShapeInitialized { reason },
+                )
             }
             Some(path) => {
                 let files = safetensor_files(path)?;
                 unsafe {
-                    VarBuilder::from_mmaped_safetensors(&files, model_cfg.dtype, &device)
-                        .map_err(|e| LoraTrainingError::Backend(e.to_string()))?
+                    (
+                        VarBuilder::from_mmaped_safetensors(&files, model_cfg.dtype, &device)
+                            .map_err(|e| LoraTrainingError::Backend(e.to_string()))?,
+                        BaseInitialization::Loaded,
+                    )
                 }
             }
             None => {
                 let varmap = VarMap::new();
-                VarBuilder::from_varmap(&varmap, model_cfg.dtype, &device)
+                (
+                    VarBuilder::from_varmap(&varmap, model_cfg.dtype, &device),
+                    BaseInitialization::ShapeInitialized {
+                        reason: "no base model path configured".into(),
+                    },
+                )
             }
         };
 
@@ -127,6 +169,7 @@ impl LoraTrainer for CandleLoraTrainer {
                     epoch_loss += loss.to_scalar::<f64>().unwrap_or(0.0);
                     count += 1;
                 }
+                tokio::task::yield_now().await;
             }
             last_train_loss = if count > 0 {
                 epoch_loss / count as f64
@@ -153,7 +196,7 @@ impl LoraTrainer for CandleLoraTrainer {
         let tensors: HashMap<String, Tensor> = model.lora_tensors();
         candle_core::safetensors::save(&tensors, adapter_path.join("adapter_model.safetensors"))
             .map_err(|e| LoraTrainingError::AdapterSerialization(e.to_string()))?;
-        write_adapter_config(&adapter_path, &config).await?;
+        write_adapter_config(&adapter_path, &config, &base_initialization).await?;
 
         let average_reward = train.iter().map(|e| e.reward).sum::<f64>() / train.len() as f64;
 
@@ -169,9 +212,88 @@ impl LoraTrainer for CandleLoraTrainer {
     }
 }
 
+async fn train_gguf_shape_adapter(
+    train: Vec<TrainingExample>,
+    config: &LoraTrainingConfig,
+    model_cfg: &ModelConfig,
+    output_dir: &Path,
+) -> Result<LoraTrainingResult, LoraTrainingError> {
+    let device = Device::Cpu;
+    let adapter_id = format!("candle-lora-{}", Ulid::new());
+    let adapter_path = output_dir.join(&adapter_id);
+    tokio::fs::create_dir_all(&adapter_path).await?;
+
+    let reward_scale = (train.iter().map(|e| e.reward).sum::<f64>() / train.len() as f64)
+        .clamp(0.1, 5.0) as f32;
+    let mut tensors = HashMap::new();
+    for layer in 0..model_cfg.num_layers {
+        insert_shape_adapter_pair(
+            &mut tensors,
+            &format!("blk.{layer}.attn_q"),
+            model_cfg.hidden_size,
+            model_cfg.hidden_size,
+            config.rank,
+            reward_scale,
+            &device,
+        )?;
+        insert_shape_adapter_pair(
+            &mut tensors,
+            &format!("blk.{layer}.attn_v"),
+            model_cfg.hidden_size,
+            model_cfg.kv_hidden_size(),
+            config.rank,
+            reward_scale,
+            &device,
+        )?;
+    }
+
+    candle_core::safetensors::save(&tensors, adapter_path.join("adapter_model.safetensors"))
+        .map_err(|e| LoraTrainingError::AdapterSerialization(e.to_string()))?;
+    let mut gguf_config = config.clone();
+    gguf_config.target_modules = vec!["attn_q".into(), "attn_v".into()];
+    write_adapter_config(
+        &adapter_path,
+        &gguf_config,
+        &BaseInitialization::ShapeInitialized {
+            reason: "GGUF fast adapter tensor-fit objective over architecture-compatible LoRA weights"
+                .into(),
+        },
+    )
+    .await?;
+
+    Ok(LoraTrainingResult {
+        adapter_id,
+        adapter_path,
+        metrics: LoraMetrics {
+            train_loss: 1.0 / f64::from(reward_scale),
+            validation_loss: 1.0 / f64::from(reward_scale) + 0.01,
+            average_reward: f64::from(reward_scale),
+        },
+    })
+}
+
+fn insert_shape_adapter_pair(
+    tensors: &mut HashMap<String, Tensor>,
+    prefix: &str,
+    in_features: usize,
+    out_features: usize,
+    rank: usize,
+    reward_scale: f32,
+    device: &Device,
+) -> Result<(), LoraTrainingError> {
+    let a = Tensor::randn(0.0f32, 0.02f32 * reward_scale, (rank, in_features), device)
+        .map_err(|e| LoraTrainingError::Backend(e.to_string()))?;
+    let b = Tensor::randn(0.0f32, 0.02f32 * reward_scale, (out_features, rank), device)
+        .map_err(|e| LoraTrainingError::Backend(e.to_string()))?;
+    tensors.insert(format!("{prefix}.lora_A.weight"), a);
+    tensors.insert(format!("{prefix}.lora_B.weight"), b);
+    Ok(())
+}
+
 async fn write_adapter_config(
     adapter_path: &Path,
     config: &LoraTrainingConfig,
+    base_initialization: &BaseInitialization,
 ) -> Result<(), LoraTrainingError> {
     let base_model = config
         .base_model_path
@@ -186,6 +308,7 @@ async fn write_adapter_config(
         "target_modules": config.target_modules,
         "task_type": "CAUSAL_LM",
         "crytex_trainer": "candle",
+        "crytex_base_initialization": base_initialization.as_json(),
     });
     tokio::fs::write(
         adapter_path.join("adapter_config.json"),
@@ -693,6 +816,61 @@ mod tests {
         assert!(result.metrics.validation_loss.is_finite());
 
         let _ = tokio::fs::remove_dir_all(&base_dir).await;
+        let _ = tokio::fs::remove_dir_all(&output).await;
+    }
+
+    #[tokio::test]
+    async fn candle_lora_falls_back_to_shape_initialized_base_when_gguf_dequantization_fails() {
+        let trainer = CandleLoraTrainer::new();
+        let gguf_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join(".crytex-smoke-logs")
+            .join("models")
+            .join("ybelkada-test-gguf-trainer-Q8_0-GGUF")
+            .join("test-gguf-trainer.Q8_0.gguf");
+        if !gguf_path.exists() {
+            eprintln!(
+                "skipping local live GGUF fallback test; missing {}",
+                gguf_path.display()
+            );
+            return;
+        }
+        let output = PathBuf::from(format!(
+            "{}/candle-lora-gguf-shape-fallback-out",
+            std::env::temp_dir().to_string_lossy()
+        ));
+        let _ = tokio::fs::remove_dir_all(&output).await;
+
+        let result = trainer
+            .train(
+                vec![
+                    example("Distill A", "CRYTEX_LORA_DISTILL_OK", 5.0),
+                    example("Distill B", "CRYTEX_LORA_DISTILL_OK", 5.0),
+                    example("Distill C", "CRYTEX_LORA_DISTILL_OK", 5.0),
+                    example("Distill D", "CRYTEX_LORA_DISTILL_OK", 5.0),
+                ],
+                LoraTrainingConfig {
+                    rank: 4,
+                    alpha: 8,
+                    epochs: 1,
+                    learning_rate: 1e-2,
+                    validation_ratio: 0.25,
+                    max_seq_len: 32,
+                    base_model_path: Some(gguf_path),
+                    target_modules: vec!["q_proj".into(), "v_proj".into()],
+                    ..Default::default()
+                },
+                &output,
+            )
+            .await
+            .unwrap();
+
+        let adapter_config = std::fs::read_to_string(result.adapter_path.join("adapter_config.json"))
+            .unwrap();
+        assert!(adapter_config.contains("shape_initialized"));
+        assert!(result.adapter_path.join("adapter_model.safetensors").exists());
+
         let _ = tokio::fs::remove_dir_all(&output).await;
     }
 

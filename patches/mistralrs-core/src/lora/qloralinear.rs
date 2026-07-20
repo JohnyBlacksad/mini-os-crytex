@@ -196,8 +196,10 @@ impl Merge for QLoraLinear {
                 w_base_layer = Some(self.get_delta_weight(adapter)?)
             }
         }
-        self.old
-            .add_delta_w(w_base_layer.as_ref().expect("Found no adapters to merge."))?;
+        let Some(w_base_layer) = w_base_layer.as_ref() else {
+            return Ok(());
+        };
+        self.old.add_delta_w(w_base_layer)?;
         self.merged = true;
         Ok(())
     }

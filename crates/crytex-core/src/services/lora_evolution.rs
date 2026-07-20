@@ -160,6 +160,7 @@ pub struct LoraEvolutionServiceImpl {
     benchmark_gate: Option<Arc<dyn LoraBenchmarkGate>>,
     max_adapter_bytes: u64,
     max_train_validation_loss_gap: f64,
+    training_config: LoraTrainingConfig,
 }
 
 impl LoraEvolutionServiceImpl {
@@ -197,6 +198,7 @@ impl LoraEvolutionServiceImpl {
             benchmark_gate: None,
             max_adapter_bytes: DEFAULT_MAX_ADAPTER_BYTES,
             max_train_validation_loss_gap: DEFAULT_MAX_TRAIN_VALIDATION_LOSS_GAP,
+            training_config: LoraTrainingConfig::default(),
         }
     }
 
@@ -263,6 +265,12 @@ impl LoraEvolutionServiceImpl {
     /// Override the minimum human score that makes an approved task a golden example.
     pub fn with_min_human_score(mut self, score: f64) -> Self {
         self.min_human_score = score;
+        self
+    }
+
+    /// Override LoRA training hyper-parameters for this service.
+    pub fn with_training_config(mut self, config: LoraTrainingConfig) -> Self {
+        self.training_config = config;
         self
     }
 
@@ -621,7 +629,7 @@ impl LoraEvolutionServiceImpl {
         }
 
         let validation_count = ((golden_examples.len() as f64
-            * LoraTrainingConfig::default().validation_ratio)
+            * self.training_config.validation_ratio)
             .ceil() as usize)
             .max(1)
             .min(golden_examples.len().saturating_sub(1));
@@ -649,7 +657,7 @@ impl LoraEvolutionServiceImpl {
             .trainer
             .train(
                 train_examples.to_vec(),
-                LoraTrainingConfig::default(),
+                self.training_config.clone(),
                 &output_dir,
             )
             .await
@@ -1625,6 +1633,7 @@ mod tests {
     struct RecordingTrainer {
         inner: MockTrainer,
         trained_examples: Mutex<Vec<TrainingExample>>,
+        configs: Mutex<Vec<LoraTrainingConfig>>,
     }
 
     impl RecordingTrainer {
@@ -1632,6 +1641,7 @@ mod tests {
             Self {
                 inner,
                 trained_examples: Mutex::new(Vec::new()),
+                configs: Mutex::new(Vec::new()),
             }
         }
     }
@@ -1645,6 +1655,7 @@ mod tests {
             output_dir: &Path,
         ) -> Result<LoraTrainingResult, LoraTrainingError> {
             *self.trained_examples.lock().unwrap() = examples.clone();
+            self.configs.lock().unwrap().push(config.clone());
             self.inner.train(examples, config, output_dir).await
         }
     }
@@ -2176,6 +2187,38 @@ mod tests {
                 .iter()
                 .any(|example| example.output_text.contains("bad rejected output"))
         );
+    }
+
+    #[tokio::test]
+    async fn train_and_register_passes_custom_training_config_to_trainer() {
+        let task = make_task("p1", "codegen", TaskStatus::Completed, Some(5.0));
+        let base_model_path = std::env::temp_dir().join(format!("base-{}.gguf", Ulid::new()));
+        let examples = vec![
+            example("codegen", 5.0, 0),
+            example("codegen", 5.0, 1),
+            example("codegen", 5.0, 2),
+        ];
+        let trainer = Arc::new(RecordingTrainer::new(MockTrainer::new()));
+        let (service, _, _, _) = evolution_service_with_trainer(task, examples, trainer.clone());
+        let service = service.with_training_config(LoraTrainingConfig {
+            rank: 4,
+            alpha: 8,
+            epochs: 1,
+            learning_rate: 1e-3,
+            validation_ratio: 0.25,
+            max_seq_len: 32,
+            base_model_path: Some(base_model_path.clone()),
+            tokenizer_path: None,
+            target_modules: vec!["q_proj".into(), "v_proj".into()],
+        });
+
+        service.train_and_register("codegen").await.unwrap();
+
+        let configs = trainer.configs.lock().unwrap();
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].base_model_path.as_ref(), Some(&base_model_path));
+        assert_eq!(configs[0].rank, 4);
+        assert_eq!(configs[0].max_seq_len, 32);
     }
 
     #[tokio::test]

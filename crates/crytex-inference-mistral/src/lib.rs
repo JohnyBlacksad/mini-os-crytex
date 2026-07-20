@@ -3,10 +3,16 @@ use crytex_inference::{
     BackendInfo, InferenceError, InferenceManager, InferenceRequest, InferenceResponse,
     LoRAAdapter, Message, ModelInfo, TokenUsage,
 };
-use mistralrs::core::{DeviceLayerMapMetadata, DeviceMapMetadata, Ordering};
+use image::DynamicImage;
+use indexmap::IndexMap;
+use mistralrs::core::{
+    Constraint, CustomLogitsProcessor, DeviceLayerMapMetadata, DeviceMapMetadata, MessageContent,
+    ModelCategory, Ordering, RequestMessage, ResponseOk, SamplingParams, Tool, ToolChoice,
+    WebSearchOptions,
+};
 use mistralrs::{
     AutoDeviceMapParams, DeviceMapSetting, GgufLoraModelBuilder, GgufModelBuilder, IsqBits,
-    LoraModelBuilder, Model, RequestBuilder, TextMessageRole, TextModelBuilder,
+    LoraModelBuilder, Model, RequestBuilder, RequestLike, TextMessageRole, TextModelBuilder,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -15,6 +21,82 @@ use tokio::sync::Mutex as AsyncMutex;
 use tracing::info;
 
 pub mod training;
+
+struct RawCompletionRequest {
+    prompt: String,
+    sampling_params: SamplingParams,
+    adapters: Vec<String>,
+}
+
+impl RawCompletionRequest {
+    fn new(prompt: String, temperature: f32, max_tokens: usize, adapter: Option<String>) -> Self {
+        let mut sampling_params = SamplingParams::deterministic();
+        sampling_params.temperature = Some(f64::from(temperature));
+        sampling_params.max_len = Some(max_tokens);
+
+        Self {
+            prompt,
+            sampling_params,
+            adapters: adapter.into_iter().collect(),
+        }
+    }
+}
+
+impl RequestLike for RawCompletionRequest {
+    fn messages_ref(&self) -> &[IndexMap<String, MessageContent>] {
+        &[]
+    }
+
+    fn images_ref(&self) -> &[DynamicImage] {
+        &[]
+    }
+
+    fn take_messages(&mut self) -> RequestMessage {
+        RequestMessage::Completion {
+            text: std::mem::take(&mut self.prompt),
+            echo_prompt: false,
+            best_of: None,
+        }
+    }
+
+    fn take_logits_processors(&mut self) -> Option<Vec<Arc<dyn CustomLogitsProcessor>>> {
+        None
+    }
+
+    fn take_adapters(&mut self) -> Option<Vec<String>> {
+        (!self.adapters.is_empty()).then(|| std::mem::take(&mut self.adapters))
+    }
+
+    fn return_logprobs(&self) -> bool {
+        false
+    }
+
+    fn enable_search(&self) -> Option<bool> {
+        None
+    }
+
+    fn take_constraint(&mut self) -> Constraint {
+        Constraint::None
+    }
+
+    fn take_tools(&mut self) -> Option<(Vec<Tool>, ToolChoice)> {
+        None
+    }
+
+    fn take_sampling_params(&mut self) -> SamplingParams {
+        std::mem::replace(&mut self.sampling_params, SamplingParams::deterministic())
+    }
+
+    fn take_web_search_options(&mut self) -> Option<WebSearchOptions> {
+        None
+    }
+
+    fn truncate_sequence(&self) -> bool {
+        true
+    }
+
+    fn resolve_pending_prefixes(&mut self, _category: &ModelCategory) {}
+}
 
 /// In-process local backend powered by [`mistral.rs`](https://github.com/EricLBuehler/mistral.rs).
 ///
@@ -28,9 +110,14 @@ struct Inner {
     model_path: String,
     context_size: usize,
     gpu_layers: Option<usize>,
-    state: AsyncMutex<Option<Arc<Model>>>,
+    state: AsyncMutex<Option<LoadedModel>>,
     loras: Mutex<HashMap<String, LoRAAdapter>>,
     active_lora: Mutex<Option<String>>,
+}
+
+struct LoadedModel {
+    adapter_id: Option<String>,
+    model: Arc<Model>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -75,19 +162,24 @@ impl MistralRsBackend {
         option_env!("MISTRALRS_SKIP_GDN_CUDA").is_none_or(|value| value != "1")
     }
 
-    async fn ensure_loaded(&self) -> Result<Arc<Model>, InferenceError> {
+    async fn ensure_loaded(&self, adapter_id: Option<String>) -> Result<Arc<Model>, InferenceError> {
         let mut guard = self.inner.state.lock().await;
-        if let Some(model) = guard.as_ref() {
-            return Ok(model.clone());
+        if let Some(loaded) = guard.as_ref()
+            && loaded.adapter_id == adapter_id
+        {
+            return Ok(loaded.model.clone());
         }
 
-        let model = Arc::new(self.load_model().await?);
-        *guard = Some(model.clone());
+        let model = Arc::new(self.load_model(adapter_id.clone()).await?);
+        *guard = Some(LoadedModel {
+            adapter_id,
+            model: model.clone(),
+        });
         Ok(model)
     }
 
-    async fn load_model(&self) -> Result<Model, InferenceError> {
-        match self.load_plan()? {
+    async fn load_model(&self, adapter_id: Option<String>) -> Result<Model, InferenceError> {
+        match self.load_plan(adapter_id.as_deref())? {
             MistralLoadPlan::Plain {
                 model_id,
                 lora_adapter_paths,
@@ -103,9 +195,9 @@ impl MistralRsBackend {
         }
     }
 
-    fn load_plan(&self) -> Result<MistralLoadPlan, InferenceError> {
+    fn load_plan(&self, adapter_id: Option<&str>) -> Result<MistralLoadPlan, InferenceError> {
         let path = PathBuf::from(&self.inner.model_path);
-        let lora_adapter_paths = self.registered_lora_adapter_paths()?;
+        let lora_adapter_paths = self.registered_lora_adapter_paths(adapter_id)?;
 
         if looks_like_gguf(&path) {
             let (model_id, files) = resolve_gguf_paths(&path)?;
@@ -122,16 +214,24 @@ impl MistralRsBackend {
         })
     }
 
-    fn registered_lora_adapter_paths(&self) -> Result<Vec<String>, InferenceError> {
+    fn registered_lora_adapter_paths(
+        &self,
+        adapter_id: Option<&str>,
+    ) -> Result<Vec<String>, InferenceError> {
+        let Some(adapter_id) = adapter_id else {
+            return Ok(Vec::new());
+        };
         let loras = self.inner.loras.lock().map_err(|e| {
             InferenceError::LoRALoadFailed(format!("failed to lock LoRA registry: {e}"))
         })?;
-        let mut adapters = loras.values().collect::<Vec<_>>();
-        adapters.sort_by(|left, right| left.id.cmp(&right.id));
-        Ok(adapters
-            .into_iter()
-            .map(|adapter| adapter.path.clone())
-            .collect())
+        loras
+            .get(adapter_id)
+            .map(|adapter| vec![adapter.path.clone()])
+            .ok_or_else(|| {
+                InferenceError::LoRALoadFailed(format!(
+                    "LoRA adapter {adapter_id} is not registered"
+                ))
+            })
     }
 
     async fn load_gguf_model(
@@ -408,6 +508,143 @@ fn apply_plain_device_settings(
     }
 }
 
+fn build_chat_request(
+    request: &InferenceRequest,
+    temperature: f32,
+    max_tokens: usize,
+    adapter: Option<String>,
+) -> RequestBuilder {
+    let mut messages = RequestBuilder::new();
+    if let Some(system) = request.system_prompt.as_ref() {
+        messages = messages.add_message(TextMessageRole::System, system);
+    }
+    for Message { role, content } in &request.messages {
+        let role = match role.as_str() {
+            "system" => TextMessageRole::System,
+            "assistant" => TextMessageRole::Assistant,
+            _ => TextMessageRole::User,
+        };
+        messages = messages.add_message(role, content.clone());
+    }
+
+    messages = messages
+        .set_sampler_temperature(f64::from(temperature))
+        .set_sampler_max_len(max_tokens);
+
+    if let Some(adapter) = adapter {
+        messages = messages.set_adapters(vec![adapter]);
+    }
+
+    messages
+}
+
+fn build_completion_prompt(request: &InferenceRequest) -> String {
+    let mut parts = Vec::new();
+    if let Some(system) = request.system_prompt.as_deref().filter(|s| !s.trim().is_empty()) {
+        parts.push(format!("System: {}", system.trim()));
+    }
+    parts.extend(request.messages.iter().map(|message| {
+        let role = match message.role.as_str() {
+            "system" => "System",
+            "assistant" => "Assistant",
+            _ => "User",
+        };
+        format!("{role}: {}", message.content.trim())
+    }));
+    parts.push("Assistant:".to_string());
+    parts.join("\n")
+}
+
+fn should_retry_as_completion(error: &InferenceError) -> bool {
+    matches!(
+        error,
+        InferenceError::GenerationFailed(message)
+            if message.contains("does not have a chat template")
+                || message.contains("pass a single string as the prompt")
+    )
+}
+
+async fn send_chat_generation(
+    model: &Model,
+    request: RequestBuilder,
+) -> Result<InferenceResponse, InferenceError> {
+    let response = model
+        .send_chat_request(request)
+        .await
+        .map_err(|e| InferenceError::GenerationFailed(e.to_string()))?;
+
+    let content = response
+        .choices
+        .into_iter()
+        .next()
+        .and_then(|c| c.message.content)
+        .unwrap_or_default();
+
+    let usage = response.usage;
+    Ok(InferenceResponse {
+        content,
+        usage: TokenUsage {
+            prompt_tokens: usage.prompt_tokens,
+            completion_tokens: usage.completion_tokens,
+            total_tokens: usage.total_tokens,
+        },
+        finish_reason: "stop".to_string(),
+    })
+}
+
+async fn send_completion_generation(
+    model: &Model,
+    request: RawCompletionRequest,
+) -> Result<InferenceResponse, InferenceError> {
+    let mut stream = model
+        .stream_chat_request(request)
+        .await
+        .map_err(|e| InferenceError::GenerationFailed(e.to_string()))?;
+    let mut content = String::new();
+    let mut usage = TokenUsage {
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        total_tokens: 0,
+    };
+    let mut finish_reason = "stop".to_string();
+
+    while let Some(response) = stream.next().await {
+        match response.as_result() {
+            Ok(ResponseOk::CompletionChunk(chunk)) => {
+                for choice in chunk.choices {
+                    content.push_str(&choice.text);
+                    if let Some(reason) = choice.finish_reason {
+                        finish_reason = reason;
+                    }
+                }
+            }
+            Ok(ResponseOk::CompletionDone(done)) => {
+                for choice in done.choices {
+                    content.push_str(&choice.text);
+                    finish_reason = choice.finish_reason;
+                }
+                usage = TokenUsage {
+                    prompt_tokens: done.usage.prompt_tokens,
+                    completion_tokens: done.usage.completion_tokens,
+                    total_tokens: done.usage.total_tokens,
+                };
+            }
+            Ok(other) => {
+                return Err(InferenceError::GenerationFailed(format!(
+                    "unexpected mistral.rs completion response: {other:?}"
+                )));
+            }
+            Err(err) => return Err(InferenceError::GenerationFailed(err.to_string())),
+        }
+    }
+
+    Ok(InferenceResponse {
+        content,
+        usage,
+        finish_reason,
+    })
+}
+
 #[async_trait]
 impl InferenceManager for MistralRsBackend {
     async fn generate(
@@ -415,53 +652,25 @@ impl InferenceManager for MistralRsBackend {
         request: InferenceRequest,
     ) -> Result<InferenceResponse, InferenceError> {
         let adapter = self.resolve_registered_adapter(&request)?;
-        let model = self.ensure_loaded().await?;
-
-        let mut messages = RequestBuilder::new();
-        if let Some(system) = request.system_prompt {
-            messages = messages.add_message(TextMessageRole::System, system);
-        }
-        for Message { role, content } in &request.messages {
-            let role = match role.as_str() {
-                "system" => TextMessageRole::System,
-                "assistant" => TextMessageRole::Assistant,
-                _ => TextMessageRole::User,
-            };
-            messages = messages.add_message(role, content.clone());
-        }
+        let model = self.ensure_loaded(adapter.clone()).await?;
 
         let temperature = request.temperature.unwrap_or(0.7);
         let max_tokens = request.max_tokens.unwrap_or(512);
-        messages = messages
-            .set_sampler_temperature(f64::from(temperature))
-            .set_sampler_max_len(max_tokens);
+        let chat_request = build_chat_request(&request, temperature, max_tokens, adapter.clone());
 
-        if let Some(adapter) = adapter {
-            messages = messages.set_adapters(vec![adapter]);
+        match send_chat_generation(&model, chat_request).await {
+            Ok(response) => Ok(response),
+            Err(error) if should_retry_as_completion(&error) => {
+                let completion_request = RawCompletionRequest::new(
+                    build_completion_prompt(&request),
+                    temperature,
+                    max_tokens,
+                    adapter,
+                );
+                send_completion_generation(&model, completion_request).await
+            }
+            Err(error) => Err(error),
         }
-
-        let response = model
-            .send_chat_request(messages)
-            .await
-            .map_err(|e| InferenceError::GenerationFailed(e.to_string()))?;
-
-        let content = response
-            .choices
-            .into_iter()
-            .next()
-            .and_then(|c| c.message.content)
-            .unwrap_or_default();
-
-        let usage = response.usage;
-        Ok(InferenceResponse {
-            content,
-            usage: TokenUsage {
-                prompt_tokens: usage.prompt_tokens as usize,
-                completion_tokens: usage.completion_tokens as usize,
-                total_tokens: usage.total_tokens as usize,
-            },
-            finish_reason: "stop".to_string(),
-        })
     }
 
     async fn embed(&self, _text: &str) -> Result<Vec<f32>, InferenceError> {
@@ -639,6 +848,51 @@ mod tests {
     }
 
     #[test]
+    fn raw_completion_request_preserves_prompt_sampling_and_adapter() {
+        let mut request = RawCompletionRequest::new(
+            "User: answer\nAssistant:".to_string(),
+            0.0,
+            7,
+            Some("coder-lora".to_string()),
+        );
+
+        assert_eq!(request.take_adapters(), Some(vec!["coder-lora".to_string()]));
+        assert!(matches!(
+            request.take_messages(),
+            RequestMessage::Completion { text, echo_prompt: false, best_of: None }
+                if text == "User: answer\nAssistant:"
+        ));
+        assert_eq!(request.take_sampling_params().max_len, Some(7));
+    }
+
+    #[test]
+    fn completion_prompt_includes_system_messages_and_assistant_turn() {
+        let request = InferenceRequest {
+            backend_id: Some("mistralrs".into()),
+            model: "model.gguf".into(),
+            system_prompt: Some("Be exact.".into()),
+            messages: vec![
+                Message {
+                    role: "user".into(),
+                    content: "first".into(),
+                },
+                Message {
+                    role: "assistant".into(),
+                    content: "second".into(),
+                },
+            ],
+            temperature: Some(0.0),
+            max_tokens: Some(8),
+            lora_adapter_id: Some("adapter".into()),
+        };
+
+        assert_eq!(
+            build_completion_prompt(&request),
+            "System: Be exact.\nUser: first\nAssistant: second\nAssistant:"
+        );
+    }
+
+    #[test]
     fn gguf_backend_advertises_lora_when_supported() {
         let backend = MistralRsBackend::new("/tmp/model.gguf", 4096, None);
         let info = backend.available_backends();
@@ -807,7 +1061,7 @@ mod tests {
         assert!(
             matches!(err, InferenceError::LoRALoadFailed(message) if message.contains("adapter_config.json"))
         );
-        assert!(backend.registered_lora_adapter_paths().unwrap().is_empty());
+        assert!(backend.registered_lora_adapter_paths(None).unwrap().is_empty());
 
         let _ = tokio::fs::remove_file(adapter_file).await;
     }
@@ -835,7 +1089,7 @@ mod tests {
         assert!(
             matches!(err, InferenceError::LoRALoadFailed(message) if message.contains("valid JSON"))
         );
-        assert!(backend.registered_lora_adapter_paths().unwrap().is_empty());
+        assert!(backend.registered_lora_adapter_paths(None).unwrap().is_empty());
 
         let _ = tokio::fs::remove_dir_all(adapter_path).await;
     }
@@ -853,7 +1107,17 @@ mod tests {
             .await
             .unwrap();
 
-        let plan = backend.load_plan().unwrap();
+        let baseline_plan = backend.load_plan(None).unwrap();
+
+        assert_eq!(
+            baseline_plan,
+            MistralLoadPlan::Plain {
+                model_id: "hf-model".to_string(),
+                lora_adapter_paths: vec![],
+            }
+        );
+
+        let plan = backend.load_plan(Some("coder")).unwrap();
 
         assert_eq!(
             plan,
@@ -879,7 +1143,18 @@ mod tests {
             .await
             .unwrap();
 
-        let plan = backend.load_plan().unwrap();
+        let baseline_plan = backend.load_plan(None).unwrap();
+
+        assert_eq!(
+            baseline_plan,
+            MistralLoadPlan::Gguf {
+                model_id: "/tmp".to_string(),
+                files: vec!["model.gguf".to_string()],
+                lora_adapter_paths: vec![],
+            }
+        );
+
+        let plan = backend.load_plan(Some("coder")).unwrap();
 
         assert_eq!(
             plan,
