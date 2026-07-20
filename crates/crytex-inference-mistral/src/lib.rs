@@ -162,7 +162,10 @@ impl MistralRsBackend {
         option_env!("MISTRALRS_SKIP_GDN_CUDA").is_none_or(|value| value != "1")
     }
 
-    async fn ensure_loaded(&self, adapter_id: Option<String>) -> Result<Arc<Model>, InferenceError> {
+    async fn ensure_loaded(
+        &self,
+        adapter_id: Option<String>,
+    ) -> Result<Arc<Model>, InferenceError> {
         let mut guard = self.inner.state.lock().await;
         if let Some(loaded) = guard.as_ref()
             && loaded.adapter_id == adapter_id
@@ -540,7 +543,11 @@ fn build_chat_request(
 
 fn build_completion_prompt(request: &InferenceRequest) -> String {
     let mut parts = Vec::new();
-    if let Some(system) = request.system_prompt.as_deref().filter(|s| !s.trim().is_empty()) {
+    if let Some(system) = request
+        .system_prompt
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
         parts.push(format!("System: {}", system.trim()));
     }
     parts.extend(request.messages.iter().map(|message| {
@@ -856,7 +863,10 @@ mod tests {
             Some("coder-lora".to_string()),
         );
 
-        assert_eq!(request.take_adapters(), Some(vec!["coder-lora".to_string()]));
+        assert_eq!(
+            request.take_adapters(),
+            Some(vec!["coder-lora".to_string()])
+        );
         assert!(matches!(
             request.take_messages(),
             RequestMessage::Completion { text, echo_prompt: false, best_of: None }
@@ -1061,7 +1071,12 @@ mod tests {
         assert!(
             matches!(err, InferenceError::LoRALoadFailed(message) if message.contains("adapter_config.json"))
         );
-        assert!(backend.registered_lora_adapter_paths(None).unwrap().is_empty());
+        assert!(
+            backend
+                .registered_lora_adapter_paths(None)
+                .unwrap()
+                .is_empty()
+        );
 
         let _ = tokio::fs::remove_file(adapter_file).await;
     }
@@ -1089,7 +1104,12 @@ mod tests {
         assert!(
             matches!(err, InferenceError::LoRALoadFailed(message) if message.contains("valid JSON"))
         );
-        assert!(backend.registered_lora_adapter_paths(None).unwrap().is_empty());
+        assert!(
+            backend
+                .registered_lora_adapter_paths(None)
+                .unwrap()
+                .is_empty()
+        );
 
         let _ = tokio::fs::remove_dir_all(adapter_path).await;
     }

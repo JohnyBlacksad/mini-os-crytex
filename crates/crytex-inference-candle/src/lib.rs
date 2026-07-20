@@ -223,8 +223,8 @@ async fn train_gguf_shape_adapter(
     let adapter_path = output_dir.join(&adapter_id);
     tokio::fs::create_dir_all(&adapter_path).await?;
 
-    let reward_scale = (train.iter().map(|e| e.reward).sum::<f64>() / train.len() as f64)
-        .clamp(0.1, 5.0) as f32;
+    let reward_scale =
+        (train.iter().map(|e| e.reward).sum::<f64>() / train.len() as f64).clamp(0.1, 5.0) as f32;
     let mut tensors = HashMap::new();
     for layer in 0..model_cfg.num_layers {
         insert_shape_adapter_pair(
@@ -255,8 +255,9 @@ async fn train_gguf_shape_adapter(
         &adapter_path,
         &gguf_config,
         &BaseInitialization::ShapeInitialized {
-            reason: "GGUF fast adapter tensor-fit objective over architecture-compatible LoRA weights"
-                .into(),
+            reason:
+                "GGUF fast adapter tensor-fit objective over architecture-compatible LoRA weights"
+                    .into(),
         },
     )
     .await?;
@@ -866,10 +867,15 @@ mod tests {
             .await
             .unwrap();
 
-        let adapter_config = std::fs::read_to_string(result.adapter_path.join("adapter_config.json"))
-            .unwrap();
+        let adapter_config =
+            std::fs::read_to_string(result.adapter_path.join("adapter_config.json")).unwrap();
         assert!(adapter_config.contains("shape_initialized"));
-        assert!(result.adapter_path.join("adapter_model.safetensors").exists());
+        assert!(
+            result
+                .adapter_path
+                .join("adapter_model.safetensors")
+                .exists()
+        );
 
         let _ = tokio::fs::remove_dir_all(&output).await;
     }
