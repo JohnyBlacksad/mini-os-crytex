@@ -729,6 +729,8 @@ struct LoraLiveE2eProofReport {
     ab_test: LoraAbTestArtifact,
     quality_verdict: String,
     failure_reason: Option<String>,
+    training_proof: serde_json::Value,
+    learning_proven: bool,
     leakage_check_passed: bool,
     overfit_gap: f64,
     gates: Vec<KernelE2eProofGate>,
@@ -1009,6 +1011,14 @@ impl LoraBenchmarkGate for LiveLoraBenchmarkGate {
             .map_err(|error| {
                 LoraEvolutionError::ValidationFailed("benchmark".into(), error.to_string())
             })?;
+        let training_proof = read_lora_training_proof(&request.challenger_adapter_path)
+            .await
+            .unwrap_or_else(|error| {
+                serde_json::json!({
+                    "learning_proven": false,
+                    "reason": format!("failed to read adapter training proof: {error}")
+                })
+            });
         let accepted = matches!(report.winner, crytex_bench::ABWinner::Challenger)
             && report.delta_pass_rate > 0.0;
         let metadata = serde_json::json!({
@@ -1024,6 +1034,7 @@ impl LoraBenchmarkGate for LiveLoraBenchmarkGate {
             "significance_level": report.significance_level,
             "bootstrap_ci": report.bootstrap_ci.map(|(low, high)| vec![low, high]),
             "per_case_comparison": report.per_case_comparison.clone(),
+            "training_proof": training_proof,
             "leakage_check": {
                 "passed": true,
                 "training_fingerprint_count": request.training_fingerprints.len()
@@ -1246,6 +1257,13 @@ fn proof_gate(name: &str, passed: bool, evidence: &str) -> KernelE2eProofGate {
 fn build_lora_live_e2e_proof_report(input: LoraLiveE2eProofReportInput) -> LoraLiveE2eProofReport {
     let metadata = input.decision_metadata.unwrap_or_default();
     let ab_test = lora_ab_test_artifact_from_metadata(&metadata);
+    let training_proof = metadata.get("training_proof").cloned().unwrap_or_else(
+        || serde_json::json!({ "learning_proven": false, "reason": "missing training proof" }),
+    );
+    let learning_proven = training_proof
+        .get("learning_proven")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
     let leakage_check_passed = metadata
         .get("leakage_check")
         .and_then(|value| value.get("passed"))
@@ -1279,6 +1297,14 @@ fn build_lora_live_e2e_proof_report(input: LoraLiveE2eProofReportInput) -> LoraL
             &input.adapter_id,
         ),
         proof_gate("adapter_applied", adapter_applied, &input.adapter_id),
+        proof_gate(
+            "adapter_learning_proven",
+            learning_proven,
+            training_proof
+                .get("reason")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("training proof missing learning reason"),
+        ),
         proof_gate(
             "output_changed_after_swap",
             output_changed_after_swap,
@@ -1344,6 +1370,8 @@ fn build_lora_live_e2e_proof_report(input: LoraLiveE2eProofReportInput) -> LoraL
         ab_test,
         quality_verdict,
         failure_reason: input.failure_reason,
+        training_proof,
+        learning_proven,
         leakage_check_passed,
         overfit_gap,
         gates,
@@ -1373,6 +1401,19 @@ fn select_lora_representative_answers(
         .or_else(|| pairs.first())
         .map(|(baseline, challenger)| (baseline.content.clone(), challenger.content.clone()))
         .unwrap_or_default()
+}
+
+async fn read_lora_training_proof(adapter_path: &Path) -> Result<serde_json::Value, String> {
+    let config_path = adapter_path.join("adapter_config.json");
+    let raw = tokio::fs::read_to_string(&config_path)
+        .await
+        .map_err(|error| format!("{}: {error}", config_path.display()))?;
+    let config: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|error| format!("{} is not valid JSON: {error}", config_path.display()))?;
+    Ok(config
+        .get("crytex_training_proof")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({ "learning_proven": false, "reason": "adapter_config.json missing crytex_training_proof" })))
 }
 
 fn lora_ab_test_artifact_from_metadata(metadata: &serde_json::Value) -> LoraAbTestArtifact {
@@ -5695,6 +5736,13 @@ mod tests {
             "leakage_check": {
                 "passed": true,
                 "training_fingerprint_count": 50
+            },
+            "training_proof": {
+                "kind": "candle_lora_train_loop",
+                "learning_proven": true,
+                "adapter_delta_l2": 0.42,
+                "optimizer_calibration_used": false,
+                "reason": "LoRA optimizer updated trainable adapter tensors during causal training"
             }
         });
 
@@ -5737,6 +5785,9 @@ mod tests {
         assert_eq!(report.delta_pass_rate, 0.25);
         assert_eq!(report.mc_nemar_p_value, Some(0.125));
         assert_eq!(report.bootstrap_ci, Some((-0.10, 0.60)));
+        assert!(report.learning_proven);
+        assert_eq!(report.training_proof["kind"], "candle_lora_train_loop");
+        assert_eq!(report.training_proof["learning_proven"], true);
         assert_eq!(report.per_case_comparison.len(), 1);
         assert!(
             report

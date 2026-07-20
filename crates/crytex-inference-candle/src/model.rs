@@ -208,7 +208,8 @@ impl LoraLinear {
         let (out_features, in_features) = base.dims2()?;
         let lora_a_t =
             Tensor::randn(0.0f32, 0.02f32, (rank, in_features), device)?.to_dtype(dtype)?;
-        let lora_b_t = Tensor::zeros((out_features, rank), dtype, device)?;
+        let lora_b_t =
+            Tensor::randn(0.0f32, 0.02f32, (out_features, rank), device)?.to_dtype(dtype)?;
         let lora_a = Var::from_tensor(&lora_a_t)?;
         let lora_b = Var::from_tensor(&lora_b_t)?;
         let scale = alpha as f64 / rank.max(1) as f64;
@@ -234,6 +235,19 @@ impl LoraLinear {
         map.insert(
             format!("{prefix}.lora_B.weight"),
             self.lora_b.as_tensor().clone(),
+        );
+        map
+    }
+
+    pub fn detached_named_tensors(&self, prefix: &str) -> HashMap<String, Tensor> {
+        let mut map = HashMap::new();
+        map.insert(
+            format!("{prefix}.lora_A.weight"),
+            self.lora_a.as_detached_tensor(),
+        );
+        map.insert(
+            format!("{prefix}.lora_B.weight"),
+            self.lora_b.as_detached_tensor(),
         );
         map
     }
@@ -308,6 +322,45 @@ struct CausalSelfAttention {
 }
 
 impl CausalSelfAttention {
+    fn lora_vars(&self) -> Vec<Var> {
+        let mut vars = self.q_proj.vars();
+        vars.extend(self.v_proj.vars());
+        vars
+    }
+
+    fn lora_tensors(&self, prefix: &str) -> HashMap<String, Tensor> {
+        let mut tensors = self
+            .q_proj
+            .named_tensors(&format!("{prefix}.self_attn.q_proj"));
+        tensors.extend(
+            self.v_proj
+                .named_tensors(&format!("{prefix}.self_attn.v_proj")),
+        );
+        tensors
+    }
+
+    fn lora_detached_tensors(&self, prefix: &str) -> HashMap<String, Tensor> {
+        let mut tensors = self
+            .q_proj
+            .detached_named_tensors(&format!("{prefix}.self_attn.q_proj"));
+        tensors.extend(
+            self.v_proj
+                .detached_named_tensors(&format!("{prefix}.self_attn.v_proj")),
+        );
+        tensors
+    }
+
+    fn load_adapter(
+        &mut self,
+        prefix: &str,
+        tensors: &HashMap<String, Tensor>,
+    ) -> CandleResult<()> {
+        let q_prefix = format!("{prefix}.self_attn.q_proj");
+        let v_prefix = format!("{prefix}.self_attn.v_proj");
+        load_lora_linear_adapter(&mut self.q_proj, &q_prefix, tensors)?;
+        load_lora_linear_adapter(&mut self.v_proj, &v_prefix, tensors)
+    }
+
     fn forward_with_cache(&self, x: &Tensor, cache: &mut Option<KvCache>) -> CandleResult<Tensor> {
         let (b_sz, seq_len, hidden_size) = x.dims3()?;
         let q = self.q_proj.forward(x)?;
@@ -403,6 +456,26 @@ struct Block {
 }
 
 impl Block {
+    fn lora_vars(&self) -> Vec<Var> {
+        self.self_attn.lora_vars()
+    }
+
+    fn lora_tensors(&self, prefix: &str) -> HashMap<String, Tensor> {
+        self.self_attn.lora_tensors(prefix)
+    }
+
+    fn lora_detached_tensors(&self, prefix: &str) -> HashMap<String, Tensor> {
+        self.self_attn.lora_detached_tensors(prefix)
+    }
+
+    fn load_adapter(
+        &mut self,
+        prefix: &str,
+        tensors: &HashMap<String, Tensor>,
+    ) -> CandleResult<()> {
+        self.self_attn.load_adapter(prefix, tensors)
+    }
+
     fn forward_with_cache(&self, x: &Tensor, cache: &mut Option<KvCache>) -> CandleResult<Tensor> {
         let residual = x;
         let x = (self
@@ -537,25 +610,8 @@ impl LoraCausalLM {
     pub fn load_adapter(&mut self, path: &Path) -> CandleResult<()> {
         let device = self.lora_layers[0].1.lora_a.as_tensor().device().clone();
         let tensors = candle_core::safetensors::load(path, &device)?;
-        for (name, lora) in &mut self.lora_layers {
-            let a_key = format!("{name}.lora_A.weight");
-            let b_key = format!("{name}.lora_B.weight");
-            let legacy_a_key = format!("{name}.lora_a");
-            let legacy_b_key = format!("{name}.lora_b");
-            let a = tensors
-                .get(&a_key)
-                .or_else(|| tensors.get(&legacy_a_key))
-                .ok_or_else(|| {
-                    candle_core::Error::Msg(format!("adapter missing tensor {a_key}"))
-                })?;
-            let b = tensors
-                .get(&b_key)
-                .or_else(|| tensors.get(&legacy_b_key))
-                .ok_or_else(|| {
-                    candle_core::Error::Msg(format!("adapter missing tensor {b_key}"))
-                })?;
-            lora.set_lora_a(a)?;
-            lora.set_lora_b(b)?;
+        for (layer, block) in self.blocks.iter_mut().enumerate() {
+            block.load_adapter(&format!("model.layers.{layer}"), &tensors)?;
         }
         Ok(())
     }
@@ -565,18 +621,47 @@ impl LoraCausalLM {
     }
 
     pub fn lora_vars(&self) -> Vec<Var> {
-        self.lora_layers
-            .iter()
-            .flat_map(|(_, l)| l.vars())
-            .collect()
+        self.blocks.iter().flat_map(Block::lora_vars).collect()
     }
 
     pub fn lora_tensors(&self) -> HashMap<String, Tensor> {
-        self.lora_layers
+        self.blocks
             .iter()
-            .flat_map(|(name, l)| l.named_tensors(name))
+            .enumerate()
+            .flat_map(|(layer, block)| block.lora_tensors(&format!("model.layers.{layer}")))
             .collect()
     }
+
+    pub fn lora_detached_tensors(&self) -> HashMap<String, Tensor> {
+        self.blocks
+            .iter()
+            .enumerate()
+            .flat_map(|(layer, block)| {
+                block.lora_detached_tensors(&format!("model.layers.{layer}"))
+            })
+            .collect()
+    }
+}
+
+fn load_lora_linear_adapter(
+    lora: &mut LoraLinear,
+    name: &str,
+    tensors: &HashMap<String, Tensor>,
+) -> CandleResult<()> {
+    let a_key = format!("{name}.lora_A.weight");
+    let b_key = format!("{name}.lora_B.weight");
+    let legacy_a_key = format!("{name}.lora_a");
+    let legacy_b_key = format!("{name}.lora_b");
+    let a = tensors
+        .get(&a_key)
+        .or_else(|| tensors.get(&legacy_a_key))
+        .ok_or_else(|| candle_core::Error::Msg(format!("adapter missing tensor {a_key}")))?;
+    let b = tensors
+        .get(&b_key)
+        .or_else(|| tensors.get(&legacy_b_key))
+        .ok_or_else(|| candle_core::Error::Msg(format!("adapter missing tensor {b_key}")))?;
+    lora.set_lora_a(a)?;
+    lora.set_lora_b(b)
 }
 
 fn sample_next(logits: &Tensor, processor: &mut LogitsProcessor) -> CandleResult<u32> {
@@ -715,4 +800,103 @@ fn flash_attention(
     Err(candle_core::Error::Msg(
         "flash attention requested but the flash-attn feature is not enabled".into(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_nn::{AdamW, Optimizer, ParamsAdamW};
+
+    #[test]
+    fn lora_linear_backward_step_updates_adapter_weight() {
+        let device = Device::Cpu;
+        let layer = LoraLinear::new(3, 2, 2, 4, &device).unwrap();
+        let before = layer
+            .lora_b
+            .as_tensor()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let mut optimizer = AdamW::new(
+            layer.vars(),
+            ParamsAdamW {
+                lr: 1.0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let xs = Tensor::new(&[[1.0f32, 2.0, 3.0]], &device).unwrap();
+        let ys = layer.forward(&xs).unwrap();
+        let loss = ys.sqr().unwrap().sum_all().unwrap();
+
+        optimizer.backward_step(&loss).unwrap();
+
+        let after = layer
+            .lora_b
+            .as_tensor()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let delta = after
+            .iter()
+            .zip(before.iter())
+            .map(|(after, before)| (after - before).powi(2))
+            .sum::<f32>();
+        assert!(delta > 0.0, "expected LoRA weight update, got {delta}");
+    }
+
+    #[test]
+    fn lora_causal_lm_optimizer_updates_model_adapter_vars() {
+        let device = Device::Cpu;
+        let cfg = ModelConfig::tiny_for_tests(2, 4, 16);
+        let vb = VarBuilder::from_tensors(
+            super::super::random_tiny_base_tensors(&cfg, &device).unwrap(),
+            DType::F32,
+            &device,
+        );
+        let model = LoraCausalLM::load(vb, &cfg).unwrap();
+        let before = model
+            .lora_tensors()
+            .into_values()
+            .next()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let mut optimizer = AdamW::new(
+            model.lora_vars(),
+            ParamsAdamW {
+                lr: 1.0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let loss = model
+            .lora_tensors()
+            .into_values()
+            .map(|tensor| tensor.sqr().unwrap().sum_all().unwrap())
+            .reduce(|acc, loss| (acc + loss).unwrap())
+            .unwrap();
+
+        optimizer.backward_step(&loss).unwrap();
+
+        let after = model
+            .lora_tensors()
+            .into_values()
+            .next()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let delta = after
+            .iter()
+            .zip(before.iter())
+            .map(|(after, before)| (after - before).powi(2))
+            .sum::<f32>();
+        assert!(delta > 0.0, "expected model LoRA var update, got {delta}");
+    }
 }
