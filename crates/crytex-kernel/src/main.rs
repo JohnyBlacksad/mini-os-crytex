@@ -193,6 +193,7 @@ enum Commands {
         report_path: Option<PathBuf>,
     },
     /// Prove the kernel happy path as one JSON artifact without requiring a desktop UI
+    #[command(alias = "prove-business-e2e", alias = "business-test")]
     ProveKernelE2e {
         #[arg(short, long)]
         path: PathBuf,
@@ -634,7 +635,16 @@ struct KernelE2eProofGate {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct KernelBusinessProofStep {
+    name: String,
+    status: String,
+    evidence: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct KernelE2eProofReport {
+    business_outcome: String,
+    business_steps: Vec<KernelBusinessProofStep>,
     trace_id: String,
     project_id: String,
     project_root: String,
@@ -780,7 +790,21 @@ impl KernelE2eProofReport {
             ),
         ];
         let passed = gates.iter().all(|gate| gate.passed);
+        let business_steps = business_steps_from_gates(&gates);
+        let business_outcome = if passed {
+            "BUSINESS_E2E_PASSED: goal decomposed, agent chain executed, critic rejection remediated, human approval recorded, benchmark ran, prompt evolution promoted, LoRA evolution promoted".to_string()
+        } else {
+            let failed = gates
+                .iter()
+                .filter(|gate| !gate.passed)
+                .map(|gate| gate.name.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("BUSINESS_E2E_FAILED: failed gates={failed}")
+        };
         Self {
+            business_outcome,
+            business_steps,
             trace_id: input.trace_id,
             project_id: input.project_id,
             project_root: input.project_root,
@@ -807,6 +831,34 @@ impl KernelE2eProofReport {
             gates,
             passed,
         }
+    }
+}
+
+fn business_steps_from_gates(gates: &[KernelE2eProofGate]) -> Vec<KernelBusinessProofStep> {
+    gates
+        .iter()
+        .map(|gate| KernelBusinessProofStep {
+            name: business_step_name(&gate.name).to_string(),
+            status: if gate.passed { "passed" } else { "failed" }.to_string(),
+            evidence: gate.evidence.clone(),
+        })
+        .collect()
+}
+
+fn business_step_name(gate_name: &str) -> &str {
+    match gate_name {
+        "live_model_executed" => "Live model generated agent evidence",
+        "project_created" => "Project was created",
+        "project_indexed" => "Project was indexed for RAG/code context",
+        "goal_plan_approved" => "Goal was decomposed into an approved task plan",
+        "agent_chain_executed" => "Agent chain executed with artifacts",
+        "critic_rejection_remediated" => "Critic rejected work and remediation was created",
+        "human_approval_recorded" => "Human approval/reward was recorded",
+        "diagnostics_exported" => "Diagnostics/trace evidence was exported",
+        "benchmark_executed" => "Baseline/challenger benchmark was executed",
+        "prompt_evolution_proved" => "Prompt evolution promoted the winning challenger",
+        "lora_evolution_proved" => "LoRA evolution trained and promoted an adapter",
+        _ => gate_name,
     }
 }
 
@@ -4500,6 +4552,13 @@ mod tests {
         });
 
         assert!(report.passed);
+        assert!(report.business_outcome.starts_with("BUSINESS_E2E_PASSED"));
+        assert!(report.business_steps.iter().any(|step| step.name
+            == "Goal was decomposed into an approved task plan"
+            && step.status == "passed"));
+        assert!(report.business_steps.iter().any(|step| step.name
+            == "LoRA evolution trained and promoted an adapter"
+            && step.status == "passed"));
         assert_eq!(report.gates.len(), 11);
         assert!(
             report
