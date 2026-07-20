@@ -10,7 +10,10 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::models::{Task, TaskStatus};
-use crate::services::{AgentRole, AgentService, InferenceService, LoraRouter, ToolService};
+use crate::services::{
+    AgentRole, AgentService, ArtifactContractViolation, InferenceService, LoraRouter, ToolService,
+    validate_agent_result,
+};
 use crate::tracing::TraceContext;
 
 use petgraph::graph::{DiGraph, NodeIndex};
@@ -38,6 +41,12 @@ pub enum WorkflowError {
     NotFound(String),
     #[error("execution error: {0}")]
     Execution(String),
+    #[error("artifact contract violation for agent '{agent}' ({artifact_kind}): {reason}")]
+    ArtifactContractViolation {
+        agent: String,
+        artifact_kind: String,
+        reason: String,
+    },
     #[error("workflow engine error: {0}")]
     Internal(String),
 }
@@ -806,8 +815,28 @@ impl WorkflowNodeExecutor for AgentWorkflowNodeExecutor {
             .execute(&task, self.inference.clone(), self.tool_service.clone())
             .await
             .map_err(|e| WorkflowError::Execution(e.to_string()))?;
+        validate_workflow_agent_result(&task, &result)?;
         Ok(result)
     }
+}
+
+fn validate_workflow_agent_result(
+    task: &Task,
+    result: &WorkflowState,
+) -> Result<(), WorkflowError> {
+    validate_agent_result(task.assigned_agent.as_deref(), &task.kind, result).map_err(
+        |ArtifactContractViolation {
+             artifact_kind,
+             reason,
+         }| WorkflowError::ArtifactContractViolation {
+            agent: task
+                .assigned_agent
+                .clone()
+                .unwrap_or_else(|| task.kind.clone()),
+            artifact_kind,
+            reason,
+        },
+    )
 }
 
 #[cfg(test)]
@@ -1066,7 +1095,7 @@ task_kind = "codegen"
             _tools: Arc<dyn ToolService>,
         ) -> Result<serde_json::Value, crate::services::AgentServiceError> {
             *self.seen.lock().unwrap() = Some(task.clone());
-            Ok(serde_json::json!({ "ok": true }))
+            Ok(valid_workflow_agent_result(task))
         }
     }
 
@@ -1188,7 +1217,11 @@ task_kind = "codegen"
             .await
             .unwrap();
 
-        assert_eq!(output, serde_json::json!({ "ok": true }));
+        assert_eq!(
+            output["agent_result"]["summary"],
+            "implemented requested behavior"
+        );
+        assert_eq!(output["agent_result"]["files_changed"][0], "src/lib.rs");
         let task = agent_service.seen.lock().unwrap().clone().unwrap();
         assert_eq!(task.lora_adapter_id.as_deref(), Some("coder-lora-v1"));
         assert_eq!(
@@ -1225,12 +1258,42 @@ task_kind = "codegen"
             _tools: Arc<dyn ToolService>,
         ) -> Result<serde_json::Value, crate::services::AgentServiceError> {
             self.seen.lock().unwrap().push(task.clone());
-            Ok(serde_json::json!({
-                "agent": task.assigned_agent,
-                "artifact": task.payload["upstream_artifact"],
-                "session_id": task.payload["agent_session"]["session_id"]
-            }))
+            let mut result = valid_workflow_agent_result(task);
+            result["upstream_artifact_seen"] = task.payload["upstream_artifact"].clone();
+            result["session_id"] = task.payload["agent_session"]["session_id"].clone();
+            Ok(result)
         }
+    }
+
+    fn valid_workflow_agent_result(task: &Task) -> serde_json::Value {
+        let artifact = match task.assigned_agent.as_deref() {
+            Some("architect") => serde_json::json!({
+                "summary": "designed an atomic implementation plan",
+                "content": task.payload["upstream_artifact"],
+            }),
+            Some("coder") => serde_json::json!({
+                "summary": "implemented requested behavior",
+                "files_changed": ["src/lib.rs"],
+            }),
+            Some("qa") => serde_json::json!({
+                "summary": "verified behavior",
+                "test_results": "cargo test passed",
+            }),
+            Some("security") => serde_json::json!({
+                "summary": "reviewed security posture",
+                "risk": "low",
+            }),
+            Some("critic") => serde_json::json!({
+                "review_decision": "pass",
+                "summary": "accepted for human review",
+            }),
+            _ => serde_json::json!({
+                "summary": "generic artifact",
+            }),
+        };
+        serde_json::json!({
+            "agent_result": artifact,
+        })
     }
 
     #[tokio::test]
@@ -1304,9 +1367,130 @@ task_kind = "codegen"
                 .is_none()
         );
         assert_eq!(
-            result.state["patch_artifact"]["artifact"],
+            result.state["patch_artifact"]["upstream_artifact_seen"],
             result.state["design_artifact"]
         );
+    }
+
+    struct StaticResultAgentService {
+        result: serde_json::Value,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentService for StaticResultAgentService {
+        async fn register(&self, _agent: Arc<dyn crate::services::Agent>) {}
+
+        async fn find(&self, _name: &str) -> Option<Arc<dyn crate::services::Agent>> {
+            None
+        }
+
+        async fn list(&self) -> Vec<String> {
+            vec![]
+        }
+
+        fn route(&self, task: &Task) -> Option<String> {
+            task.assigned_agent.clone()
+        }
+
+        async fn execute(
+            &self,
+            _task: &Task,
+            _inference: Arc<dyn InferenceService>,
+            _tools: Arc<dyn ToolService>,
+        ) -> Result<serde_json::Value, crate::services::AgentServiceError> {
+            Ok(self.result.clone())
+        }
+    }
+
+    async fn run_single_agent_workflow(
+        agent: &str,
+        kind: &str,
+        result: serde_json::Value,
+    ) -> Result<WorkflowResult, WorkflowError> {
+        let executor = Arc::new(AgentWorkflowNodeExecutor::new(
+            Arc::new(StaticResultAgentService { result }),
+            Arc::new(NoopInference),
+            Arc::new(NoopToolService),
+        ));
+        let engine = WorkflowEngine::new(executor);
+        let workflow = WorkflowDefinition {
+            id: "single-agent-contract".to_string(),
+            entry: agent.to_string(),
+            max_concurrency: 1,
+            nodes: vec![WorkflowNode::Agent {
+                id: agent.to_string(),
+                agent: agent.to_string(),
+                task_kind: Some(kind.to_string()),
+                input: "task".to_string(),
+                output: "artifact".to_string(),
+                timeout_seconds: None,
+                retry: WorkflowRetryPolicy::default(),
+            }],
+            ..Default::default()
+        };
+        engine
+            .run(
+                &workflow,
+                serde_json::json!({
+                    "project_id": "p1",
+                    "trace_id": "trace-contract",
+                    "task": "prove strict artifact contracts",
+                }),
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn agent_workflow_rejects_malformed_coder_artifact_before_handoff() {
+        let err = run_single_agent_workflow(
+            "coder",
+            "codegen",
+            serde_json::json!({
+                "agent_result": {
+                    "summary": "I changed something but provide no evidence"
+                }
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            WorkflowError::ArtifactContractViolation {
+                agent,
+                artifact_kind,
+                reason,
+            } if agent == "coder"
+                && artifact_kind == "patch_artifact"
+                && reason.contains("files_changed")
+        ));
+    }
+
+    #[tokio::test]
+    async fn agent_workflow_rejects_critic_reject_without_blocking_issues() {
+        let err = run_single_agent_workflow(
+            "critic",
+            "review",
+            serde_json::json!({
+                "agent_result": {
+                    "review_decision": "reject",
+                    "summary": "not good enough"
+                }
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            WorkflowError::ArtifactContractViolation {
+                agent,
+                artifact_kind,
+                reason,
+            } if agent == "critic"
+                && artifact_kind == "review_decision"
+                && reason.contains("blocking_issues")
+        ));
     }
 
     #[derive(Default)]

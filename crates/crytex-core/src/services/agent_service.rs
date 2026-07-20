@@ -16,7 +16,7 @@ use crate::persistence::PromptVersionRepository;
 use crate::policy::Capability;
 use crate::security::SecurityScanner;
 use crate::services::{
-    AuditLogEntry, AuditLogService, ContextAssembler, ContextRequest, ToolService,
+    AuditLogEntry, AuditLogService, ContextAssembler, ContextRequest, RagChunkEvidence, ToolService,
 };
 
 /// Factory that builds a scoped [`ToolService`] for a given capability set.
@@ -261,54 +261,10 @@ impl AgentService for AgentServiceImpl {
             match assembler.assemble_with_evidence(request).await {
                 Ok(assembly) => {
                     if !assembly.rag.chunks.is_empty() {
-                        let chunks: Vec<Value> = assembly
-                            .rag
-                            .chunks
-                            .iter()
-                            .map(|chunk| {
-                                serde_json::json!({
-                                    "id": chunk.id,
-                                    "score": chunk.score,
-                                    "source": chunk.source,
-                                    "relative_path": chunk.relative_path,
-                                    "text_preview": chunk.text_preview,
-                                    "retrieval_sources": chunk.retrieval_sources,
-                                    "selection_reason": chunk.selection_reason,
-                                })
-                            })
-                            .collect();
-                        let retrieval_candidates: Vec<Value> = assembly
-                            .rag
-                            .retrieval_candidates
-                            .iter()
-                            .map(|chunk| {
-                                serde_json::json!({
-                                    "id": chunk.id,
-                                    "score": chunk.score,
-                                    "source": chunk.source,
-                                    "relative_path": chunk.relative_path,
-                                    "text_preview": chunk.text_preview,
-                                    "retrieval_sources": chunk.retrieval_sources,
-                                    "selection_reason": chunk.selection_reason,
-                                })
-                            })
-                            .collect();
-                        let reranked_chunks: Vec<Value> = assembly
-                            .rag
-                            .reranked_chunks
-                            .iter()
-                            .map(|chunk| {
-                                serde_json::json!({
-                                    "id": chunk.id,
-                                    "score": chunk.score,
-                                    "source": chunk.source,
-                                    "relative_path": chunk.relative_path,
-                                    "text_preview": chunk.text_preview,
-                                    "retrieval_sources": chunk.retrieval_sources,
-                                    "selection_reason": chunk.selection_reason,
-                                })
-                            })
-                            .collect();
+                        let chunks = rag_chunks_json(&assembly.rag.chunks);
+                        let retrieval_candidates =
+                            rag_chunks_json(&assembly.rag.retrieval_candidates);
+                        let reranked_chunks = rag_chunks_json(&assembly.rag.reranked_chunks);
                         let _ = self
                             .audit
                             .log(
@@ -393,6 +349,25 @@ impl AgentService for AgentServiceImpl {
             }
         }
     }
+}
+
+fn rag_chunks_json(chunks: &[RagChunkEvidence]) -> Vec<Value> {
+    chunks
+        .iter()
+        .map(|chunk| {
+            serde_json::json!({
+                "id": chunk.id,
+                "score": chunk.score,
+                "source": chunk.source,
+                "relative_path": chunk.relative_path,
+                "symbol_id": chunk.symbol_id,
+                "related_symbols": chunk.related_symbols,
+                "text_preview": chunk.text_preview,
+                "retrieval_sources": chunk.retrieval_sources,
+                "selection_reason": chunk.selection_reason,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]

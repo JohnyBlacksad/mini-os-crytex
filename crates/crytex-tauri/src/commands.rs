@@ -15,6 +15,7 @@ use crytex_core::services::{
     ModelManager, ModelManagerError, ModelStatus, Orchestrator, OrchestratorError, ProjectError,
     ProjectService, Quantization, RecommendedConfig, RewardServiceError, TaskError, TaskService,
     ToolDescription, ToolService, ToolServiceError, VectorStore, VectorStoreError,
+    validate_artifact_content,
 };
 use crytex_core::state_export::{ProjectState, StateExportError, export_project_state};
 use crytex_inference::{
@@ -305,6 +306,8 @@ pub struct RuntimeStatus {
     pub active_model: Option<String>,
     pub ollama_url: Option<String>,
     pub real_agent_execution: bool,
+    pub ready_to_run: bool,
+    pub missing_requirements: Vec<String>,
     pub backend_capabilities: Vec<BackendCapabilityReport>,
     pub cuda_toolchain: Option<CudaToolchainStatus>,
     pub compatibility_notes: Vec<RuntimeCompatibilityNote>,
@@ -2648,42 +2651,8 @@ fn validate_agent_artifact_envelope(envelope: &AgentArtifactEnvelope) -> Result<
     require_non_empty(&envelope.artifact_id, "artifact_id")?;
     require_non_empty(&envelope.source_task_id, "source_task_id")?;
     require_object(&envelope.content, "content")?;
-    match envelope.artifact_kind.as_str() {
-        "design_artifact" => validate_design_artifact(&envelope.content),
-        "patch_artifact" => validate_patch_artifact(&envelope.content),
-        "test_report_artifact" => validate_test_report_artifact(&envelope.content),
-        "security_report_artifact" => validate_security_report_artifact(&envelope.content),
-        "review_decision" => validate_review_decision_artifact(&envelope.content),
-        _ => Ok(()),
-    }
-}
-
-fn validate_design_artifact(content: &Value) -> Result<(), String> {
-    require_text_field(content, "summary")
-        .or_else(|_| require_text_field(content, "content"))
-        .map(|_| ())
-}
-
-fn validate_patch_artifact(content: &Value) -> Result<(), String> {
-    require_array_field(content, "files_changed")?;
-    require_text_field(content, "summary")?;
-    Ok(())
-}
-
-fn validate_test_report_artifact(content: &Value) -> Result<(), String> {
-    require_text_field(content, "summary")
-        .or_else(|_| require_text_field(content, "test_results"))
-        .map(|_| ())
-}
-
-fn validate_security_report_artifact(content: &Value) -> Result<(), String> {
-    require_text_field(content, "summary")
-        .or_else(|_| require_text_field(content, "risk"))
-        .map(|_| ())
-}
-
-fn validate_review_decision_artifact(content: &Value) -> Result<(), String> {
-    require_text_field(content, "review_decision").map(|_| ())
+    validate_artifact_content(&envelope.artifact_kind, &envelope.content)
+        .map_err(|violation| violation.reason)
 }
 
 fn require_object(value: &Value, field: &str) -> Result<(), String> {
@@ -2697,22 +2666,6 @@ fn require_non_empty(value: &str, field: &str) -> Result<(), String> {
     (!value.trim().is_empty())
         .then_some(())
         .ok_or_else(|| format!("{field} must be non-empty"))
-}
-
-fn require_text_field<'a>(content: &'a Value, field: &str) -> Result<&'a str, String> {
-    content
-        .get(field)
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| format!("artifact content requires non-empty string field `{field}`"))
-}
-
-fn require_array_field<'a>(content: &'a Value, field: &str) -> Result<&'a Vec<Value>, String> {
-    content
-        .get(field)
-        .and_then(Value::as_array)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| format!("artifact content requires non-empty array field `{field}`"))
 }
 
 fn is_generated_chain_task(task: &Task) -> bool {
@@ -5107,6 +5060,8 @@ mod tests {
             active_model: Some("qwen3.5:9b".into()),
             ollama_url: Some("http://127.0.0.1:11434".into()),
             real_agent_execution: true,
+            ready_to_run: true,
+            missing_requirements: vec![],
             backend_capabilities: vec![
                 BackendInfo {
                     id: "ollama".into(),
@@ -5254,6 +5209,8 @@ mod tests {
             active_model: Some("qwen3.5:9b".into()),
             ollama_url: Some("http://127.0.0.1:11434".into()),
             real_agent_execution: true,
+            ready_to_run: true,
+            missing_requirements: vec![],
             backend_capabilities: vec![],
             cuda_toolchain: None,
             compatibility_notes: vec![],
@@ -5329,6 +5286,8 @@ mod tests {
             active_model: Some("qwen3.5:9b".into()),
             ollama_url: Some("http://127.0.0.1:11434".into()),
             real_agent_execution: true,
+            ready_to_run: true,
+            missing_requirements: vec![],
             backend_capabilities: vec![],
             cuda_toolchain: None,
             compatibility_notes: vec![],
@@ -5399,6 +5358,8 @@ mod tests {
             active_model: Some("qwen3.5:9b".into()),
             ollama_url: Some("http://127.0.0.1:11434".into()),
             real_agent_execution: true,
+            ready_to_run: true,
+            missing_requirements: vec![],
             backend_capabilities: vec![],
             cuda_toolchain: None,
             compatibility_notes: vec![],
@@ -5477,6 +5438,8 @@ mod tests {
             active_model: Some("qwen3.5:9b".into()),
             ollama_url: Some("http://127.0.0.1:11434".into()),
             real_agent_execution: true,
+            ready_to_run: true,
+            missing_requirements: vec![],
             backend_capabilities: vec![],
             cuda_toolchain: None,
             compatibility_notes: vec![],

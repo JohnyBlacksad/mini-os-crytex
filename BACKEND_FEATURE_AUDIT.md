@@ -324,13 +324,15 @@ Reality:
 
 - Chain execution and upstream artifact passing exist.
 - Critic review/human review gates exist.
-- Artifact shape is still loose JSON. The system does not yet enforce per-agent artifact schemas strongly enough.
+- Core now owns shared artifact contract validation for `architect`, `coder`, `qa`, `security`, and `critic`.
+- `AgentWorkflowNodeExecutor` rejects malformed agent outputs before writing them into workflow state.
+- Tauri command execution uses the same core content validator for handoff envelopes, retries malformed outputs once, then fails with contract diagnostics if still invalid.
+- Diagnostics export typed artifact lineage and artifact handoff rejection reasons.
 
 Required proof:
 
-- Define typed artifact schemas per role.
-- Add integration tests where each downstream agent fails if a required upstream field is missing.
-- Diagnostics should export artifact lineage for every task.
+- Broaden the strict contract to real model structured-output prompts for every role, not only runtime validation.
+- Add schema version migration tests when artifact schemas evolve.
 
 ### 3. Critic Rejection and Remediation
 
@@ -349,13 +351,13 @@ Reality:
 
 - The remediation loop exists.
 - The critic can return structured reasons.
-- Structured rejection should become a mandatory contract, not best-effort JSON extraction.
+- Critic rejection is now a mandatory contract: `review_decision = reject` must include `blocking_issues`.
+- Malformed critic/coder artifacts are rejected, retried, and eventually fail with explicit contract reasons.
 
 Required proof:
 
-- A critic result schema with required `review_decision`, `failure_type`, `blocking_issues`, `feedback`, `target_task_id`.
-- Tests for malformed critic output -> retry/repair/escalation.
-- Tests for retry exhaustion.
+- Real-model critic smoke should prove the model follows the structured rejection contract without repair.
+- Product UI should surface contract retry/failure reasons directly in Observe.
 
 ### 4. Human Review, Reward, and Experience
 
@@ -401,13 +403,14 @@ Reality:
 - Tree-sitter chunking works.
 - CodeGraph and impact analysis work at crate level.
 - `chunk_code_with_graph` exists and can add `symbol_id`/`related_symbols`.
-- The main `ProjectIndexer` currently calls `chunk_code`, not `chunk_code_with_graph`; therefore graph-aware metadata is not proven in indexed RAG chunks.
+- The main `ProjectIndexer` uses graph-aware code chunking and persists `symbol_id`/`related_symbols` in vector payloads.
+- `ContextAssembler` now exposes graph metadata in selected RAG evidence and prompt context headers.
+- Tauri app-state proof verifies indexed Rust graph metadata reaches the agent prompt and exported `rag_context_assembled` diagnostics.
 
 Required proof:
 
-- Wire `CodeGraphBuilder`/`chunk_code_with_graph` into indexing or explicitly separate graph index from vector index.
-- Integration: index a project and assert vector payload includes symbol metadata.
-- Agent prompt should include a retrieved symbol scope header.
+- Broaden graph proof beyond Rust to the other supported tree-sitter languages.
+- Add product diagnostics that explain symbol-neighborhood selection, not only raw ids.
 
 ### 6. Project Indexing, Watcher, and RAG
 
@@ -426,15 +429,15 @@ Current evidence:
 Reality:
 
 - Code, markdown, and HTML are indexed.
+- PDF documents are routed through the document extraction path and covered by mixed-project indexing tests.
 - Dense and sparse vector paths exist.
 - Watcher is implemented and tested.
-- PDF support is not present in `ProjectIndexer` based on current extension routing.
+- Context assembly preserves before/after rerank evidence, selected chunks, retrieval sources, and graph metadata.
 - Automatic indexing is present in kernel `run`, but broader app/CLI product paths need more e2e proof.
 
 Required proof:
 
-- Mixed project e2e: Rust + Markdown + HTML + PDF/plain document.
-- If PDF is required, add parser and tests.
+- Mixed project e2e from the product entrypoint: Rust + Markdown + HTML + PDF/plain document -> query -> agent prompt -> diagnostics export.
 - CLI: create/open project -> automatic watcher starts -> file change appears in search without manual reindex.
 
 ### 7. Reranker
@@ -454,12 +457,13 @@ Reality:
 
 - Reranker abstraction and ONNX implementation exist.
 - Kernel now wires `create_reranker` into `ContextAssembler`.
-- Tauri still needs proof because its app state uses mock context components.
+- Tauri app-state proof verifies an intentionally wrong dense order is corrected before context reaches the agent prompt.
+- Exported `rag_context_assembled` diagnostics include retrieval candidates, reranked chunks, selected chunks, and `rerank_applied`.
 
 Required proof:
 
-- Integration test with intentionally wrong dense order and reranker correcting final agent context order.
-- Diagnostics should show reranker backend/model and before/after ranks.
+- Real ONNX reranker smoke with a selected local model, including backend/model id in diagnostics.
+- UI/CLI diagnostics should render before/after ranks clearly instead of exposing only raw JSON.
 
 ### 8. Context Compression / Token Optimizer
 
@@ -805,7 +809,7 @@ Reality:
 
 - CLI is the right place to prove product readiness before UI.
 - There are very few kernel-level integration tests.
-- Reranker is constructed as `_reranker` but not proven in context path.
+- Reranker is wired into context assembly and proven in core/Tauri paths; kernel/CLI e2e proof with a real selected reranker model is still missing.
 
 Required proof:
 
@@ -846,7 +850,7 @@ Reality:
 - Tooling loop exists for JSON tool calls.
 - Prompt security block is injected into role prompts.
 - Tests are mostly deterministic mocks, not real end-to-end model behavior.
-- Agent output schemas are still mostly loose JSON rather than strongly typed contracts shared with orchestrator/diagnostics.
+- Agent output schemas now share core runtime validation across workflow execution and Tauri handoff diagnostics; remaining gap is schema-guided generation/prompting for real models.
 
 Required proof:
 
@@ -979,9 +983,9 @@ Required proof:
 
 Priority 1: RAG correctness proof
 
-- Wire graph-aware chunks or document the split.
-- Wire reranker into context assembly.
-- Add integration proving dense/sparse/rerank final context order.
+- Product e2e: mixed project -> automatic index -> query -> rerank -> agent prompt -> exported diagnostics.
+- Real ONNX reranker smoke with selected model metadata.
+- Human-readable diagnostics for symbol graph selection and before/after rerank.
 
 Priority 2: Model manager/runtime proof
 

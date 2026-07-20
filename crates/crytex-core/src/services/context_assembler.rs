@@ -83,6 +83,8 @@ pub struct RagChunkEvidence {
     pub score: f32,
     pub source: Option<String>,
     pub relative_path: Option<String>,
+    pub symbol_id: Option<String>,
+    pub related_symbols: Vec<String>,
     pub text_preview: String,
     pub retrieval_sources: Vec<String>,
     pub selection_reason: String,
@@ -427,7 +429,12 @@ fn format_retrieved_context(results: &[SearchResult]) -> String {
                 .get("source")
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown");
-            format!("[{}] {}", source, text)
+            let metadata = context_metadata(&r.payload);
+            if metadata.is_empty() {
+                format!("[{}] {}", source, text)
+            } else {
+                format!("[{} | {}] {}", source, metadata.join(" | "), text)
+            }
         })
         .collect();
     format!("Relevant context:\n{}", parts.join("\n\n"))
@@ -444,10 +451,27 @@ fn chunk_evidence(result: &SearchResult) -> RagChunkEvidence {
         score: result.score,
         source: string_payload(&result.payload, "source"),
         relative_path: string_payload(&result.payload, "relative_path"),
+        symbol_id: string_payload(&result.payload, "symbol_id"),
+        related_symbols: string_array_payload(&result.payload, "related_symbols"),
         text_preview: preview(text, 240),
         retrieval_sources: retrieval_sources(&result.payload),
         selection_reason: selection_reason(result),
     }
+}
+
+fn context_metadata(payload: &serde_json::Value) -> Vec<String> {
+    let mut metadata = Vec::new();
+    if let Some(path) = string_payload(payload, "relative_path") {
+        metadata.push(format!("file={path}"));
+    }
+    if let Some(symbol_id) = string_payload(payload, "symbol_id") {
+        metadata.push(format!("symbol={symbol_id}"));
+    }
+    let related_symbols = string_array_payload(payload, "related_symbols");
+    if !related_symbols.is_empty() {
+        metadata.push(format!("related={}", related_symbols.join(",")));
+    }
+    metadata
 }
 
 fn retrieval_sources(payload: &serde_json::Value) -> Vec<String> {
@@ -483,6 +507,17 @@ fn string_payload(payload: &serde_json::Value, key: &str) -> Option<String> {
         .get(key)
         .and_then(|value| value.as_str())
         .map(ToString::to_string)
+}
+
+fn string_array_payload(payload: &serde_json::Value, key: &str) -> Vec<String> {
+    payload
+        .get(key)
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str())
+        .map(ToString::to_string)
+        .collect()
 }
 
 fn preview(text: &str, max_chars: usize) -> String {
@@ -986,6 +1021,60 @@ mod tests {
             assembly.rag.chunks[0]
                 .selection_reason
                 .contains("selected after dense retrieval evidence")
+        );
+    }
+
+    #[tokio::test]
+    async fn assembler_exposes_graph_symbol_metadata_in_prompt_and_evidence() {
+        let store = Arc::new(TestVectorStore::default());
+        store
+            .upsert(
+                "code_chunks",
+                vec![VectorPoint {
+                    id: "symbol-chunk".into(),
+                    vector: vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    payload: serde_json::json!({
+                        "project_id": "proj-graph",
+                        "source": "src/lib.rs",
+                        "relative_path": "src/lib.rs",
+                        "text": "pub fn helper() -> i32 { 1 }",
+                        "symbol_id": "rust:src/lib.rs:helper",
+                        "related_symbols": ["rust:src/lib.rs:caller"]
+                    }),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let assembly = make_assembler_with_store(store)
+            .assemble_with_evidence(ContextRequest {
+                system_prompt: "You are a coder.".into(),
+                user_query: "helper caller relationship".into(),
+                project_id: Some("proj-graph".into()),
+                token_budget: 200,
+                top_k: 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let context = assembly
+            .messages
+            .iter()
+            .find(|message| message.content.starts_with("Relevant context:"))
+            .map(|message| message.content.as_str())
+            .expect("retrieved context should be present");
+
+        assert!(context.contains("file=src/lib.rs"));
+        assert!(context.contains("symbol=rust:src/lib.rs:helper"));
+        assert!(context.contains("related=rust:src/lib.rs:caller"));
+        assert_eq!(
+            assembly.rag.chunks[0].symbol_id.as_deref(),
+            Some("rust:src/lib.rs:helper")
+        );
+        assert_eq!(
+            assembly.rag.chunks[0].related_symbols,
+            vec!["rust:src/lib.rs:caller"]
         );
     }
 

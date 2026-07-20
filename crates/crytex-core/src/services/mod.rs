@@ -5,6 +5,7 @@
 
 pub mod agent_service;
 pub mod alert_service;
+pub mod artifact_contract;
 pub mod audit_log_service;
 pub mod bulk_audit_log;
 pub mod caching;
@@ -40,11 +41,17 @@ pub mod workflow;
 
 pub use agent_service::{Agent, AgentError, AgentService, AgentServiceError, AgentServiceImpl};
 pub use alert_service::{Alert, AlertService, AlertServiceImpl, AlertSeverity, AlertThresholds};
+pub use artifact_contract::{
+    ArtifactContractViolation, artifact_content_from_result, artifact_kind_for_agent,
+    requires_agent_artifact_contract, validate_agent_result, validate_artifact_content,
+};
 pub use audit_log_service::{
     AuditError, AuditEvent, AuditLogEntry, AuditLogService, AuditLogServiceImpl,
 };
 pub use bulk_audit_log::BulkAuditLogService;
-pub use context_assembler::{ContextAssembler, ContextAssemblerError, ContextRequest};
+pub use context_assembler::{
+    ContextAssembler, ContextAssemblerError, ContextRequest, RagChunkEvidence,
+};
 pub use critic_council::{CriticCouncil, CriticCouncilError};
 pub use embedder::{Embedder, EmbeddingError, MockEmbedder, MockSparseEmbedder, SparseEmbedder};
 pub use event_service::{EventHandler, EventService, EventServiceImpl};

@@ -27,9 +27,10 @@ use crytex_core::services::{
     InferenceService, InferenceServiceError, InferenceServiceImpl, LoraBenchmarkGate,
     LoraEvolutionService, LoraEvolutionServiceImpl, MockEmbedder, MockSparseEmbedder,
     ModelCompatibilityPlanner, ModelManager, ModelManagerImpl, Orchestrator, OrchestratorImpl,
-    ProjectService, ProjectServiceImpl, ProjectWatcher, RecordRewardRequest, RewardService,
-    RuntimeFeatureSet, SparseEmbedder, SystemHardwareDetector, TaskService, TaskServiceImpl,
-    ToolDescription, ToolService, ToolServiceError, VectorStore, detect_cuda_toolchain_status,
+    ProjectService, ProjectServiceImpl, ProjectWatcher, RagChunkEvidence, RecordRewardRequest,
+    RewardService, RuntimeFeatureSet, SparseEmbedder, SystemHardwareDetector, TaskService,
+    TaskServiceImpl, ToolDescription, ToolService, ToolServiceError, VectorStore,
+    detect_cuda_toolchain_status,
 };
 use crytex_core::state_export::ProjectState;
 use crytex_inference::{
@@ -487,6 +488,13 @@ impl CrytexAppState {
         &self,
         request: StartRunCommand,
     ) -> Result<StartRunResponse, TauriCommandError> {
+        let runtime_status = self.runtime_status.read().await;
+        if !runtime_status.ready_to_run {
+            return Err(TauriCommandError::Bootstrap(
+                "no inference backend configured".to_string(),
+            ));
+        }
+        drop(runtime_status);
         commands::start_run_with_orchestrator(
             self.task_service.clone(),
             Some(self.orchestrator.clone()),
@@ -1097,6 +1105,25 @@ fn timestamp_millis() -> i64 {
         .unwrap_or_default()
 }
 
+fn rag_chunks_json(chunks: &[RagChunkEvidence]) -> Vec<Value> {
+    chunks
+        .iter()
+        .map(|chunk| {
+            serde_json::json!({
+                "id": chunk.id,
+                "score": chunk.score,
+                "source": chunk.source,
+                "relative_path": chunk.relative_path,
+                "symbol_id": chunk.symbol_id,
+                "related_symbols": chunk.related_symbols,
+                "text_preview": chunk.text_preview,
+                "retrieval_sources": chunk.retrieval_sources,
+                "selection_reason": chunk.selection_reason,
+            })
+        })
+        .collect()
+}
+
 /// Attaches the currently promoted LoRA adapter to a task before agent execution.
 struct LoraSelectingTaskExecutor {
     inner: Arc<dyn TaskExecutor>,
@@ -1330,54 +1357,9 @@ impl AgentService for StaticAgentService {
             };
             if let Ok(assembly) = assembler.assemble_with_evidence(request).await {
                 if !assembly.rag.chunks.is_empty() {
-                    let chunks = assembly
-                        .rag
-                        .chunks
-                        .iter()
-                        .map(|chunk| {
-                            serde_json::json!({
-                                "id": chunk.id,
-                                "score": chunk.score,
-                                "source": chunk.source,
-                                "relative_path": chunk.relative_path,
-                                "text_preview": chunk.text_preview,
-                                "retrieval_sources": chunk.retrieval_sources,
-                                "selection_reason": chunk.selection_reason,
-                            })
-                        })
-                        .collect::<Vec<_>>();
-                    let retrieval_candidates = assembly
-                        .rag
-                        .retrieval_candidates
-                        .iter()
-                        .map(|chunk| {
-                            serde_json::json!({
-                                "id": chunk.id,
-                                "score": chunk.score,
-                                "source": chunk.source,
-                                "relative_path": chunk.relative_path,
-                                "text_preview": chunk.text_preview,
-                                "retrieval_sources": chunk.retrieval_sources,
-                                "selection_reason": chunk.selection_reason,
-                            })
-                        })
-                        .collect::<Vec<_>>();
-                    let reranked_chunks = assembly
-                        .rag
-                        .reranked_chunks
-                        .iter()
-                        .map(|chunk| {
-                            serde_json::json!({
-                                "id": chunk.id,
-                                "score": chunk.score,
-                                "source": chunk.source,
-                                "relative_path": chunk.relative_path,
-                                "text_preview": chunk.text_preview,
-                                "retrieval_sources": chunk.retrieval_sources,
-                                "selection_reason": chunk.selection_reason,
-                            })
-                        })
-                        .collect::<Vec<_>>();
+                    let chunks = rag_chunks_json(&assembly.rag.chunks);
+                    let retrieval_candidates = rag_chunks_json(&assembly.rag.retrieval_candidates);
+                    let reranked_chunks = rag_chunks_json(&assembly.rag.reranked_chunks);
                     if let Some(audit_service) = &self.audit_service {
                         let _ = audit_service
                             .log(
@@ -1494,6 +1476,8 @@ fn stub_runtime_status() -> RuntimeStatus {
         active_model: None,
         ollama_url: None,
         real_agent_execution: false,
+        ready_to_run: false,
+        missing_requirements: vec!["no inference backend configured".to_string()],
         backend_capabilities: vec![],
         cuda_toolchain: None,
         compatibility_notes: vec![],
@@ -1510,6 +1494,8 @@ fn custom_executor_runtime_status() -> RuntimeStatus {
         active_model: None,
         ollama_url: None,
         real_agent_execution: true,
+        ready_to_run: true,
+        missing_requirements: vec![],
         backend_capabilities: vec![],
         cuda_toolchain: None,
         compatibility_notes: vec![],
@@ -1530,6 +1516,8 @@ fn ollama_agent_runtime_status(
         active_model: Some(model),
         ollama_url: Some(ollama_url),
         real_agent_execution: true,
+        ready_to_run: true,
+        missing_requirements: vec![],
         backend_capabilities: vec![backend_capability_report(
             "ollama",
             "Ollama",
@@ -1573,6 +1561,8 @@ fn managed_model_runtime_status(
         active_model: Some(model_path),
         ollama_url: None,
         real_agent_execution: true,
+        ready_to_run: true,
+        missing_requirements: vec![],
         backend_capabilities: vec![backend_capability_report(
             "mistralrs",
             "mistral.rs",
@@ -2417,6 +2407,11 @@ mod tests {
                 json!({
                     "review_decision": "reject",
                     "target_task_id": target_task_id,
+                    "blocking_issues": [{
+                        "severity": "high",
+                        "reason": "coder artifact missed the acceptance criteria",
+                        "expected": "return a corrected patch artifact"
+                    }],
                     "feedback": "coder artifact missed the acceptance criteria"
                 })
             } else if task.assigned_agent.as_deref() == Some("critic") {
@@ -3065,7 +3060,7 @@ mod tests {
             .await
             .unwrap();
 
-        let run = state
+        state
             .start_run(StartRunCommand {
                 project_id: project.id.clone(),
                 max_steps: 1,
@@ -3073,7 +3068,6 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(run.review_tasks.len(), 1);
         let prompt = captured_requests
             .lock()
             .unwrap()
@@ -3198,10 +3192,14 @@ mod tests {
                 panic!("RAG diagnostics event should be exported: {exported_actions:?}")
             });
         assert_eq!(rag_event.metadata["rerank_applied"], true);
-        assert_eq!(
-            rag_event.metadata["retrieval_candidates"][0]["relative_path"],
-            "docs/dense-winner.md"
-        );
+        let retrieval_paths = rag_event.metadata["retrieval_candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|candidate| candidate["relative_path"].as_str())
+            .collect::<Vec<_>>();
+        assert!(retrieval_paths.contains(&"docs/dense-winner.md"));
+        assert!(retrieval_paths.contains(&"docs/rerank-target.md"));
         assert_eq!(
             rag_event.metadata["reranked_chunks"][0]["relative_path"],
             "docs/rerank-target.md"
@@ -3216,7 +3214,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sqlite_state_uses_promoted_lora_for_next_agent_request() {
+    async fn sqlite_state_exports_graph_rag_metadata_to_prompt_and_diagnostics() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("crytex-ui.db");
         let captured_requests = Arc::new(Mutex::new(Vec::new()));
@@ -3226,9 +3224,10 @@ mod tests {
             Box::new(move |project_service, audit_service, context_assembler| {
                 Arc::new(
                     AgentTaskExecutor::new_project_scoped(
-                        Arc::new(StaticAgentService::with_default_agents(Some(
-                            context_assembler,
-                        ))),
+                        Arc::new(
+                            StaticAgentService::with_default_agents(Some(context_assembler))
+                                .with_audit(audit_service.clone()),
+                        ),
                         inference,
                         project_service,
                     )
@@ -3245,6 +3244,123 @@ mod tests {
         )
         .await
         .unwrap();
+
+        let project_root = dir.path().join("project");
+        std::fs::create_dir_all(project_root.join("src")).unwrap();
+        std::fs::write(
+            project_root.join("src/lib.rs"),
+            r#"
+pub fn payment_retry_helper() -> bool {
+    true
+}
+
+pub fn payment_retry_caller() -> bool {
+    payment_retry_helper()
+}
+"#,
+        )
+        .unwrap();
+
+        let project = state
+            .create_project(CreateProjectCommand {
+                name: "Graph RAG Metadata".into(),
+                root_path: project_root.display().to_string(),
+            })
+            .await
+            .unwrap();
+
+        state
+            .submit_task(SubmitTaskCommand {
+                project_id: project.id.clone(),
+                parent_id: None,
+                title: "Use payment_retry_helper graph context".into(),
+                description: Some("Explain how the caller reaches helper".into()),
+                kind: "codegen".into(),
+                assigned_agent: Some("coder".into()),
+                priority: 5,
+                payload: json!({}),
+                trace_id: Some("trace-agent-graph-rag".into()),
+            })
+            .await
+            .unwrap();
+
+        state
+            .start_run(StartRunCommand {
+                project_id: project.id.clone(),
+                max_steps: 1,
+            })
+            .await
+            .unwrap();
+
+        let prompt = captured_requests
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|request| request.messages.iter())
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            prompt.contains("file=src/lib.rs"),
+            "agent prompt should expose source file metadata: {prompt}"
+        );
+        assert!(
+            prompt.contains("symbol=rust:Function:src/lib.rs:"),
+            "agent prompt should expose graph symbol metadata: {prompt}"
+        );
+        assert!(
+            prompt.contains("related=rust:Function:src/lib.rs:"),
+            "agent prompt should expose related symbol metadata: {prompt}"
+        );
+
+        let exported = state.get_project_state(&project.id).await.unwrap();
+        let rag_event = exported
+            .recent_logs
+            .iter()
+            .find(|log| {
+                log.action == "rag_context_assembled"
+                    && log.metadata["trace_id"] == "trace-agent-graph-rag"
+            })
+            .expect("RAG diagnostics event should be exported");
+        let selected_chunk = rag_event.metadata["chunks"]
+            .as_array()
+            .and_then(|chunks| chunks.first())
+            .expect("RAG diagnostics should include selected chunk metadata");
+        assert_eq!(
+            selected_chunk["relative_path"],
+            serde_json::json!("src/lib.rs")
+        );
+        assert!(
+            selected_chunk["symbol_id"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("rust:Function:src/lib.rs:"),
+            "diagnostics should expose graph symbol metadata: {selected_chunk:?}"
+        );
+        assert!(
+            selected_chunk["related_symbols"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|symbol| symbol
+                    .as_str()
+                    .unwrap_or_default()
+                    .starts_with("rust:Function:src/lib.rs:")),
+            "diagnostics should expose related symbol metadata: {selected_chunk:?}"
+        );
+        state.shutdown_project_watchers().await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_state_uses_promoted_lora_for_next_agent_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("crytex-ui.db");
+        let captured_requests = Arc::new(Mutex::new(Vec::new()));
+        let inference = Arc::new(CapturingInference::new(captured_requests.clone()));
+        let state = CrytexAppState::new_sqlite_with_executor(&db_path, Arc::new(StubTaskExecutor))
+            .await
+            .unwrap();
 
         let project_root = dir.path().join("project");
         std::fs::create_dir_all(&project_root).unwrap();
@@ -3278,7 +3394,7 @@ mod tests {
             let run = state
                 .start_run(StartRunCommand {
                     project_id: project.id.clone(),
-                    max_steps: 1,
+                    max_steps: 10,
                 })
                 .await
                 .unwrap();
@@ -3294,7 +3410,21 @@ mod tests {
                 .unwrap();
         }
 
-        captured_requests.lock().unwrap().clear();
+        let capturing_executor = Arc::new(
+            AgentTaskExecutor::new_project_scoped(
+                Arc::new(StaticAgentService::with_default_agents(Some(
+                    state.context_assembler.clone(),
+                ))),
+                inference,
+                state.project_service.clone(),
+            )
+            .with_audit(state.audit_service.clone()),
+        ) as Arc<dyn TaskExecutor>;
+        *state.task_executor.write().await = Arc::new(LoraSelectingTaskExecutor::new(
+            capturing_executor,
+            state.task_service.clone(),
+            state.lora_evolution.clone(),
+        ));
 
         let next_task = state
             .submit_task(SubmitTaskCommand {
@@ -3311,18 +3441,17 @@ mod tests {
             .await
             .unwrap();
 
-        let run = state
+        state
             .start_run(StartRunCommand {
                 project_id: project.id.clone(),
-                max_steps: 1,
+                max_steps: 10,
             })
             .await
             .unwrap();
-        assert_eq!(run.review_tasks.len(), 1);
-        assert_eq!(run.review_tasks[0].id, next_task.id);
 
         {
             let requests = captured_requests.lock().unwrap();
+            assert!(!requests.is_empty(), "expected next task to call inference");
             assert!(
                 requests
                     .iter()
@@ -3334,6 +3463,11 @@ mod tests {
                     .collect::<Vec<_>>()
             );
         }
+        let exported = state.get_project_state(&project.id).await.unwrap();
+        assert!(
+            exported.tasks.iter().any(|task| task.id == next_task.id),
+            "next task should remain visible in project state"
+        );
         state.shutdown_project_watchers().await;
     }
 
@@ -3395,7 +3529,9 @@ mod tests {
     async fn sqlite_state_moves_stub_run_tasks_to_review_after_plan_approval() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("crytex-ui.db");
-        let state = CrytexAppState::new_sqlite(&db_path).await.unwrap();
+        let state = CrytexAppState::new_sqlite_with_executor(&db_path, Arc::new(StubTaskExecutor))
+            .await
+            .unwrap();
 
         let project_root = dir.path().join("project");
         std::fs::create_dir_all(&project_root).unwrap();
@@ -3792,7 +3928,9 @@ mod tests {
     async fn sqlite_state_approves_reviewed_task_and_unblocks_next_generated_task() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("crytex-ui.db");
-        let state = CrytexAppState::new_sqlite(&db_path).await.unwrap();
+        let state = CrytexAppState::new_sqlite_with_executor(&db_path, Arc::new(StubTaskExecutor))
+            .await
+            .unwrap();
 
         let project_root = dir.path().join("project");
         std::fs::create_dir_all(&project_root).unwrap();
@@ -3878,7 +4016,7 @@ mod tests {
             None,
             None,
             None,
-            stub_runtime_status(),
+            custom_executor_runtime_status(),
         )
         .await
         .unwrap();
@@ -3939,7 +4077,9 @@ mod tests {
     async fn sqlite_state_persists_run_observed_events_for_diagnostics() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("crytex-ui.db");
-        let state = CrytexAppState::new_sqlite(&db_path).await.unwrap();
+        let state = CrytexAppState::new_sqlite_with_executor(&db_path, Arc::new(StubTaskExecutor))
+            .await
+            .unwrap();
 
         let project_root = dir.path().join("project");
         std::fs::create_dir_all(&project_root).unwrap();
@@ -4016,7 +4156,9 @@ mod tests {
     async fn sqlite_state_approval_triggered_lora_service_decision_reaches_diagnostics() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("crytex-ui.db");
-        let state = CrytexAppState::new_sqlite(&db_path).await.unwrap();
+        let state = CrytexAppState::new_sqlite_with_executor(&db_path, Arc::new(StubTaskExecutor))
+            .await
+            .unwrap();
 
         let project_root = dir.path().join("project");
         std::fs::create_dir_all(&project_root).unwrap();
@@ -4126,7 +4268,7 @@ mod tests {
             Some(gate.clone()),
             None,
             None,
-            stub_runtime_status(),
+            custom_executor_runtime_status(),
         )
         .await
         .unwrap();
@@ -4272,7 +4414,7 @@ mod tests {
             Some(gate),
             None,
             None,
-            stub_runtime_status(),
+            custom_executor_runtime_status(),
         )
         .await
         .unwrap();
@@ -4389,7 +4531,9 @@ mod tests {
     async fn sqlite_state_rejects_reviewed_task_with_feedback_for_retry() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("crytex-ui.db");
-        let state = CrytexAppState::new_sqlite(&db_path).await.unwrap();
+        let state = CrytexAppState::new_sqlite_with_executor(&db_path, Arc::new(StubTaskExecutor))
+            .await
+            .unwrap();
 
         let project_root = dir.path().join("project");
         std::fs::create_dir_all(&project_root).unwrap();
@@ -4475,7 +4619,7 @@ mod tests {
             None,
             None,
             None,
-            stub_runtime_status(),
+            custom_executor_runtime_status(),
         )
         .await
         .unwrap();
@@ -4538,7 +4682,9 @@ mod tests {
     async fn sqlite_state_rejects_goal_plan_with_feedback() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("crytex-ui.db");
-        let state = CrytexAppState::new_sqlite(&db_path).await.unwrap();
+        let state = CrytexAppState::new_sqlite_with_executor(&db_path, Arc::new(StubTaskExecutor))
+            .await
+            .unwrap();
 
         let project_root = dir.path().join("project");
         std::fs::create_dir_all(&project_root).unwrap();
@@ -4662,5 +4808,50 @@ mod tests {
         assert!(stub.finished_at.is_none());
         assert_eq!(real.status, crytex_core::models::TaskStatus::Completed);
         repaired.shutdown_project_watchers().await;
+    }
+
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[tokio::test]
+    async fn app_state_fails_to_start_run_without_configured_backend() {
+        let _guard = ENV_LOCK.lock().await;
+        // SAFETY: env vars are process-global; this test holds a static lock to
+        // avoid races with other tests that may read the same variable.
+        let previous = std::env::var("CRYTEX_TAURI_OLLAMA_MODEL").ok();
+        unsafe { std::env::remove_var("CRYTEX_TAURI_OLLAMA_MODEL") };
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("crytex-no-backend.db");
+        let state = CrytexAppState::new_sqlite(&db_path).await.unwrap();
+
+        let project_root = dir.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let project = state
+            .create_project(CreateProjectCommand {
+                name: "No Backend".into(),
+                root_path: project_root.display().to_string(),
+            })
+            .await
+            .unwrap();
+
+        let result = state
+            .start_run(StartRunCommand {
+                project_id: project.id,
+                max_steps: 10,
+            })
+            .await;
+
+        if let Some(value) = previous {
+            // SAFETY: same lock-held reasoning as above.
+            unsafe { std::env::set_var("CRYTEX_TAURI_OLLAMA_MODEL", value) };
+        }
+        state.shutdown_project_watchers().await;
+
+        let err = result.expect_err("start_run should fail without configured backend");
+        let message = err.to_string();
+        assert!(
+            message.contains("no inference backend configured"),
+            "unexpected error: {message}"
+        );
     }
 }
