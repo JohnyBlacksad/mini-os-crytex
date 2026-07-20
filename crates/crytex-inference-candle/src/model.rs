@@ -227,8 +227,14 @@ impl LoraLinear {
 
     pub fn named_tensors(&self, prefix: &str) -> HashMap<String, Tensor> {
         let mut map = HashMap::new();
-        map.insert(format!("{prefix}.lora_a"), self.lora_a.as_tensor().clone());
-        map.insert(format!("{prefix}.lora_b"), self.lora_b.as_tensor().clone());
+        map.insert(
+            format!("{prefix}.lora_A.weight"),
+            self.lora_a.as_tensor().clone(),
+        );
+        map.insert(
+            format!("{prefix}.lora_B.weight"),
+            self.lora_b.as_tensor().clone(),
+        );
         map
     }
 
@@ -532,14 +538,22 @@ impl LoraCausalLM {
         let device = self.lora_layers[0].1.lora_a.as_tensor().device().clone();
         let tensors = candle_core::safetensors::load(path, &device)?;
         for (name, lora) in &mut self.lora_layers {
-            let a_key = format!("{name}.lora_a");
-            let b_key = format!("{name}.lora_b");
-            let a = tensors.get(&a_key).ok_or_else(|| {
-                candle_core::Error::Msg(format!("adapter missing tensor {a_key}"))
-            })?;
-            let b = tensors.get(&b_key).ok_or_else(|| {
-                candle_core::Error::Msg(format!("adapter missing tensor {b_key}"))
-            })?;
+            let a_key = format!("{name}.lora_A.weight");
+            let b_key = format!("{name}.lora_B.weight");
+            let legacy_a_key = format!("{name}.lora_a");
+            let legacy_b_key = format!("{name}.lora_b");
+            let a = tensors
+                .get(&a_key)
+                .or_else(|| tensors.get(&legacy_a_key))
+                .ok_or_else(|| {
+                    candle_core::Error::Msg(format!("adapter missing tensor {a_key}"))
+                })?;
+            let b = tensors
+                .get(&b_key)
+                .or_else(|| tensors.get(&legacy_b_key))
+                .ok_or_else(|| {
+                    candle_core::Error::Msg(format!("adapter missing tensor {b_key}"))
+                })?;
             lora.set_lora_a(a)?;
             lora.set_lora_b(b)?;
         }

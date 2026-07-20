@@ -3,10 +3,10 @@ use crytex_inference::{
     BackendInfo, InferenceError, InferenceManager, InferenceRequest, InferenceResponse,
     LoRAAdapter, Message, ModelInfo, TokenUsage,
 };
-use mistralrs::core::{DeviceLayerMapMetadata, DeviceMapMetadata};
+use mistralrs::core::{DeviceLayerMapMetadata, DeviceMapMetadata, Ordering};
 use mistralrs::{
-    AutoDeviceMapParams, DeviceMapSetting, GgufModelBuilder, IsqBits, LoraModelBuilder, Model,
-    RequestBuilder, TextMessageRole, TextModelBuilder,
+    AutoDeviceMapParams, DeviceMapSetting, GgufLoraModelBuilder, GgufModelBuilder, IsqBits,
+    LoraModelBuilder, Model, RequestBuilder, TextMessageRole, TextModelBuilder,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -42,6 +42,7 @@ enum MistralLoadPlan {
     Gguf {
         model_id: String,
         files: Vec<String>,
+        lora_adapter_paths: Vec<String>,
     },
 }
 
@@ -91,8 +92,13 @@ impl MistralRsBackend {
                 model_id,
                 lora_adapter_paths,
             } => self.load_plain_model(&model_id, lora_adapter_paths).await,
-            MistralLoadPlan::Gguf { model_id, files } => {
-                self.load_gguf_model(model_id, files).await
+            MistralLoadPlan::Gguf {
+                model_id,
+                files,
+                lora_adapter_paths,
+            } => {
+                self.load_gguf_model(model_id, files, lora_adapter_paths)
+                    .await
             }
         }
     }
@@ -102,15 +108,12 @@ impl MistralRsBackend {
         let lora_adapter_paths = self.registered_lora_adapter_paths()?;
 
         if looks_like_gguf(&path) {
-            if !lora_adapter_paths.is_empty() {
-                return Err(InferenceError::UnsupportedOperation(
-                    "GGUF LoRA adapter loading is not yet wired for local registered adapters"
-                        .to_string(),
-                ));
-            }
-
             let (model_id, files) = resolve_gguf_paths(&path)?;
-            return Ok(MistralLoadPlan::Gguf { model_id, files });
+            return Ok(MistralLoadPlan::Gguf {
+                model_id,
+                files,
+                lora_adapter_paths,
+            });
         }
 
         Ok(MistralLoadPlan::Plain {
@@ -135,20 +138,37 @@ impl MistralRsBackend {
         &self,
         model_id: String,
         files: Vec<String>,
+        lora_adapter_paths: Vec<String>,
     ) -> Result<Model, InferenceError> {
         info!(
             "Loading mistral.rs GGUF model from {} with files {:?}",
             model_id, files
         );
 
-        let mut builder = GgufModelBuilder::new(model_id, files);
+        let mut builder = GgufModelBuilder::new(model_id.clone(), files);
         builder =
             apply_gguf_device_settings(builder, self.inner.gpu_layers, self.inner.context_size);
 
-        builder
+        if lora_adapter_paths.is_empty() {
+            builder
+                .build()
+                .await
+                .map_err(|e| InferenceError::GenerationFailed(format!("model load failed: {e}")))
+        } else {
+            GgufLoraModelBuilder::from_gguf_model_builder(
+                builder,
+                lora_adapter_paths.join(";"),
+                Ordering {
+                    adapters: None,
+                    layers: None,
+                    base_model_id: model_id,
+                    preload_adapters: None,
+                },
+            )
             .build()
             .await
             .map_err(|e| InferenceError::GenerationFailed(format!("model load failed: {e}")))
+        }
     }
 
     async fn load_plain_model(
@@ -273,29 +293,7 @@ impl MistralRsBackend {
     }
 
     fn supports_lora_capability(&self) -> bool {
-        !Self::is_gguf_model_path(Path::new(&self.inner.model_path))
-    }
-
-    fn is_gguf_model_path(path: &Path) -> bool {
-        if path
-            .extension()
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
-        {
-            return true;
-        }
-
-        path.is_dir()
-            && std::fs::read_dir(path)
-                .ok()
-                .into_iter()
-                .flatten()
-                .filter_map(Result::ok)
-                .any(|entry| {
-                    entry
-                        .path()
-                        .extension()
-                        .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
-                })
+        true
     }
 }
 
@@ -641,11 +639,12 @@ mod tests {
     }
 
     #[test]
-    fn gguf_backend_does_not_advertise_lora_until_supported() {
+    fn gguf_backend_advertises_lora_when_supported() {
         let backend = MistralRsBackend::new("/tmp/model.gguf", 4096, None);
         let info = backend.available_backends();
 
-        assert!(!info[0].capabilities.contains(&"lora".to_string()));
+        assert!(info[0].capabilities.contains(&"lora".to_string()));
+        assert!(info[0].capabilities.contains(&"hot_swap".to_string()));
     }
 
     #[test]
@@ -715,14 +714,15 @@ mod tests {
     }
 
     #[test]
-    fn gguf_directory_backend_does_not_advertise_lora_until_supported() {
+    fn gguf_directory_backend_advertises_lora_when_supported() {
         let dir = std::env::temp_dir().join(format!("crytex-gguf-dir-{}", Ulid::new()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("model.gguf"), b"not a real model").unwrap();
         let backend = MistralRsBackend::new(dir.to_string_lossy(), 4096, None);
         let info = backend.available_backends();
 
-        assert!(!info[0].capabilities.contains(&"lora".to_string()));
+        assert!(info[0].capabilities.contains(&"lora".to_string()));
+        assert!(info[0].capabilities.contains(&"hot_swap".to_string()));
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -867,7 +867,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gguf_model_load_plan_rejects_registered_lora_until_supported() {
+    async fn gguf_model_load_plan_uses_registered_lora_paths() {
         let backend = MistralRsBackend::new("/tmp/model.gguf", 4096, None);
         let adapter_path = valid_lora_adapter_path("coder").await;
         backend
@@ -879,10 +879,15 @@ mod tests {
             .await
             .unwrap();
 
-        let err = backend.load_plan().unwrap_err();
+        let plan = backend.load_plan().unwrap();
 
-        assert!(
-            matches!(err, InferenceError::UnsupportedOperation(message) if message.contains("GGUF LoRA"))
+        assert_eq!(
+            plan,
+            MistralLoadPlan::Gguf {
+                model_id: "/tmp".to_string(),
+                files: vec!["model.gguf".to_string()],
+                lora_adapter_paths: vec![adapter_path.to_string_lossy().to_string()],
+            }
         );
 
         let _ = tokio::fs::remove_dir_all(adapter_path).await;
@@ -909,6 +914,44 @@ mod tests {
         );
 
         let _ = tokio::fs::remove_dir_all(active_path).await;
+    }
+
+    #[tokio::test]
+    async fn swap_lora_changes_adapter_used_by_next_request() {
+        let backend = MistralRsBackend::new("/tmp/model.gguf", 4096, None);
+        let first_path = valid_lora_adapter_path("first").await;
+        let second_path = valid_lora_adapter_path("second").await;
+        backend
+            .register_lora(LoRAAdapter {
+                id: "first".to_string(),
+                path: first_path.to_string_lossy().to_string(),
+                base_model: "mistral".to_string(),
+            })
+            .await
+            .unwrap();
+        backend
+            .register_lora(LoRAAdapter {
+                id: "second".to_string(),
+                path: second_path.to_string_lossy().to_string(),
+                base_model: "mistral".to_string(),
+            })
+            .await
+            .unwrap();
+
+        backend.swap_lora("first").await.unwrap();
+        assert_eq!(
+            backend.resolve_adapter(&empty_request()),
+            Some("first".to_string())
+        );
+
+        backend.swap_lora("second").await.unwrap();
+        assert_eq!(
+            backend.resolve_adapter(&empty_request()),
+            Some("second".to_string())
+        );
+
+        let _ = tokio::fs::remove_dir_all(first_path).await;
+        let _ = tokio::fs::remove_dir_all(second_path).await;
     }
 
     #[tokio::test]

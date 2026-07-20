@@ -62,6 +62,19 @@ pub fn get_xlora_paths(
     xlora_order: Option<&Ordering>,
 ) -> Result<AdapterPaths> {
     match (lora_adapter_ids, xlora_model_id, xlora_order) {
+        (None, Some(lora_ids), Some(order)) if is_plain_lora_order(order) => {
+            let mut lora_adapter_paths = Vec::new();
+            for adapter_id in lora_ids.split(mistralrs_quant::MULTI_LORA_DELIMITER) {
+                info!("Loading adapter at `{adapter_id}`");
+                lora_adapter_paths.push(resolve_lora_adapter_path(
+                    adapter_id,
+                    token_source,
+                    revision.clone(),
+                )?);
+            }
+
+            Ok(AdapterPaths::Lora(lora_adapter_paths))
+        }
         (None, Some(xlora_id), Some(xlora_order)) => {
             let api = {
                 let cache = GLOBAL_HF_CACHE.get().cloned().unwrap_or_default();
@@ -275,32 +288,11 @@ pub fn get_xlora_paths(
             let mut lora_adapter_paths = Vec::new();
             for adapter_id in adapter_ids {
                 info!("Loading adapter at `{adapter_id}`");
-
-                let api = {
-                    let cache = GLOBAL_HF_CACHE.get().cloned().unwrap_or_default();
-                    let mut api = ApiBuilder::from_cache(cache)
-                        .with_progress(true)
-                        .with_token(get_token(token_source)?);
-                    if let Some(cache_dir) = crate::hf_hub_cache_dir() {
-                        api = api.with_cache_dir(cache_dir);
-                    }
-                    api.build().map_err(candle_core::Error::msg)?
-                };
-                let api = api.repo(Repo::with_revision(
-                    adapter_id.clone(),
-                    RepoType::Model,
+                lora_adapter_paths.push(resolve_lora_adapter_path(
+                    adapter_id,
+                    token_source,
                     revision.clone(),
-                ));
-
-                let config_path = api.get("adapter_config.json")?;
-                let adapter_path = api.get("adapter_model.safetensors")?;
-                let lora_config: mistralrs_quant::LoraConfig =
-                    serde_json::from_str(&fs::read_to_string(config_path)?)?;
-
-                lora_adapter_paths.push(LoraAdapterPaths {
-                    lora_config,
-                    adapter_path,
-                });
+                )?);
             }
 
             Ok(AdapterPaths::Lora(lora_adapter_paths))
@@ -310,6 +302,54 @@ pub fn get_xlora_paths(
             "Incorrect configuration for an adapter model. Lora and XLora are mutually exclusive."
         ),
     }
+}
+
+fn is_plain_lora_order(order: &Ordering) -> bool {
+    order.adapters.is_none() && order.layers.is_none() && order.preload_adapters.is_none()
+}
+
+fn resolve_lora_adapter_path(
+    adapter_id: &str,
+    token_source: &TokenSource,
+    revision: String,
+) -> Result<LoraAdapterPaths> {
+    let local_dir = Path::new(adapter_id);
+    if local_dir.is_dir() {
+        let config_path = local_dir.join("adapter_config.json");
+        let adapter_path = local_dir.join("adapter_model.safetensors");
+        let lora_config: mistralrs_quant::LoraConfig =
+            serde_json::from_str(&fs::read_to_string(config_path)?)?;
+        return Ok(LoraAdapterPaths {
+            lora_config,
+            adapter_path,
+        });
+    }
+
+    let api = {
+        let cache = GLOBAL_HF_CACHE.get().cloned().unwrap_or_default();
+        let mut api = ApiBuilder::from_cache(cache)
+            .with_progress(true)
+            .with_token(get_token(token_source)?);
+        if let Some(cache_dir) = crate::hf_hub_cache_dir() {
+            api = api.with_cache_dir(cache_dir);
+        }
+        api.build().map_err(candle_core::Error::msg)?
+    };
+    let api = api.repo(Repo::with_revision(
+        adapter_id.to_string(),
+        RepoType::Model,
+        revision,
+    ));
+
+    let config_path = api.get("adapter_config.json")?;
+    let adapter_path = api.get("adapter_model.safetensors")?;
+    let lora_config: mistralrs_quant::LoraConfig =
+        serde_json::from_str(&fs::read_to_string(config_path)?)?;
+
+    Ok(LoraAdapterPaths {
+        lora_config,
+        adapter_path,
+    })
 }
 
 pub fn get_model_paths(
@@ -584,6 +624,7 @@ pub(crate) fn get_chat_template(
     }
 }
 
+#[cfg(test)]
 mod tests {
     #[test]
     fn match_safetensors() -> anyhow::Result<()> {
@@ -637,5 +678,81 @@ mod tests {
             assert!(!pickle_match.is_match(id));
         }
         Ok(())
+    }
+
+    #[test]
+    fn local_lora_adapter_path_resolves_without_hf_lookup() -> anyhow::Result<()> {
+        let adapter_dir = write_local_lora_adapter("single", 4)?;
+
+        let resolved = super::resolve_lora_adapter_path(
+            adapter_dir.to_string_lossy().as_ref(),
+            &crate::TokenSource::None,
+            "main".to_string(),
+        )?;
+
+        assert_eq!(resolved.lora_config.rank, 4);
+        assert_eq!(resolved.adapter_path, adapter_dir.join("adapter_model.safetensors"));
+        let _ = std::fs::remove_dir_all(adapter_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn gguf_lora_builder_style_ids_resolve_as_plain_lora() -> anyhow::Result<()> {
+        let first = write_local_lora_adapter("first", 4)?;
+        let second = write_local_lora_adapter("second", 8)?;
+        let adapter_ids = format!(
+            "{}{}{}",
+            first.display(),
+            mistralrs_quant::MULTI_LORA_DELIMITER,
+            second.display()
+        );
+        let order = crate::Ordering {
+            adapters: None,
+            layers: None,
+            base_model_id: "base-gguf".to_string(),
+            preload_adapters: None,
+        };
+
+        let resolved = super::get_xlora_paths(
+            "base-gguf".to_string(),
+            Some(&adapter_ids),
+            None,
+            &crate::TokenSource::None,
+            "main".to_string(),
+            Some(&order),
+        )?;
+
+        let super::AdapterPaths::Lora(paths) = resolved else {
+            panic!("GGUF LoRA builder inputs must resolve to plain LoRA adapter paths");
+        };
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0].lora_config.rank, 4);
+        assert_eq!(paths[1].lora_config.rank, 8);
+
+        let _ = std::fs::remove_dir_all(first);
+        let _ = std::fs::remove_dir_all(second);
+        Ok(())
+    }
+
+    fn write_local_lora_adapter(name: &str, rank: usize) -> anyhow::Result<std::path::PathBuf> {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let adapter_dir =
+            std::env::temp_dir().join(format!("mistralrs-local-lora-{name}-{suffix}"));
+        std::fs::create_dir_all(&adapter_dir)?;
+        let target_modules =
+            std::collections::HashSet::from(["q_proj".to_string(), "v_proj".to_string()]);
+        let config = mistralrs_quant::LoraConfig {
+            rank,
+            alpha: (rank * 2) as f64,
+            target_modules,
+        };
+        std::fs::write(
+            adapter_dir.join("adapter_config.json"),
+            serde_json::to_vec(&config)?,
+        )?;
+        std::fs::write(adapter_dir.join("adapter_model.safetensors"), b"adapter")?;
+        Ok(adapter_dir)
     }
 }

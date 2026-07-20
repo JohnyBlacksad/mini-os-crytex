@@ -639,9 +639,9 @@ mod tests {
 
         assert!(!names.is_empty());
         assert!(
-            names
-                .iter()
-                .all(|name| { name.ends_with(".lora_a") || name.ends_with(".lora_b") })
+            names.iter().all(|name| {
+                name.ends_with(".lora_A.weight") || name.ends_with(".lora_B.weight")
+            })
         );
         assert!(!names.iter().any(|name| {
             name.contains("embed_tokens")
