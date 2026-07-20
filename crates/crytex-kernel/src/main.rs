@@ -204,6 +204,14 @@ enum Commands {
             default_value = "Implement a validated utility with tests"
         )]
         goal: String,
+        #[arg(long, default_value = "ollama")]
+        live_backend: String,
+        #[arg(long, default_value = "qwen3.5:9b")]
+        live_model: String,
+        #[arg(long, default_value = "http://localhost:11434")]
+        live_url: String,
+        #[arg(long)]
+        deterministic: bool,
         #[arg(long)]
         report_path: Option<PathBuf>,
     },
@@ -630,6 +638,11 @@ struct KernelE2eProofReport {
     trace_id: String,
     project_id: String,
     project_root: String,
+    runtime_kind: String,
+    live_backend: Option<String>,
+    live_model: Option<String>,
+    live_generation_count: usize,
+    live_generation_evidence: Vec<KernelLiveGenerationEvidence>,
     goal_task_id: String,
     task_ids: Vec<String>,
     critic_rejection_task_id: String,
@@ -649,10 +662,26 @@ struct KernelE2eProofReport {
     passed: bool,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct KernelLiveGenerationEvidence {
+    agent: String,
+    task_id: String,
+    prompt_chars: usize,
+    response_chars: usize,
+    prompt_tokens: usize,
+    completion_tokens: usize,
+    finish_reason: String,
+    excerpt: String,
+}
+
 struct KernelE2eProofInput {
     trace_id: String,
     project_id: String,
     project_root: String,
+    runtime_kind: String,
+    live_backend: Option<String>,
+    live_model: Option<String>,
+    live_generation_evidence: Vec<KernelLiveGenerationEvidence>,
     goal_task_id: String,
     task_ids: Vec<String>,
     critic_rejection_task_id: String,
@@ -673,6 +702,15 @@ struct KernelE2eProofInput {
 impl KernelE2eProofReport {
     fn from_input(input: KernelE2eProofInput) -> Self {
         let gates = vec![
+            proof_gate(
+                "live_model_executed",
+                input.runtime_kind == "deterministic" || !input.live_generation_evidence.is_empty(),
+                &format!(
+                    "runtime={}, generations={}",
+                    input.runtime_kind,
+                    input.live_generation_evidence.len()
+                ),
+            ),
             proof_gate(
                 "project_created",
                 !input.project_id.is_empty(),
@@ -746,6 +784,11 @@ impl KernelE2eProofReport {
             trace_id: input.trace_id,
             project_id: input.project_id,
             project_root: input.project_root,
+            runtime_kind: input.runtime_kind,
+            live_backend: input.live_backend,
+            live_model: input.live_model,
+            live_generation_count: input.live_generation_evidence.len(),
+            live_generation_evidence: input.live_generation_evidence,
             goal_task_id: input.goal_task_id,
             task_ids: input.task_ids,
             critic_rejection_task_id: input.critic_rejection_task_id,
@@ -841,6 +884,7 @@ struct KernelE2eProofDeps {
     audit_service: Arc<dyn crytex_core::services::AuditLogService>,
     metrics_service: Arc<dyn MetricsService>,
     lora_evolution: Arc<dyn crytex_core::services::LoraEvolutionService>,
+    live_inference: Option<Arc<dyn crytex_core::services::InferenceService>>,
     prompt_service: Arc<PromptEvolutionService<Storage, Storage>>,
     benchmark_harness: Arc<dyn BenchmarkHarness>,
     benchmark_repo: Arc<dyn BenchmarkResultRepository>,
@@ -852,6 +896,19 @@ struct KernelE2eProofRequest {
     project_path: PathBuf,
     project_name: String,
     goal: String,
+    runtime_kind: String,
+    live_backend: Option<String>,
+    live_model: Option<String>,
+}
+
+struct KernelE2eProofCommandRequest {
+    path: PathBuf,
+    name: String,
+    goal: String,
+    live_backend: String,
+    live_model: String,
+    live_url: String,
+    deterministic: bool,
 }
 
 #[async_trait]
@@ -893,6 +950,7 @@ async fn run_kernel_e2e_proof(
         audit_service,
         metrics_service,
         lora_evolution,
+        live_inference,
         prompt_service,
         benchmark_harness,
         benchmark_repo,
@@ -903,7 +961,11 @@ async fn run_kernel_e2e_proof(
         project_path,
         project_name,
         goal,
+        runtime_kind,
+        live_backend,
+        live_model,
     } = request;
+    let mut live_generation_evidence = Vec::new();
 
     tokio::fs::create_dir_all(&project_path)
         .await
@@ -948,21 +1010,32 @@ async fn run_kernel_e2e_proof(
             kind: "goal".into(),
             assigned_agent: Some("architect".into()),
             priority: 10,
-            payload: serde_json::json!({ "goal": goal }),
+            payload: serde_json::json!({ "goal": goal.clone() }),
             trace_id: Some(trace_id.clone()),
         })
         .await
         .map_err(|error| format!("failed to submit goal: {error}"))?;
-    let goal_task = complete_proof_task(
-        task_service.as_ref(),
-        &goal_task.id,
-        serde_json::json!({
-            "source": "kernel_e2e_proof",
-            "plan_approved": true,
-            "tasks": ["architect", "coder", "qa", "security", "critic"]
-        }),
-    )
-    .await?;
+    let mut goal_result = serde_json::json!({
+        "source": "kernel_e2e_proof",
+        "plan_approved": true,
+        "tasks": ["architect", "coder", "qa", "security", "critic"]
+    });
+    if let Some(inference) = live_inference.as_ref() {
+        let evidence = run_live_agent_generation(
+            inference.clone(),
+            &live_backend,
+            &live_model,
+            "architect",
+            &goal_task.id,
+            "You are the architect/team lead. Decompose the user goal into atomic tasks and return concise JSON.",
+            &format!("Goal: {goal}\nReturn a task graph with architect, coder, qa, security, critic."),
+        )
+        .await?;
+        goal_result["live_model"] = serde_json::to_value(&evidence)
+            .map_err(|error| format!("failed to serialize live architect evidence: {error}"))?;
+        live_generation_evidence.push(evidence);
+    }
+    let goal_task = complete_proof_task(task_service.as_ref(), &goal_task.id, goal_result).await?;
 
     let mut chain_task_ids = vec![goal_task.id.clone()];
     let mut previous_artifact = serde_json::json!({
@@ -995,6 +1068,27 @@ async fn run_kernel_e2e_proof(
                 "summary": format!("{agent} completed {title}")
             }
         });
+        let mut result = result;
+        if let Some(inference) = live_inference.as_ref() {
+            let evidence = run_live_agent_generation(
+                inference.clone(),
+                &live_backend,
+                &live_model,
+                agent,
+                &task.id,
+                live_agent_system_prompt(agent),
+                &format!(
+                    "Task: {title}\nIncoming artifact JSON:\n{}\nReturn the next artifact as concise JSON or markdown evidence.",
+                    previous_artifact
+                ),
+            )
+            .await?;
+            result["live_model"] = serde_json::to_value(&evidence)
+                .map_err(|error| format!("failed to serialize live {agent} evidence: {error}"))?;
+            result["artifact"]["live_excerpt"] =
+                serde_json::Value::String(evidence.excerpt.clone());
+            live_generation_evidence.push(evidence);
+        }
         let completed =
             complete_proof_task(task_service.as_ref(), &task.id, result.clone()).await?;
         previous_artifact = result["artifact"].clone();
@@ -1010,17 +1104,29 @@ async fn run_kernel_e2e_proof(
         &previous_artifact,
     )
     .await?;
-    let critic = complete_proof_task(
-        task_service.as_ref(),
-        &critic.id,
-        serde_json::json!({
-            "source": "kernel_e2e_proof",
-            "agent": "critic",
-            "decision": "reject",
-            "feedback": "missing deterministic regression evidence"
-        }),
-    )
-    .await?;
+    let mut critic_result = serde_json::json!({
+        "source": "kernel_e2e_proof",
+        "agent": "critic",
+        "decision": "reject",
+        "feedback": "missing deterministic regression evidence"
+    });
+    if let Some(inference) = live_inference.as_ref() {
+        let evidence = run_live_agent_generation(
+            inference.clone(),
+            &live_backend,
+            &live_model,
+            "critic",
+            &critic.id,
+            "You are a strict reviewer. Find one concrete reason to reject the artifact and explain the remediation.",
+            &format!("Review this artifact and reject it with an actionable reason:\n{previous_artifact}"),
+        )
+        .await?;
+        critic_result["live_model"] = serde_json::to_value(&evidence)
+            .map_err(|error| format!("failed to serialize live critic evidence: {error}"))?;
+        critic_result["feedback"] = serde_json::Value::String(evidence.excerpt.clone());
+        live_generation_evidence.push(evidence);
+    }
+    let critic = complete_proof_task(task_service.as_ref(), &critic.id, critic_result).await?;
     task_service
         .set_critic_score(&critic.id, 2.0)
         .await
@@ -1042,17 +1148,38 @@ async fn run_kernel_e2e_proof(
         &previous_artifact,
     )
     .await?;
-    let remediation = complete_proof_task(
-        task_service.as_ref(),
-        &remediation.id,
-        serde_json::json!({
-            "source": "kernel_e2e_proof",
-            "agent": "coder",
-            "remediation_for": rejected.id,
-            "evidence": "deterministic regression benchmark added"
-        }),
-    )
-    .await?;
+    let mut remediation_result = serde_json::json!({
+        "source": "kernel_e2e_proof",
+        "agent": "coder",
+        "remediation_for": rejected.id,
+        "evidence": "deterministic regression benchmark added"
+    });
+    if let Some(inference) = live_inference.as_ref() {
+        let evidence = run_live_agent_generation(
+            inference.clone(),
+            &live_backend,
+            &live_model,
+            "remediation",
+            &remediation.id,
+            "You are the remediation engineer. Respond with concrete fix evidence for the critic rejection.",
+            &format!(
+                "Critic rejected the work with this feedback: {}\nReturn remediation evidence.",
+                critic
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.get("feedback"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("missing deterministic regression evidence")
+            ),
+        )
+        .await?;
+        remediation_result["live_model"] = serde_json::to_value(&evidence)
+            .map_err(|error| format!("failed to serialize live remediation evidence: {error}"))?;
+        remediation_result["evidence"] = serde_json::Value::String(evidence.excerpt.clone());
+        live_generation_evidence.push(evidence);
+    }
+    let remediation =
+        complete_proof_task(task_service.as_ref(), &remediation.id, remediation_result).await?;
     task_service
         .set_human_score(&remediation.id, 5.0)
         .await
@@ -1158,6 +1285,10 @@ async fn run_kernel_e2e_proof(
         trace_id,
         project_id: project.id,
         project_root: project_path.display().to_string(),
+        runtime_kind,
+        live_backend,
+        live_model,
+        live_generation_evidence,
         goal_task_id: goal_task.id,
         task_ids: chain_task_ids,
         critic_rejection_task_id: rejected.id,
@@ -1178,10 +1309,17 @@ async fn run_kernel_e2e_proof(
 
 async fn run_kernel_e2e_proof_command(
     config: &CrytexConfig,
-    path: PathBuf,
-    name: String,
-    goal: String,
+    command: KernelE2eProofCommandRequest,
 ) -> Result<KernelE2eProofReport, String> {
+    let KernelE2eProofCommandRequest {
+        path,
+        name,
+        goal,
+        live_backend,
+        live_model,
+        live_url,
+        deterministic,
+    } = command;
     let proof_state_dir = path.join(".crytex");
     tokio::fs::create_dir_all(&proof_state_dir)
         .await
@@ -1231,13 +1369,22 @@ async fn run_kernel_e2e_proof_command(
         )
         .with_prompt_repo(storage.clone()),
     );
-    let inference: Arc<dyn crytex_core::services::InferenceService> =
+    let lora_inference: Arc<dyn crytex_core::services::InferenceService> =
         Arc::new(KernelProofInference);
+    let live_inference = if deterministic {
+        None
+    } else {
+        Some(create_kernel_live_inference(
+            &live_backend,
+            &live_model,
+            &live_url,
+        )?)
+    };
     let lora_evolution = create_lora_evolution_service(
         persistence.clone(),
         task_service.clone(),
         storage.clone(),
-        inference,
+        lora_inference,
         event_service,
         Some(embedder.clone()),
         Some(vector_store.clone()),
@@ -1254,6 +1401,7 @@ async fn run_kernel_e2e_proof_command(
             audit_service,
             metrics_service,
             lora_evolution,
+            live_inference,
             prompt_service,
             benchmark_harness,
             benchmark_repo,
@@ -1264,9 +1412,94 @@ async fn run_kernel_e2e_proof_command(
             project_path: path,
             project_name: name,
             goal,
+            runtime_kind: if deterministic {
+                "deterministic".into()
+            } else {
+                "live".into()
+            },
+            live_backend: (!deterministic).then_some(live_backend),
+            live_model: (!deterministic).then_some(live_model),
         },
     )
     .await
+}
+
+fn create_kernel_live_inference(
+    backend_id: &str,
+    model: &str,
+    url: &str,
+) -> Result<Arc<dyn crytex_core::services::InferenceService>, String> {
+    let backend_config = match backend_id {
+        "ollama" => BackendConfig::ollama(backend_id, model, url),
+        other => {
+            return Err(format!(
+                "kernel live E2E currently supports ollama only, got {other}"
+            ));
+        }
+    };
+    let mut registry = BackendRegistry::new(backend_id);
+    let backend = factory::create_backend(&backend_config)
+        .map_err(|error| format!("failed to create live backend {backend_id}: {error}"))?;
+    registry.register(backend_id.to_string(), backend);
+    Ok(Arc::new(InferenceServiceImpl::new(
+        Arc::new(registry),
+        Some(backend_id.to_string()),
+    )))
+}
+
+fn live_agent_system_prompt(agent: &str) -> &'static str {
+    match agent {
+        "architect" => {
+            "You are an architect. Decompose work into atomic tasks with explicit artifact handoff."
+        }
+        "coder" => "You are a coder. Produce implementation evidence and mention tests.",
+        "qa" => "You are QA. Validate behavior and list concrete checks.",
+        "security" => "You are security reviewer. Identify risks and mitigations.",
+        "critic" => "You are critic. Reject weak evidence with a specific reason.",
+        _ => "You are an autonomous engineering agent. Produce concise task evidence.",
+    }
+}
+
+async fn run_live_agent_generation(
+    inference: Arc<dyn crytex_core::services::InferenceService>,
+    backend_id: &Option<String>,
+    model: &Option<String>,
+    agent: &str,
+    task_id: &str,
+    system: &str,
+    user: &str,
+) -> Result<KernelLiveGenerationEvidence, String> {
+    let model = model
+        .as_deref()
+        .ok_or_else(|| "live model is required for live kernel proof".to_string())?;
+    let request = inference.chat_request(backend_id.as_deref(), model, Some(system), user);
+    let response = inference
+        .generate(InferenceRequest {
+            temperature: Some(0.2),
+            max_tokens: Some(256),
+            ..request
+        })
+        .await
+        .map_err(|error| format!("live {agent} generation failed: {error}"))?;
+    let excerpt = response
+        .content
+        .chars()
+        .take(280)
+        .collect::<String>()
+        .replace(['\r', '\n'], " ");
+    if excerpt.trim().is_empty() {
+        return Err(format!("live {agent} generation returned empty content"));
+    }
+    Ok(KernelLiveGenerationEvidence {
+        agent: agent.to_string(),
+        task_id: task_id.to_string(),
+        prompt_chars: system.len() + user.len(),
+        response_chars: response.content.chars().count(),
+        prompt_tokens: response.usage.prompt_tokens,
+        completion_tokens: response.usage.completion_tokens,
+        finish_reason: response.finish_reason,
+        excerpt,
+    })
 }
 
 async fn submit_agent_chain_task(
@@ -2434,16 +2667,30 @@ async fn async_main() {
         path,
         name,
         goal,
+        live_backend,
+        live_model,
+        live_url,
+        deterministic,
         report_path,
     } = &cli.command
     {
-        let report =
-            run_kernel_e2e_proof_command(&config, path.clone(), name.clone(), goal.clone())
-                .await
-                .unwrap_or_else(|error| {
-                    eprintln!("Kernel E2E proof failed: {error}");
-                    std::process::exit(1);
-                });
+        let report = run_kernel_e2e_proof_command(
+            &config,
+            KernelE2eProofCommandRequest {
+                path: path.clone(),
+                name: name.clone(),
+                goal: goal.clone(),
+                live_backend: live_backend.clone(),
+                live_model: live_model.clone(),
+                live_url: live_url.clone(),
+                deterministic: *deterministic,
+            },
+        )
+        .await
+        .unwrap_or_else(|error| {
+            eprintln!("Kernel E2E proof failed: {error}");
+            std::process::exit(1);
+        });
         let payload = serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into());
         if let Some(report_path) = report_path {
             if let Some(parent) = report_path.parent()
@@ -4214,6 +4461,19 @@ mod tests {
             trace_id: "trace-kernel-e2e".into(),
             project_id: "project-1".into(),
             project_root: "A:/tmp/project".into(),
+            runtime_kind: "live".into(),
+            live_backend: Some("ollama".into()),
+            live_model: Some("qwen3.5:9b".into()),
+            live_generation_evidence: vec![KernelLiveGenerationEvidence {
+                agent: "architect".into(),
+                task_id: "goal-1".into(),
+                prompt_chars: 128,
+                response_chars: 256,
+                prompt_tokens: 12,
+                completion_tokens: 24,
+                finish_reason: "stop".into(),
+                excerpt: "live model produced an artifact".into(),
+            }],
             goal_task_id: "goal-1".into(),
             task_ids: vec![
                 "goal-1".into(),
@@ -4240,7 +4500,13 @@ mod tests {
         });
 
         assert!(report.passed);
-        assert_eq!(report.gates.len(), 10);
+        assert_eq!(report.gates.len(), 11);
+        assert!(
+            report
+                .gates
+                .iter()
+                .any(|gate| gate.name == "live_model_executed" && gate.passed)
+        );
         assert!(
             report
                 .gates
@@ -4260,6 +4526,10 @@ mod tests {
                 trace_id: report.trace_id,
                 project_id: report.project_id,
                 project_root: report.project_root,
+                runtime_kind: report.runtime_kind,
+                live_backend: report.live_backend,
+                live_model: report.live_model,
+                live_generation_evidence: report.live_generation_evidence,
                 goal_task_id: report.goal_task_id,
                 task_ids: report.task_ids,
                 critic_rejection_task_id: report.critic_rejection_task_id,
