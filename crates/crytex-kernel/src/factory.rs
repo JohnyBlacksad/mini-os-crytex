@@ -272,7 +272,7 @@ pub fn create_reranker(config: &CrytexConfig) -> Option<Arc<dyn Reranker>> {
 /// Creates a LoRA trainer.
 ///
 /// Uses the Candle-based trainer which performs real low-rank adapter training
-/// in pure Rust and writes a `.safetensors` adapter file.
+/// in pure Rust and writes a PEFT-like adapter directory.
 pub fn create_lora_trainer() -> Arc<dyn LoraTrainer> {
     Arc::new(crytex_inference_candle::CandleLoraTrainer::new())
 }

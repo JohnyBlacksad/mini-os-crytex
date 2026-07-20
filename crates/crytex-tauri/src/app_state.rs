@@ -11,6 +11,7 @@ use crate::commands::{
     SetActiveManagedModelCommand, SetActiveOllamaModelCommand, SetTaskStatusCommand,
     StartRunCommand, StartRunResponse, StubTaskExecutor, SubmitGoalCommand, SubmitTaskCommand,
     TaskExecutor, TaskReviewDecisionCommand, TaskReviewDecisionResponse, TauriCommandError,
+    TrainLoraAdapterCommand, TrainLoraAdapterResponse,
 };
 use async_trait::async_trait;
 use crytex_agents::{
@@ -23,14 +24,14 @@ use crytex_core::metrics::{MetricsService, MetricsServiceImpl};
 use crytex_core::models::{KanbanState, Project, Task, TaskDependency, TaskStatus};
 use crytex_core::persistence::ProjectSnapshotRepository;
 use crytex_core::services::{
-    Agent, AgentService, AgentServiceError, AuditLogService, AuditLogServiceImpl, ContextAssembler,
-    DeviceKind, Embedder, EventHandler, EventService, EventServiceImpl, HardwareDetector,
-    InferenceService, InferenceServiceError, InferenceServiceImpl, LoraBenchmarkGate,
-    LoraEvolutionService, LoraEvolutionServiceImpl, MockEmbedder, MockSparseEmbedder,
-    ModelCompatibilityPlanner, ModelManager, ModelManagerImpl, Orchestrator, OrchestratorImpl,
-    ProjectService, ProjectServiceImpl, ProjectWatcher, RagChunkEvidence, RecordRewardRequest,
-    RewardService, RuntimeFeatureSet, SparseEmbedder, SystemHardwareDetector, TaskService,
-    TaskServiceImpl, ToolDescription, ToolService, ToolServiceError, VectorStore,
+    Agent, AgentRole, AgentService, AgentServiceError, AuditLogService, AuditLogServiceImpl,
+    ContextAssembler, DeviceKind, Embedder, EventHandler, EventService, EventServiceImpl,
+    HardwareDetector, InferenceService, InferenceServiceError, InferenceServiceImpl,
+    LoraBenchmarkGate, LoraEvolutionService, LoraEvolutionServiceImpl, MockEmbedder,
+    MockSparseEmbedder, ModelCompatibilityPlanner, ModelManager, ModelManagerImpl, Orchestrator,
+    OrchestratorImpl, ProjectService, ProjectServiceImpl, ProjectWatcher, RagChunkEvidence,
+    RecordRewardRequest, RewardService, RuntimeFeatureSet, SparseEmbedder, SystemHardwareDetector,
+    TaskService, TaskServiceImpl, ToolDescription, ToolService, ToolServiceError, VectorStore,
     detect_cuda_toolchain_status,
 };
 use crytex_core::state_export::ProjectState;
@@ -38,8 +39,8 @@ use crytex_inference::{
     BackendCapabilityReport, BackendInfo, BackendRegistry, InferenceRequest, InferenceResponse,
     LoRAAdapter, ModelInfo,
 };
+use crytex_inference_candle::CandleLoraTrainer;
 use crytex_inference_mistral::MistralRsBackend;
-use crytex_inference_mistral::training::MockLoraTrainer;
 use crytex_inference_ollama::OllamaBackend;
 use crytex_storage::{Storage, vector::EdgeVectorStore};
 use serde_json::Value;
@@ -288,7 +289,7 @@ impl CrytexAppState {
                 storage.clone(),
                 Arc::new(NoopLoraInferenceService),
                 event_service.clone(),
-                Arc::new(MockLoraTrainer::new()),
+                Arc::new(CandleLoraTrainer::new()),
                 app_data_dir.join("lora-adapters"),
                 runtime_status
                     .active_model
@@ -1027,6 +1028,32 @@ impl CrytexAppState {
             let _ = self.lora_evolution.train_and_register(&task.kind).await?;
         }
         Ok(())
+    }
+
+    pub async fn train_lora_adapter(
+        &self,
+        request: TrainLoraAdapterCommand,
+    ) -> Result<TrainLoraAdapterResponse, TauriCommandError> {
+        let adapter = if let Some(role) = request.agent_role.as_deref() {
+            let role = AgentRole::from_agent(role).ok_or_else(|| {
+                TauriCommandError::Bootstrap(format!("unknown LoRA agent role: {role}"))
+            })?;
+            self.lora_evolution
+                .train_and_register_for_role(role)
+                .await?
+        } else {
+            self.lora_evolution
+                .train_and_register(&request.task_kind)
+                .await?
+        };
+        let benchmark_gate = adapter.metrics.get("benchmark_gate").cloned();
+
+        Ok(TrainLoraAdapterResponse {
+            promoted: adapter.active,
+            benchmark_gate,
+            metrics: adapter.metrics.clone(),
+            adapter,
+        })
     }
 }
 
@@ -2338,7 +2365,12 @@ mod tests {
                 base_model: "mock-base".into(),
                 task_kind: Some(task_kind.to_string()),
                 agent_role: None,
-                metrics: json!({}),
+                metrics: json!({
+                    "benchmark_gate": {
+                        "accepted": true,
+                        "reason": "recording gate accepted"
+                    }
+                }),
                 created_at: 0,
                 active: true,
             })
@@ -4381,6 +4413,49 @@ pub fn payment_retry_caller() -> bool {
             ["codegen"]
         );
         state.shutdown_project_watchers().await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_state_train_lora_adapter_command_returns_promoted_benchmark_gate_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("crytex-ui.db");
+        let lora_evolution = Arc::new(RecordingLoraEvolution::new(true));
+        let state = CrytexAppState::new_sqlite_with_executor_factory_and_planning(
+            &db_path,
+            Box::new(|_, _, _| Arc::new(StubTaskExecutor)),
+            None,
+            None,
+            Some(lora_evolution.clone()),
+            None,
+            None,
+            None,
+            custom_executor_runtime_status(),
+        )
+        .await
+        .unwrap();
+
+        let response = state
+            .train_lora_adapter(TrainLoraAdapterCommand {
+                task_kind: "codegen".into(),
+                agent_role: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            lora_evolution.trained.lock().unwrap().as_slice(),
+            ["codegen"]
+        );
+        assert_eq!(response.adapter.id, "codegen-mock-lora");
+        assert!(response.promoted);
+        assert_eq!(
+            response.benchmark_gate.as_ref().unwrap()["accepted"],
+            serde_json::Value::Bool(true)
+        );
+        assert_eq!(
+            response.metrics["benchmark_gate"]["reason"],
+            "recording gate accepted"
+        );
     }
 
     #[tokio::test]

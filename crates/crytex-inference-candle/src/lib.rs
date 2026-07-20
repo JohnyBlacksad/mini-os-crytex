@@ -147,11 +147,13 @@ impl LoraTrainer for CandleLoraTrainer {
         );
 
         let adapter_id = format!("candle-lora-{}", Ulid::new());
-        let adapter_path = output_dir.join(format!("{adapter_id}.safetensors"));
+        let adapter_path = output_dir.join(&adapter_id);
+        tokio::fs::create_dir_all(&adapter_path).await?;
 
         let tensors: HashMap<String, Tensor> = model.lora_tensors();
-        candle_core::safetensors::save(&tensors, &adapter_path)
+        candle_core::safetensors::save(&tensors, adapter_path.join("adapter_model.safetensors"))
             .map_err(|e| LoraTrainingError::AdapterSerialization(e.to_string()))?;
+        write_adapter_config(&adapter_path, &config).await?;
 
         let average_reward = train.iter().map(|e| e.reward).sum::<f64>() / train.len() as f64;
 
@@ -165,6 +167,33 @@ impl LoraTrainer for CandleLoraTrainer {
             },
         })
     }
+}
+
+async fn write_adapter_config(
+    adapter_path: &Path,
+    config: &LoraTrainingConfig,
+) -> Result<(), LoraTrainingError> {
+    let base_model = config
+        .base_model_path
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "crytex-candle-tiny".to_string());
+    let payload = serde_json::json!({
+        "peft_type": "LORA",
+        "base_model_name_or_path": base_model,
+        "r": config.rank,
+        "lora_alpha": config.alpha,
+        "target_modules": config.target_modules,
+        "task_type": "CAUSAL_LM",
+        "crytex_trainer": "candle",
+    });
+    tokio::fs::write(
+        adapter_path.join("adapter_config.json"),
+        serde_json::to_vec_pretty(&payload)
+            .map_err(|e| LoraTrainingError::AdapterSerialization(e.to_string()))?,
+    )
+    .await?;
+    Ok(())
 }
 
 fn is_gguf_path(path: &Path) -> bool {
@@ -384,14 +413,13 @@ mod tests {
 
         let result = trainer.train(examples, config, &output).await.unwrap();
 
-        assert!(result.adapter_path.exists());
+        assert!(result.adapter_path.is_dir());
+        assert!(result.adapter_path.join("adapter_config.json").exists());
         assert!(
             result
                 .adapter_path
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .ends_with(".safetensors")
+                .join("adapter_model.safetensors")
+                .exists()
         );
         assert!(
             result.metrics.train_loss.is_finite(),
@@ -547,7 +575,9 @@ mod tests {
         let vb =
             unsafe { VarBuilder::from_mmaped_safetensors(&files, cfg.dtype, &device) }.unwrap();
         let mut model = LoraCausalLM::load(vb, &cfg).unwrap();
-        model.load_adapter(&result.adapter_path).unwrap();
+        model
+            .load_adapter(&result.adapter_path.join("adapter_model.safetensors"))
+            .unwrap();
 
         let prompt = tokenizer::ByteTokenizer::new(cfg.vocab_size)
             .encode("x")
@@ -600,7 +630,10 @@ mod tests {
         };
 
         let result = trainer.train(examples, config, &output).await.unwrap();
-        let adapter_bytes = std::fs::read(&result.adapter_path).unwrap();
+        assert!(result.adapter_path.is_dir());
+        assert!(result.adapter_path.join("adapter_config.json").exists());
+        let adapter_bytes =
+            std::fs::read(result.adapter_path.join("adapter_model.safetensors")).unwrap();
         let tensors = safetensors::SafeTensors::deserialize(&adapter_bytes).unwrap();
         let names = tensors.names();
 

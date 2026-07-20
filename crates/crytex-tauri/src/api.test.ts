@@ -92,6 +92,45 @@ describe("createCrytexApi", () => {
     }));
   });
 
+  it("should trigger lora adapter training through tauri ipc", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", {
+      configurable: true,
+      value: {},
+    });
+    vi.mocked(invoke).mockResolvedValue({
+      adapter: {
+        id: "codegen-v2",
+        file_path: "adapters/codegen/codegen-v2",
+        base_model: "mistral-7b",
+        task_kind: "codegen",
+        agent_role: null,
+        active: true,
+      },
+      promoted: true,
+      benchmark_gate: {
+        accepted: true,
+      },
+      metrics: {},
+    });
+
+    const sink = vi.fn();
+    const api = createCrytexApi(sink);
+    await api.trainLoraAdapter({
+      task_kind: "codegen",
+      agent_role: null,
+    });
+
+    expect(invoke).toHaveBeenCalledWith("train_lora_adapter", {
+      request: {
+        task_kind: "codegen",
+        agent_role: null,
+      },
+    });
+    expect(sink).toHaveBeenCalledWith(expect.objectContaining({
+      name: "train_lora_adapter",
+    }));
+  });
+
   it("should forward backend event payloads from tauri event stream", async () => {
     const unlisten = vi.fn();
     const backendEvent: BackendEvent = {

@@ -10,6 +10,7 @@ crytex-core = { path = "../crytex-core" }
 crytex-agents = { path = "../crytex-agents" }
 crytex-inference = { path = "../crytex-inference" }
 crytex-inference-mistral = { path = "../crytex-inference-mistral" }
+crytex-inference-candle = { path = "../crytex-inference-candle" }
 crytex-inference-ollama = { path = "../crytex-inference-ollama" }
 crytex-inference-onnx = { path = "../crytex-inference-onnx" }
 crytex-storage = { path = "../crytex-storage" }

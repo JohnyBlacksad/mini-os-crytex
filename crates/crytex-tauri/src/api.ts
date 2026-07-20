@@ -32,6 +32,8 @@ import type {
   Task,
   TaskReviewDecisionRequest,
   TaskReviewDecisionResponse,
+  TrainLoraAdapterRequest,
+  TrainLoraAdapterResponse,
 } from "./ui-types";
 
 type CommandSink = (record: CommandRecord) => void;
@@ -104,6 +106,8 @@ export function createCrytexApi(sink: CommandSink) {
       callCommand<RuntimeStatus>("set_active_managed_model", { request }, sink),
     proveManagedModelRuntime: (request: ProveManagedModelRuntimeRequest) =>
       callCommand<ManagedModelRuntimeProofReport>("prove_managed_model_runtime", { request }, sink),
+    trainLoraAdapter: (request: TrainLoraAdapterRequest) =>
+      callCommand<TrainLoraAdapterResponse>("train_lora_adapter", { request }, sink),
     listProjects: () => callCommand<Project[]>("list_projects", {}, sink),
     createProject: (request: CreateProjectRequest) =>
       callCommand<Project>("create_project", { request }, sink),

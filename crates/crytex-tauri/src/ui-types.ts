@@ -250,6 +250,31 @@ export type ManagedModelRuntimeProofReport = {
   runtime_probe: ModelRuntimeProbeReport;
 };
 
+export type LoraAdapterRecord = {
+  id: string;
+  project_id: string | null;
+  name: string;
+  file_path: string;
+  base_model: string;
+  task_kind: string | null;
+  agent_role: string | null;
+  metrics: unknown;
+  created_at: number;
+  active: boolean;
+};
+
+export type TrainLoraAdapterRequest = {
+  task_kind: string;
+  agent_role: string | null;
+};
+
+export type TrainLoraAdapterResponse = {
+  adapter: LoraAdapterRecord;
+  promoted: boolean;
+  benchmark_gate: unknown | null;
+  metrics: unknown;
+};
+
 export type CreateProjectRequest = {
   name: string;
   root_path: string;

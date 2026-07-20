@@ -10,6 +10,7 @@ use crate::commands::{
     SetActiveManagedModelCommand, SetActiveOllamaModelCommand, SetTaskStatusCommand,
     StartRunCommand, StartRunResponse, SubmitGoalCommand, SubmitTaskCommand,
     TaskReviewDecisionCommand, TaskReviewDecisionResponse, TauriCommandError,
+    TrainLoraAdapterCommand, TrainLoraAdapterResponse,
 };
 use crytex_core::bus::Event;
 use crytex_core::models::{KanbanState, Project, Task};
@@ -280,6 +281,14 @@ pub async fn prove_managed_model_runtime(
         .prove_managed_model_runtime(request)
         .await
         .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn train_lora_adapter(
+    state: State<'_, CrytexAppState>,
+    request: TrainLoraAdapterCommand,
+) -> Result<TrainLoraAdapterResponse, IpcError> {
+    state.train_lora_adapter(request).await.map_err(Into::into)
 }
 
 #[cfg(test)]

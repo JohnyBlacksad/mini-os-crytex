@@ -5,7 +5,9 @@ use crytex_core::bus::Event;
 use crytex_core::config::{BackendKind, SecurityConfig};
 use crytex_core::indexer::{IndexerError, search_chunks};
 use crytex_core::metrics::MetricsService;
-use crytex_core::models::{KanbanState, Project, Task, TaskDependency, TaskStatus};
+use crytex_core::models::{
+    KanbanState, LoraAdapter as StoredLoraAdapter, Project, Task, TaskDependency, TaskStatus,
+};
 use crytex_core::persistence::ProjectSnapshotRepository;
 use crytex_core::services::agent_service::capabilities_for_task;
 use crytex_core::services::{
@@ -249,6 +251,22 @@ pub struct RunDiagnosticsReport {
     pub lora_evolution: Vec<RunDiagnosticLoraEvolution>,
     pub rag_context_sent_to_model: bool,
     pub human_reward_recorded: bool,
+}
+
+/// Payload for manually triggering LoRA evolution from desktop/IPC.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrainLoraAdapterCommand {
+    pub task_kind: String,
+    pub agent_role: Option<String>,
+}
+
+/// Result of a LoRA evolution train/promote attempt.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrainLoraAdapterResponse {
+    pub adapter: StoredLoraAdapter,
+    pub promoted: bool,
+    pub benchmark_gate: Option<Value>,
+    pub metrics: Value,
 }
 
 /// Backend e2e scenario selected by the proof matrix runner.
