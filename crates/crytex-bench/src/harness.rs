@@ -119,7 +119,6 @@ impl BenchmarkHarness for DefaultBenchmarkHarness {
                 explanation: score.explanation,
                 metadata: score.metadata,
             };
-            self.repo.insert_result(&run_id, &result).await?;
             results.push(result);
         }
 
@@ -153,6 +152,9 @@ impl BenchmarkHarness for DefaultBenchmarkHarness {
         };
 
         self.repo.insert_run(&run).await?;
+        for result in &run.results {
+            self.repo.insert_result(&run.summary.id, result).await?;
+        }
 
         self.event_service.publish(Event::BenchmarkRunCompleted {
             run_id,
@@ -173,9 +175,89 @@ mod tests {
     use crate::scorer::ExactMatchScorer;
     use async_trait::async_trait;
     use crytex_core::bus::EventBus;
+    use crytex_core::models::{BenchmarkResult, BenchmarkRun, BenchmarkRunSummary};
+    use crytex_core::persistence::PersistenceError;
     use crytex_core::services::EventServiceImpl;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
 
     struct DummyRunner;
+
+    struct RunFirstRepository {
+        runs: Mutex<HashMap<String, BenchmarkRun>>,
+        results: Mutex<HashMap<String, Vec<BenchmarkResult>>>,
+    }
+
+    impl RunFirstRepository {
+        fn new() -> Self {
+            Self {
+                runs: Mutex::new(HashMap::new()),
+                results: Mutex::new(HashMap::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl BenchmarkResultRepository for RunFirstRepository {
+        async fn insert_run(&self, run: &BenchmarkRun) -> Result<(), PersistenceError> {
+            self.runs
+                .lock()
+                .map_err(|error| PersistenceError::Database(error.to_string()))?
+                .insert(run.summary.id.clone(), run.clone());
+            Ok(())
+        }
+
+        async fn get_run(&self, id: &str) -> Result<Option<BenchmarkRun>, PersistenceError> {
+            Ok(self
+                .runs
+                .lock()
+                .map_err(|error| PersistenceError::Database(error.to_string()))?
+                .get(id)
+                .cloned())
+        }
+
+        async fn list_runs(
+            &self,
+            _limit: usize,
+        ) -> Result<Vec<BenchmarkRunSummary>, PersistenceError> {
+            Ok(vec![])
+        }
+
+        async fn insert_result(
+            &self,
+            run_id: &str,
+            result: &BenchmarkResult,
+        ) -> Result<(), PersistenceError> {
+            let has_run = self
+                .runs
+                .lock()
+                .map_err(|error| PersistenceError::Database(error.to_string()))?
+                .contains_key(run_id);
+            if !has_run {
+                return Err(PersistenceError::Database(format!("missing run {run_id}")));
+            }
+            self.results
+                .lock()
+                .map_err(|error| PersistenceError::Database(error.to_string()))?
+                .entry(run_id.to_string())
+                .or_default()
+                .push(result.clone());
+            Ok(())
+        }
+
+        async fn list_results(
+            &self,
+            run_id: &str,
+        ) -> Result<Vec<BenchmarkResult>, PersistenceError> {
+            Ok(self
+                .results
+                .lock()
+                .map_err(|error| PersistenceError::Database(error.to_string()))?
+                .get(run_id)
+                .cloned()
+                .unwrap_or_default())
+        }
+    }
 
     #[async_trait]
     impl BenchmarkRunner for DummyRunner {
@@ -224,5 +306,35 @@ mod tests {
 
         let persisted = repo.get_run(&run.summary.id).await.unwrap().unwrap();
         assert_eq!(persisted.summary.pass_rate, 0.5);
+    }
+
+    #[tokio::test]
+    async fn harness_persists_run_before_results_for_fk_backends() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gs.jsonl");
+        tokio::fs::write(
+            &path,
+            r#"{"id":"a","input":{"answer":"compute validated parser behavior for foreign key benchmark ordering"},"expected":{"answer":"compute validated parser behavior for foreign key benchmark ordering"}}"#,
+        )
+        .await
+        .unwrap();
+
+        let repo: Arc<dyn BenchmarkResultRepository> = Arc::new(RunFirstRepository::new());
+        let bus = Arc::new(EventBus::new());
+        let event_service: Arc<dyn EventService> = Arc::new(EventServiceImpl::new(bus));
+        let harness = DefaultBenchmarkHarness::new(repo.clone(), event_service);
+
+        let request = BenchmarkRunRequest {
+            name: "fk-order".into(),
+            golden_set_path: path,
+            variant: BenchmarkVariant::default(),
+            scorer: Arc::new(ExactMatchScorer),
+            runner: Arc::new(DummyRunner),
+            max_concurrency: 1,
+            project_id: None,
+        };
+
+        let run = harness.run(request).await.unwrap();
+        assert_eq!(repo.list_results(&run.summary.id).await.unwrap().len(), 1);
     }
 }
