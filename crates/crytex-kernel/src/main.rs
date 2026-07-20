@@ -67,7 +67,7 @@ use crytex_inference::{
 use crytex_sandbox::SandboxOrchestrator;
 use crytex_storage::Storage;
 use crytex_tools::{Capability, ScanningToolService, ToolServiceImpl, TypedToolRegistry};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -722,10 +722,58 @@ struct LoraLiveE2eProofReport {
     baseline_pass_rate: f64,
     challenger_pass_rate: f64,
     delta_pass_rate: f64,
+    mc_nemar_p_value: Option<f64>,
+    significance_level: Option<f64>,
+    bootstrap_ci: Option<(f64, f64)>,
+    per_case_comparison: Vec<LoraAbCaseComparison>,
+    ab_test: LoraAbTestArtifact,
+    quality_verdict: String,
+    failure_reason: Option<String>,
     leakage_check_passed: bool,
     overfit_gap: f64,
     gates: Vec<KernelE2eProofGate>,
     passed: bool,
+}
+
+#[derive(Debug, Clone)]
+struct LoraLiveE2eProofReportInput {
+    trace_id: String,
+    gguf_path: String,
+    training_task_count: usize,
+    heldout_case_count: usize,
+    adapter_id: String,
+    adapter_path: String,
+    adapter_registered: bool,
+    baseline_output: String,
+    challenger_output: String,
+    benchmark_outputs: Vec<LoraProofOutput>,
+    decision_metadata: Option<serde_json::Value>,
+    train_loss: f64,
+    validation_loss: f64,
+    failure_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct LoraAbCaseComparison {
+    case_id: String,
+    baseline_passed: bool,
+    challenger_passed: bool,
+    baseline_score: f64,
+    challenger_score: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LoraAbTestArtifact {
+    baseline_run_id: Option<String>,
+    challenger_run_id: Option<String>,
+    winner: String,
+    baseline_pass_rate: f64,
+    challenger_pass_rate: f64,
+    delta_pass_rate: f64,
+    mc_nemar_p_value: Option<f64>,
+    significance_level: Option<f64>,
+    bootstrap_ci: Option<(f64, f64)>,
+    per_case_comparison: Vec<LoraAbCaseComparison>,
 }
 
 #[derive(Debug, Clone)]
@@ -795,14 +843,14 @@ impl BenchmarkRunner for LoraProofBenchmarkRunner {
             Duration::from_secs(self.generation_timeout_secs),
             self.inference.generate(request),
         )
-            .await
-            .map_err(|_| {
-                crytex_bench::BenchError::Runner(format!(
-                    "live LoRA generation timed out for case {} variant {}",
-                    case.id, variant.name
-                ))
-            })?
-            .map_err(|error| crytex_bench::BenchError::Runner(error.to_string()))?;
+        .await
+        .map_err(|_| {
+            crytex_bench::BenchError::Runner(format!(
+                "live LoRA generation timed out for case {} variant {}",
+                case.id, variant.name
+            ))
+        })?
+        .map_err(|error| crytex_bench::BenchError::Runner(error.to_string()))?;
         info!(
             case_id = %case.id,
             variant = %variant.name,
@@ -884,19 +932,22 @@ impl LoraBenchmarkGate for LiveLoraBenchmarkGate {
             challenger_adapter_path = %request.challenger_adapter_path.display(),
             "registering live LoRA challenger before benchmark"
         );
-        tokio::time::timeout(Duration::from_secs(60), self.inference.register_lora(InferenceLoRAAdapter {
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            self.inference.register_lora(InferenceLoRAAdapter {
                 id: request.challenger_adapter_id.clone(),
                 path: request.challenger_adapter_path.display().to_string(),
                 base_model: request.base_model.clone(),
-            }))
-            .await
-            .map_err(|_| {
-                LoraEvolutionError::Inference(format!(
-                    "live LoRA registration timed out for adapter {}",
-                    request.challenger_adapter_id
-                ))
-            })?
-            .map_err(|error| LoraEvolutionError::Inference(error.to_string()))?;
+            }),
+        )
+        .await
+        .map_err(|_| {
+            LoraEvolutionError::Inference(format!(
+                "live LoRA registration timed out for adapter {}",
+                request.challenger_adapter_id
+            ))
+        })?
+        .map_err(|error| LoraEvolutionError::Inference(error.to_string()))?;
         info!(
             challenger_adapter_id = %request.challenger_adapter_id,
             "registered live LoRA challenger before benchmark"
@@ -961,6 +1012,8 @@ impl LoraBenchmarkGate for LiveLoraBenchmarkGate {
         let accepted = matches!(report.winner, crytex_bench::ABWinner::Challenger)
             && report.delta_pass_rate > 0.0;
         let metadata = serde_json::json!({
+            "challenger_adapter_id": request.challenger_adapter_id,
+            "challenger_adapter_path": request.challenger_adapter_path,
             "baseline_run_id": baseline.summary.id,
             "challenger_run_id": challenger.summary.id,
             "winner": format!("{:?}", report.winner),
@@ -968,6 +1021,9 @@ impl LoraBenchmarkGate for LiveLoraBenchmarkGate {
             "challenger_pass_rate": report.challenger.pass_rate,
             "delta_pass_rate": report.delta_pass_rate,
             "mc_nemar_p_value": report.mc_nemar_p_value,
+            "significance_level": report.significance_level,
+            "bootstrap_ci": report.bootstrap_ci.map(|(low, high)| vec![low, high]),
+            "per_case_comparison": report.per_case_comparison.clone(),
             "leakage_check": {
                 "passed": true,
                 "training_fingerprint_count": request.training_fingerprints.len()
@@ -1185,6 +1241,215 @@ fn proof_gate(name: &str, passed: bool, evidence: &str) -> KernelE2eProofGate {
         passed,
         evidence: evidence.to_string(),
     }
+}
+
+fn build_lora_live_e2e_proof_report(input: LoraLiveE2eProofReportInput) -> LoraLiveE2eProofReport {
+    let metadata = input.decision_metadata.unwrap_or_default();
+    let ab_test = lora_ab_test_artifact_from_metadata(&metadata);
+    let leakage_check_passed = metadata
+        .get("leakage_check")
+        .and_then(|value| value.get("passed"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let overfit_gap = input.validation_loss - input.train_loss;
+    let (baseline_output, challenger_output) = select_lora_representative_answers(
+        &input.baseline_output,
+        &input.challenger_output,
+        &input.benchmark_outputs,
+    );
+    let output_changed_after_swap = baseline_output != challenger_output;
+    let adapter_applied = input.benchmark_outputs.iter().any(|output| {
+        output.variant == "challenger"
+            && output.lora_adapter_id.as_deref() == Some(input.adapter_id.as_str())
+    });
+    let gates = vec![
+        proof_gate(
+            "real_gguf_path",
+            Path::new(&input.gguf_path).is_file(),
+            &input.gguf_path,
+        ),
+        proof_gate(
+            "fifty_task_training_loop",
+            input.training_task_count >= 50,
+            &input.training_task_count.to_string(),
+        ),
+        proof_gate(
+            "adapter_registered",
+            input.adapter_registered,
+            &input.adapter_id,
+        ),
+        proof_gate("adapter_applied", adapter_applied, &input.adapter_id),
+        proof_gate(
+            "output_changed_after_swap",
+            output_changed_after_swap,
+            "baseline != challenger",
+        ),
+        proof_gate(
+            "heldout_challenger_won",
+            ab_test.winner == "Challenger" && ab_test.delta_pass_rate > 0.0,
+            &format!(
+                "winner={}, delta={:.4}, p_value={}",
+                ab_test.winner,
+                ab_test.delta_pass_rate,
+                ab_test
+                    .mc_nemar_p_value
+                    .map(|value| format!("{value:.6}"))
+                    .unwrap_or_else(|| "missing".into())
+            ),
+        ),
+        proof_gate(
+            "no_training_leakage",
+            leakage_check_passed,
+            "held-out leakage check",
+        ),
+        proof_gate(
+            "overfit_gap_checked",
+            overfit_gap.is_finite() && overfit_gap <= 1.0,
+            &format!("gap={overfit_gap:.4}"),
+        ),
+    ];
+    let passed = gates.iter().all(|gate| gate.passed) && input.failure_reason.is_none();
+    let quality_verdict = lora_quality_verdict(
+        &ab_test,
+        output_changed_after_swap,
+        input.failure_reason.as_deref(),
+    );
+
+    LoraLiveE2eProofReport {
+        proof_outcome: if passed {
+            "LORA_LIVE_E2E_PASSED".into()
+        } else {
+            "LORA_LIVE_E2E_FAILED".into()
+        },
+        trace_id: input.trace_id,
+        gguf_path: input.gguf_path,
+        training_task_count: input.training_task_count,
+        heldout_case_count: input.heldout_case_count,
+        adapter_id: input.adapter_id,
+        adapter_path: input.adapter_path,
+        adapter_registered: input.adapter_registered,
+        adapter_applied,
+        baseline_output,
+        challenger_output,
+        benchmark_outputs: input.benchmark_outputs,
+        output_changed_after_swap,
+        benchmark_winner: ab_test.winner.clone(),
+        baseline_pass_rate: ab_test.baseline_pass_rate,
+        challenger_pass_rate: ab_test.challenger_pass_rate,
+        delta_pass_rate: ab_test.delta_pass_rate,
+        mc_nemar_p_value: ab_test.mc_nemar_p_value,
+        significance_level: ab_test.significance_level,
+        bootstrap_ci: ab_test.bootstrap_ci,
+        per_case_comparison: ab_test.per_case_comparison.clone(),
+        ab_test,
+        quality_verdict,
+        failure_reason: input.failure_reason,
+        leakage_check_passed,
+        overfit_gap,
+        gates,
+        passed,
+    }
+}
+
+fn select_lora_representative_answers(
+    baseline_output: &str,
+    challenger_output: &str,
+    benchmark_outputs: &[LoraProofOutput],
+) -> (String, String) {
+    if !baseline_output.is_empty() || !challenger_output.is_empty() {
+        return (baseline_output.to_string(), challenger_output.to_string());
+    }
+
+    let baselines = benchmark_outputs
+        .iter()
+        .filter(|output| output.variant == "baseline");
+    let challengers = benchmark_outputs
+        .iter()
+        .filter(|output| output.variant == "challenger");
+    let pairs = baselines.zip(challengers).collect::<Vec<_>>();
+    pairs
+        .iter()
+        .find(|(baseline, challenger)| baseline.content != challenger.content)
+        .or_else(|| pairs.first())
+        .map(|(baseline, challenger)| (baseline.content.clone(), challenger.content.clone()))
+        .unwrap_or_default()
+}
+
+fn lora_ab_test_artifact_from_metadata(metadata: &serde_json::Value) -> LoraAbTestArtifact {
+    LoraAbTestArtifact {
+        baseline_run_id: metadata
+            .get("baseline_run_id")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned),
+        challenger_run_id: metadata
+            .get("challenger_run_id")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned),
+        winner: metadata
+            .get("winner")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("Unknown")
+            .to_string(),
+        baseline_pass_rate: metadata
+            .get("baseline_pass_rate")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0),
+        challenger_pass_rate: metadata
+            .get("challenger_pass_rate")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0),
+        delta_pass_rate: metadata
+            .get("delta_pass_rate")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0),
+        mc_nemar_p_value: metadata
+            .get("mc_nemar_p_value")
+            .and_then(serde_json::Value::as_f64),
+        significance_level: metadata
+            .get("significance_level")
+            .and_then(serde_json::Value::as_f64),
+        bootstrap_ci: lora_bootstrap_ci_from_metadata(metadata),
+        per_case_comparison: metadata
+            .get("per_case_comparison")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default(),
+    }
+}
+
+fn lora_bootstrap_ci_from_metadata(metadata: &serde_json::Value) -> Option<(f64, f64)> {
+    let values = metadata.get("bootstrap_ci")?.as_array()?;
+    let low = values.first()?.as_f64()?;
+    let high = values.get(1)?.as_f64()?;
+    Some((low, high))
+}
+
+fn lora_quality_verdict(
+    ab_test: &LoraAbTestArtifact,
+    output_changed: bool,
+    failure_reason: Option<&str>,
+) -> String {
+    let base = format!(
+        "baseline_pass_rate={:.4}, challenger_pass_rate={:.4}, delta={:.4}, winner={}",
+        ab_test.baseline_pass_rate,
+        ab_test.challenger_pass_rate,
+        ab_test.delta_pass_rate,
+        ab_test.winner
+    );
+    if let Some(reason) = failure_reason {
+        return format!(
+            "LoRA adapter was not promoted because benchmark gate rejected challenger: {reason}. {base}"
+        );
+    }
+    if ab_test.winner == "Challenger" && ab_test.delta_pass_rate > 0.0 {
+        return format!("LoRA adapter improved held-out benchmark and was promoted. {base}");
+    }
+    if output_changed {
+        return format!(
+            "LoRA changed generation, but quality improvement was not statistically accepted. {base}"
+        );
+    }
+    format!("LoRA did not change generation and was not accepted. {base}")
 }
 
 struct KernelProofBenchmarkRunner;
@@ -2136,148 +2401,143 @@ async fn run_lora_live_e2e_proof(
         rank = request.rank,
         "starting live LoRA train_and_register"
     );
-    let adapter = tokio::time::timeout(
+    let train_result = tokio::time::timeout(
         Duration::from_secs(request.train_timeout_secs),
         lora_evolution.train_and_register("codegen"),
     )
-    .await
-    .map_err(|_| "LoRA live evolution timed out during train_and_register".to_string())?
-        .map_err(|error| format!("LoRA live evolution failed: {error}"))?;
-    info!(
-        trace_id,
-        adapter_id = %adapter.id,
-        adapter_path = %adapter.file_path,
-        "finished live LoRA train_and_register"
-    );
-    inference
-        .swap_lora(&adapter.id)
-        .await
-        .map_err(|error| format!("failed to swap promoted LoRA: {error}"))?;
-
-    let baseline_output = generate_lora_probe(
-        inference.clone(),
-        &gguf_path,
-        None,
-        request.generation_timeout_secs,
-    )
-    .await?;
-    let challenger_output = generate_lora_probe(
-        inference.clone(),
-        &gguf_path,
-        Some(adapter.id.clone()),
-        request.generation_timeout_secs,
-    )
-    .await?;
-    let output_changed_after_swap = baseline_output != challenger_output;
+    .await;
     let metadata = decision_metadata
         .lock()
         .map_err(|error| format!("failed to lock LoRA proof decision metadata: {error}"))?
         .clone()
         .unwrap_or_default();
-    let benchmark_winner = metadata
-        .get("winner")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("Unknown")
-        .to_string();
-    let baseline_pass_rate = metadata
-        .get("baseline_pass_rate")
-        .and_then(serde_json::Value::as_f64)
-        .unwrap_or(0.0);
-    let challenger_pass_rate = metadata
-        .get("challenger_pass_rate")
-        .and_then(serde_json::Value::as_f64)
-        .unwrap_or(0.0);
-    let delta_pass_rate = metadata
-        .get("delta_pass_rate")
-        .and_then(serde_json::Value::as_f64)
-        .unwrap_or(0.0);
-    let leakage_check_passed = metadata
-        .get("leakage_check")
-        .and_then(|value| value.get("passed"))
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    let train_loss = adapter
-        .metrics
-        .get("train_loss")
-        .and_then(serde_json::Value::as_f64)
-        .unwrap_or(f64::NAN);
-    let validation_loss = adapter
-        .metrics
-        .get("validation_loss")
-        .and_then(serde_json::Value::as_f64)
-        .unwrap_or(f64::NAN);
-    let overfit_gap = validation_loss - train_loss;
-    let adapter_registered = true;
     let benchmark_outputs = outputs
         .lock()
         .map_err(|error| format!("failed to lock LoRA proof outputs: {error}"))?
         .clone();
-    let adapter_applied = benchmark_outputs.iter().any(|output| {
-        output.lora_adapter_id.as_deref() == Some(adapter.id.as_str())
-            && output.variant == "challenger"
-    });
-    let gates = vec![
-        proof_gate(
-            "real_gguf_path",
-            gguf_path.is_file(),
-            &gguf_path.display().to_string(),
-        ),
-        proof_gate(
-            "fifty_task_training_loop",
-            request.training_tasks >= 50,
-            &request.training_tasks.to_string(),
-        ),
-        proof_gate("adapter_registered", adapter_registered, &adapter.id),
-        proof_gate("adapter_applied", adapter_applied, &adapter.id),
-        proof_gate(
-            "output_changed_after_swap",
-            output_changed_after_swap,
-            "baseline != challenger",
-        ),
-        proof_gate(
-            "heldout_challenger_won",
-            benchmark_winner == "Challenger" && delta_pass_rate > 0.0,
-            &format!("winner={benchmark_winner}, delta={delta_pass_rate:.4}"),
-        ),
-        proof_gate(
-            "no_training_leakage",
-            leakage_check_passed,
-            "held-out leakage check",
-        ),
-        proof_gate(
-            "overfit_gap_checked",
-            overfit_gap.is_finite() && overfit_gap <= 1.0,
-            &format!("gap={overfit_gap:.4}"),
-        ),
-    ];
-    let passed = gates.iter().all(|gate| gate.passed);
-    Ok(LoraLiveE2eProofReport {
-        proof_outcome: if passed {
-            "LORA_LIVE_E2E_PASSED".into()
-        } else {
-            "LORA_LIVE_E2E_FAILED".into()
-        },
-        trace_id,
-        gguf_path: gguf_path.display().to_string(),
-        training_task_count: request.training_tasks,
-        heldout_case_count: request.heldout_cases,
-        adapter_id: adapter.id,
-        adapter_path: adapter.file_path,
-        adapter_registered,
-        adapter_applied,
-        baseline_output,
-        challenger_output,
-        benchmark_outputs,
-        output_changed_after_swap,
-        benchmark_winner,
-        baseline_pass_rate,
-        challenger_pass_rate,
-        delta_pass_rate,
-        leakage_check_passed,
-        overfit_gap,
-        gates,
-        passed,
-    })
+    match train_result {
+        Ok(Ok(adapter)) => {
+            info!(
+                trace_id,
+                adapter_id = %adapter.id,
+                adapter_path = %adapter.file_path,
+                "finished live LoRA train_and_register"
+            );
+            inference
+                .swap_lora(&adapter.id)
+                .await
+                .map_err(|error| format!("failed to swap promoted LoRA: {error}"))?;
+
+            let baseline_output = generate_lora_probe(
+                inference.clone(),
+                &gguf_path,
+                None,
+                request.generation_timeout_secs,
+            )
+            .await?;
+            let challenger_output = generate_lora_probe(
+                inference.clone(),
+                &gguf_path,
+                Some(adapter.id.clone()),
+                request.generation_timeout_secs,
+            )
+            .await?;
+            let train_loss = adapter
+                .metrics
+                .get("train_loss")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(f64::NAN);
+            let validation_loss = adapter
+                .metrics
+                .get("validation_loss")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(f64::NAN);
+            Ok(build_lora_live_e2e_proof_report(
+                LoraLiveE2eProofReportInput {
+                    trace_id,
+                    gguf_path: gguf_path.display().to_string(),
+                    training_task_count: request.training_tasks,
+                    heldout_case_count: request.heldout_cases,
+                    adapter_id: adapter.id,
+                    adapter_path: adapter.file_path,
+                    adapter_registered: true,
+                    baseline_output,
+                    challenger_output,
+                    benchmark_outputs,
+                    decision_metadata: Some(metadata),
+                    train_loss,
+                    validation_loss,
+                    failure_reason: None,
+                },
+            ))
+        }
+        Ok(Err(error)) => Ok(build_lora_live_e2e_proof_report(
+            LoraLiveE2eProofReportInput {
+                trace_id,
+                gguf_path: gguf_path.display().to_string(),
+                training_task_count: request.training_tasks,
+                heldout_case_count: request.heldout_cases,
+                adapter_id: metadata
+                    .get("challenger_adapter_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string(),
+                adapter_path: metadata
+                    .get("challenger_adapter_path")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                adapter_registered: benchmark_outputs.iter().any(|output| {
+                    output.variant == "challenger"
+                        && output.lora_adapter_id.as_deref()
+                            == metadata
+                                .get("challenger_adapter_id")
+                                .and_then(serde_json::Value::as_str)
+                }),
+                baseline_output: String::new(),
+                challenger_output: String::new(),
+                benchmark_outputs,
+                decision_metadata: Some(metadata),
+                train_loss: f64::NAN,
+                validation_loss: f64::NAN,
+                failure_reason: Some(format!("LoRA live evolution failed: {error}")),
+            },
+        )),
+        Err(_) => Ok(build_lora_live_e2e_proof_report(
+            LoraLiveE2eProofReportInput {
+                trace_id,
+                gguf_path: gguf_path.display().to_string(),
+                training_task_count: request.training_tasks,
+                heldout_case_count: request.heldout_cases,
+                adapter_id: metadata
+                    .get("challenger_adapter_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string(),
+                adapter_path: metadata
+                    .get("challenger_adapter_path")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                adapter_registered: benchmark_outputs.iter().any(|output| {
+                    output.variant == "challenger"
+                        && output.lora_adapter_id.as_deref()
+                            == metadata
+                                .get("challenger_adapter_id")
+                                .and_then(serde_json::Value::as_str)
+                }),
+                baseline_output: String::new(),
+                challenger_output: String::new(),
+                benchmark_outputs,
+                decision_metadata: Some(metadata),
+                train_loss: f64::NAN,
+                validation_loss: f64::NAN,
+                failure_reason: Some(
+                    "LoRA live evolution timed out during train_and_register".into(),
+                ),
+            },
+        )),
+    }
 }
 
 async fn seed_lora_proof_training_tasks(
@@ -2383,11 +2643,14 @@ async fn generate_lora_probe(
     request.temperature = Some(0.0);
     request.max_tokens = Some(32);
     request.lora_adapter_id = lora_adapter_id;
-    tokio::time::timeout(Duration::from_secs(generation_timeout_secs), inference.generate(request))
-        .await
-        .map_err(|_| "LoRA probe generation timed out".to_string())?
-        .map(|response| response.content)
-        .map_err(|error| format!("LoRA probe generation failed: {error}"))
+    tokio::time::timeout(
+        Duration::from_secs(generation_timeout_secs),
+        inference.generate(request),
+    )
+    .await
+    .map_err(|_| "LoRA probe generation timed out".to_string())?
+    .map(|response| response.content)
+    .map_err(|error| format!("LoRA probe generation failed: {error}"))
 }
 
 fn find_default_lora_proof_gguf() -> Option<PathBuf> {
@@ -5405,6 +5668,144 @@ mod tests {
                 .gates
                 .iter()
                 .any(|gate| gate.name == "prompt_evolution_proved" && !gate.passed)
+        );
+    }
+
+    #[test]
+    fn lora_live_e2e_report_exposes_ab_artifact_even_when_gate_rejects() {
+        let metadata = serde_json::json!({
+            "baseline_run_id": "baseline-run-1",
+            "challenger_run_id": "challenger-run-1",
+            "winner": "Inconclusive",
+            "baseline_pass_rate": 0.25,
+            "challenger_pass_rate": 0.50,
+            "delta_pass_rate": 0.25,
+            "mc_nemar_p_value": 0.125,
+            "significance_level": 0.05,
+            "bootstrap_ci": [-0.10, 0.60],
+            "per_case_comparison": [
+                {
+                    "case_id": "heldout-1",
+                    "baseline_passed": false,
+                    "challenger_passed": true,
+                    "baseline_score": 0.0,
+                    "challenger_score": 1.0
+                }
+            ],
+            "leakage_check": {
+                "passed": true,
+                "training_fingerprint_count": 50
+            }
+        });
+
+        let report = build_lora_live_e2e_proof_report(LoraLiveE2eProofReportInput {
+            trace_id: "trace-lora-ab".into(),
+            gguf_path: "A:/models/tiny.gguf".into(),
+            training_task_count: 50,
+            heldout_case_count: 4,
+            adapter_id: "codegen-v1".into(),
+            adapter_path: "A:/adapters/codegen-v1".into(),
+            adapter_registered: true,
+            baseline_output: "baseline answer without the learned distillation marker".into(),
+            challenger_output: "challenger answer includes CRYTEX_LORA_DISTILL_OK".into(),
+            benchmark_outputs: vec![
+                LoraProofOutput {
+                    variant: "baseline".into(),
+                    lora_adapter_id: None,
+                    content: "baseline held-out answer".into(),
+                },
+                LoraProofOutput {
+                    variant: "challenger".into(),
+                    lora_adapter_id: Some("codegen-v1".into()),
+                    content: "challenger held-out answer CRYTEX_LORA_DISTILL_OK".into(),
+                },
+            ],
+            decision_metadata: Some(metadata),
+            train_loss: 0.42,
+            validation_loss: 0.50,
+            failure_reason: Some(
+                "benchmark gate rejected challenger: winner=Inconclusive, delta_pass_rate=0.2500"
+                    .into(),
+            ),
+        });
+
+        assert!(!report.passed);
+        assert_eq!(report.proof_outcome, "LORA_LIVE_E2E_FAILED");
+        assert_eq!(report.benchmark_winner, "Inconclusive");
+        assert_eq!(report.baseline_pass_rate, 0.25);
+        assert_eq!(report.challenger_pass_rate, 0.50);
+        assert_eq!(report.delta_pass_rate, 0.25);
+        assert_eq!(report.mc_nemar_p_value, Some(0.125));
+        assert_eq!(report.bootstrap_ci, Some((-0.10, 0.60)));
+        assert_eq!(report.per_case_comparison.len(), 1);
+        assert!(
+            report
+                .quality_verdict
+                .contains("not promoted because benchmark gate rejected challenger")
+        );
+        assert!(
+            report
+                .gates
+                .iter()
+                .any(|gate| gate.name == "heldout_challenger_won" && !gate.passed)
+        );
+        let serialized = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            serialized["baseline_output"],
+            "baseline answer without the learned distillation marker"
+        );
+        assert_eq!(
+            serialized["challenger_output"],
+            "challenger answer includes CRYTEX_LORA_DISTILL_OK"
+        );
+        assert_eq!(serialized["ab_test"]["winner"], "Inconclusive");
+    }
+
+    #[test]
+    fn lora_live_e2e_report_uses_differing_benchmark_outputs_as_representative_answers() {
+        let report = build_lora_live_e2e_proof_report(LoraLiveE2eProofReportInput {
+            trace_id: "trace-lora-ab".into(),
+            gguf_path: "A:/models/tiny.gguf".into(),
+            training_task_count: 50,
+            heldout_case_count: 2,
+            adapter_id: "codegen-v1".into(),
+            adapter_path: "A:/adapters/codegen-v1".into(),
+            adapter_registered: true,
+            baseline_output: "".into(),
+            challenger_output: "".into(),
+            benchmark_outputs: vec![
+                LoraProofOutput {
+                    variant: "baseline".into(),
+                    lora_adapter_id: None,
+                    content: "same answer".into(),
+                },
+                LoraProofOutput {
+                    variant: "challenger".into(),
+                    lora_adapter_id: Some("codegen-v1".into()),
+                    content: "same answer".into(),
+                },
+                LoraProofOutput {
+                    variant: "baseline".into(),
+                    lora_adapter_id: None,
+                    content: "baseline misses marker".into(),
+                },
+                LoraProofOutput {
+                    variant: "challenger".into(),
+                    lora_adapter_id: Some("codegen-v1".into()),
+                    content: "challenger includes CRYTEX_LORA_DISTILL_OK".into(),
+                },
+            ],
+            decision_metadata: None,
+            train_loss: 0.1,
+            validation_loss: 0.2,
+            failure_reason: None,
+        });
+
+        assert!(report.output_changed_after_swap);
+        assert_eq!(report.baseline_output, "baseline misses marker");
+        assert_eq!(
+            report.challenger_output,
+            "challenger includes CRYTEX_LORA_DISTILL_OK"
         );
     }
 
