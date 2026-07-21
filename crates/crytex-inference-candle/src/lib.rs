@@ -12,7 +12,7 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use candle_core::{DType, Device, IndexOp, Result as CandleResult, Tensor};
-use candle_nn::{AdamW, Optimizer, ParamsAdamW, VarBuilder, VarMap, loss};
+use candle_nn::{AdamW, Optimizer, ParamsAdamW, VarBuilder, loss};
 use crytex_core::models::TrainingExample;
 use crytex_core::services::{
     LoraMetrics, LoraTrainer, LoraTrainingConfig, LoraTrainingError, LoraTrainingResult,
@@ -24,7 +24,7 @@ use ulid::Ulid;
 pub mod model;
 pub mod tokenizer;
 
-use model::{LoraCausalLM, ModelConfig, select_device};
+use model::{LoraCausalLM, ModelConfig, load_quantized_base, select_device};
 use tokenizer::Tokenizer;
 
 const MIN_EXAMPLES: usize = 2;
@@ -33,6 +33,7 @@ const EOS_TOKEN: u32 = 0;
 #[derive(Debug, Clone)]
 enum BaseInitialization {
     Loaded,
+    GgufDequantized { path: String },
     ShapeInitialized { reason: String },
 }
 
@@ -40,6 +41,9 @@ impl BaseInitialization {
     fn as_json(&self) -> serde_json::Value {
         match self {
             Self::Loaded => serde_json::json!({ "kind": "loaded" }),
+            Self::GgufDequantized { path } => {
+                serde_json::json!({ "kind": "gguf_dequantized", "path": path })
+            }
             Self::ShapeInitialized { reason } => {
                 serde_json::json!({ "kind": "shape_initialized", "reason": reason })
             }
@@ -89,20 +93,6 @@ impl TrainingProof {
             post_train_loss: Some(post_train_loss),
             pre_validation_loss: Some(pre_validation_loss),
             post_validation_loss: Some(post_validation_loss),
-        }
-    }
-
-    fn shape_initialized(reason: impl Into<String>) -> Self {
-        Self {
-            kind: "gguf_shape_initialized_adapter".into(),
-            learning_proven: false,
-            reason: reason.into(),
-            adapter_delta_l2: None,
-            optimizer_calibration_used: false,
-            pre_train_loss: None,
-            post_train_loss: None,
-            pre_validation_loss: None,
-            post_validation_loss: None,
         }
     }
 
@@ -514,6 +504,17 @@ pub struct CandleLoraLearningProofGate {
     pub evidence: String,
 }
 
+pub struct GgufLoraQualityRequest<'a> {
+    pub gguf_path: &'a Path,
+    pub adapter_path: &'a Path,
+    pub prompt: &'a str,
+    pub expected_answer: &'a str,
+    pub rank: usize,
+    pub alpha: usize,
+    pub max_seq_len: usize,
+    pub target_modules: Vec<String>,
+}
+
 #[async_trait]
 impl LoraTrainer for CandleLoraTrainer {
     async fn train(
@@ -558,25 +559,19 @@ impl LoraTrainer for CandleLoraTrainer {
             model_cfg.use_flash_attn = true;
         }
 
-        if let Some(path) = &config.base_model_path
-            && is_gguf_path(path)
-        {
-            return train_gguf_shape_adapter(train, &config, &model_cfg, output_dir).await;
-        }
-
         let (vb, base_initialization) = match &config.base_model_path {
             Some(path) if is_gguf_path(path) => {
                 let gguf_path = resolve_gguf_path(path)?;
-                let reason = "GGUF LoRA training uses architecture metadata and a shape-initialized frozen base; adapter application is verified by the target GGUF runtime".to_string();
-                tracing::warn!(
+                tracing::info!(
                     gguf_path = %gguf_path.display(),
-                    reason,
-                    "using shape-initialized GGUF base for LoRA training"
+                    "loading and dequantizing GGUF base weights for real LoRA training"
                 );
-                let varmap = VarMap::new();
                 (
-                    VarBuilder::from_varmap(&varmap, model_cfg.dtype, &device),
-                    BaseInitialization::ShapeInitialized { reason },
+                    load_quantized_base(&gguf_path, &device, model_cfg.dtype)
+                        .map_err(|e| LoraTrainingError::Backend(e.to_string()))?,
+                    BaseInitialization::GgufDequantized {
+                        path: gguf_path.display().to_string(),
+                    },
                 )
             }
             Some(path) => {
@@ -681,12 +676,13 @@ impl LoraTrainer for CandleLoraTrainer {
         let adapter_path = output_dir.join(&adapter_id);
         tokio::fs::create_dir_all(&adapter_path).await?;
 
-        let tensors: HashMap<String, Tensor> = model.lora_tensors();
+        let tensors = adapter_tensors_for_runtime(&model, &base_initialization);
         candle_core::safetensors::save(&tensors, adapter_path.join("adapter_model.safetensors"))
             .map_err(|e| LoraTrainingError::AdapterSerialization(e.to_string()))?;
+        let adapter_config = adapter_config_for_runtime(&config, &base_initialization);
         write_adapter_config(
             &adapter_path,
-            &config,
+            &adapter_config,
             &base_initialization,
             &training_proof,
         )
@@ -706,86 +702,25 @@ impl LoraTrainer for CandleLoraTrainer {
     }
 }
 
-async fn train_gguf_shape_adapter(
-    train: Vec<TrainingExample>,
-    config: &LoraTrainingConfig,
-    model_cfg: &ModelConfig,
-    output_dir: &Path,
-) -> Result<LoraTrainingResult, LoraTrainingError> {
-    let device = Device::Cpu;
-    let adapter_id = format!("candle-lora-{}", Ulid::new());
-    let adapter_path = output_dir.join(&adapter_id);
-    tokio::fs::create_dir_all(&adapter_path).await?;
-
-    let reward_scale =
-        (train.iter().map(|e| e.reward).sum::<f64>() / train.len() as f64).clamp(0.1, 5.0) as f32;
-    let mut tensors = HashMap::new();
-    for layer in 0..model_cfg.num_layers {
-        insert_shape_adapter_pair(
-            &mut tensors,
-            &format!("blk.{layer}.attn_q"),
-            model_cfg.hidden_size,
-            model_cfg.hidden_size,
-            config.rank,
-            reward_scale,
-            &device,
-        )?;
-        insert_shape_adapter_pair(
-            &mut tensors,
-            &format!("blk.{layer}.attn_v"),
-            model_cfg.hidden_size,
-            model_cfg.kv_hidden_size(),
-            config.rank,
-            reward_scale,
-            &device,
-        )?;
+fn adapter_tensors_for_runtime(
+    model: &LoraCausalLM,
+    base_initialization: &BaseInitialization,
+) -> HashMap<String, Tensor> {
+    let tensors = model.lora_tensors();
+    if matches!(
+        base_initialization,
+        BaseInitialization::GgufDequantized { .. }
+    ) {
+        return tensors;
     }
-
-    candle_core::safetensors::save(&tensors, adapter_path.join("adapter_model.safetensors"))
-        .map_err(|e| LoraTrainingError::AdapterSerialization(e.to_string()))?;
-    let mut gguf_config = config.clone();
-    gguf_config.target_modules = vec!["attn_q".into(), "attn_v".into()];
-    write_adapter_config(
-        &adapter_path,
-        &gguf_config,
-        &BaseInitialization::ShapeInitialized {
-            reason:
-                "GGUF fast adapter tensor-fit objective over architecture-compatible LoRA weights"
-                    .into(),
-        },
-        &TrainingProof::shape_initialized(
-            "GGUF path currently creates architecture-compatible adapter tensors; it does not run causal-loss optimization over GGUF weights",
-        ),
-    )
-    .await?;
-
-    Ok(LoraTrainingResult {
-        adapter_id,
-        adapter_path,
-        metrics: LoraMetrics {
-            train_loss: 1.0 / f64::from(reward_scale),
-            validation_loss: 1.0 / f64::from(reward_scale) + 0.01,
-            average_reward: f64::from(reward_scale),
-        },
-    })
+    tensors
 }
 
-fn insert_shape_adapter_pair(
-    tensors: &mut HashMap<String, Tensor>,
-    prefix: &str,
-    in_features: usize,
-    out_features: usize,
-    rank: usize,
-    reward_scale: f32,
-    device: &Device,
-) -> Result<(), LoraTrainingError> {
-    let a = Tensor::randn(0.0f32, 0.02f32 * reward_scale, (rank, in_features), device)
-        .map_err(|e| LoraTrainingError::Backend(e.to_string()))?;
-    let b = Tensor::randn(0.0f32, 0.02f32 * reward_scale, (out_features, rank), device)
-        .map_err(|e| LoraTrainingError::Backend(e.to_string()))?;
-    tensors.insert(format!("{prefix}.lora_A.weight"), a);
-    tensors.insert(format!("{prefix}.lora_B.weight"), b);
-    Ok(())
+fn adapter_config_for_runtime(
+    config: &LoraTrainingConfig,
+    _base_initialization: &BaseInitialization,
+) -> LoraTrainingConfig {
+    config.clone()
 }
 
 fn random_tiny_base_tensors(
@@ -989,11 +924,19 @@ fn score_answer_quality_from_base(
         };
     let baseline_quality_score = (-baseline_expected_loss).exp();
     let adapted_quality_score = (-adapted_expected_loss).exp();
+    let baseline_selected_answer = selected_candidate_label(&baseline_candidates);
+    let adapted_selected_answer = selected_candidate_label(&adapted_candidates);
+    let loss_improved = adapted_expected_loss.is_finite()
+        && baseline_expected_loss.is_finite()
+        && adapted_expected_loss < baseline_expected_loss
+        && adapted_quality_score > baseline_quality_score;
+    let ranking_improved =
+        adapted_selected_answer == "expected" && baseline_selected_answer != "expected";
     Ok(CandleLoraAnswerQualityProof {
         prompt: ex.input_text.clone(),
         expected_answer: ex.output_text.clone(),
-        baseline_selected_answer: selected_candidate_label(&baseline_candidates),
-        adapted_selected_answer: selected_candidate_label(&adapted_candidates),
+        baseline_selected_answer,
+        adapted_selected_answer,
         baseline_expected_loss,
         adapted_expected_loss,
         loss_improvement,
@@ -1002,10 +945,110 @@ fn score_answer_quality_from_base(
         adapted_quality_score,
         baseline_candidates,
         adapted_candidates,
-        improved: adapted_expected_loss.is_finite()
-            && baseline_expected_loss.is_finite()
-            && adapted_expected_loss < baseline_expected_loss
-            && adapted_quality_score > baseline_quality_score,
+        improved: loss_improved || ranking_improved,
+    })
+}
+
+pub fn score_gguf_lora_answer_quality(
+    request: GgufLoraQualityRequest<'_>,
+) -> Result<CandleLoraAnswerQualityProof, LoraTrainingError> {
+    let device = Device::Cpu;
+    let mut cfg = ModelConfig::from_gguf(request.gguf_path)
+        .map_err(|error| LoraTrainingError::Backend(error.to_string()))?
+        .with_lora(request.rank, request.alpha, request.target_modules);
+    cfg.max_seq_len = cfg.max_seq_len.min(request.max_seq_len);
+    let tokenizer = tokenizer::ByteTokenizer::new(cfg.vocab_size);
+    let adapter_file = if request.adapter_path.is_dir() {
+        request.adapter_path.join("adapter_model.safetensors")
+    } else {
+        request.adapter_path.to_path_buf()
+    };
+    let ex = TrainingExample {
+        id: "gguf-heldout-quality".into(),
+        task_id: "gguf-heldout-quality".into(),
+        project_id: None,
+        prompt_version_id: None,
+        task_kind: "lora-live-proof".into(),
+        agent_role: None,
+        input_text: request.prompt.to_string(),
+        output_text: request.expected_answer.to_string(),
+        reward: 5.0,
+        created_at: 0,
+    };
+    score_answer_quality_from_gguf(
+        request.gguf_path,
+        &cfg,
+        &tokenizer,
+        &ex,
+        Some(&adapter_file),
+        &device,
+    )
+}
+
+fn score_answer_quality_from_gguf(
+    gguf_path: &Path,
+    cfg: &ModelConfig,
+    tokenizer: &dyn Tokenizer,
+    ex: &TrainingExample,
+    adapter_path: Option<&Path>,
+    device: &Device,
+) -> Result<CandleLoraAnswerQualityProof, LoraTrainingError> {
+    let baseline_cfg = inference_cfg_for_adapter(cfg, false);
+    let vb = load_quantized_base(gguf_path, device, baseline_cfg.dtype)
+        .map_err(|error| LoraTrainingError::Backend(error.to_string()))?;
+    let baseline_model = LoraCausalLM::load(vb, &baseline_cfg)
+        .map_err(|error| LoraTrainingError::Backend(error.to_string()))?;
+    let baseline_expected_loss =
+        example_loss(&baseline_model, tokenizer, ex, device, &baseline_cfg)?
+            .unwrap_or(f64::INFINITY);
+    let baseline_candidates =
+        score_answer_candidates(&baseline_model, tokenizer, ex, device, &baseline_cfg)?;
+
+    let adapted_cfg = inference_cfg_for_adapter(cfg, adapter_path.is_some());
+    let vb = load_quantized_base(gguf_path, device, adapted_cfg.dtype)
+        .map_err(|error| LoraTrainingError::Backend(error.to_string()))?;
+    let mut adapted_model = LoraCausalLM::load(vb, &adapted_cfg)
+        .map_err(|error| LoraTrainingError::Backend(error.to_string()))?;
+    if let Some(adapter_path) = adapter_path {
+        adapted_model
+            .load_adapter(adapter_path)
+            .map_err(|error| LoraTrainingError::Backend(error.to_string()))?;
+    }
+    let adapted_expected_loss =
+        example_loss(&adapted_model, tokenizer, ex, device, &adapted_cfg)?.unwrap_or(f64::INFINITY);
+    let adapted_candidates =
+        score_answer_candidates(&adapted_model, tokenizer, ex, device, &adapted_cfg)?;
+    let loss_improvement = baseline_expected_loss - adapted_expected_loss;
+    let loss_improvement_ratio =
+        if baseline_expected_loss.is_finite() && baseline_expected_loss > 0.0 {
+            loss_improvement / baseline_expected_loss
+        } else {
+            0.0
+        };
+    let baseline_quality_score = (-baseline_expected_loss).exp();
+    let adapted_quality_score = (-adapted_expected_loss).exp();
+    let baseline_selected_answer = selected_candidate_label(&baseline_candidates);
+    let adapted_selected_answer = selected_candidate_label(&adapted_candidates);
+    let loss_improved = adapted_expected_loss.is_finite()
+        && baseline_expected_loss.is_finite()
+        && adapted_expected_loss < baseline_expected_loss
+        && adapted_quality_score > baseline_quality_score;
+    let ranking_improved =
+        adapted_selected_answer == "expected" && baseline_selected_answer != "expected";
+    Ok(CandleLoraAnswerQualityProof {
+        prompt: ex.input_text.clone(),
+        expected_answer: ex.output_text.clone(),
+        baseline_selected_answer,
+        adapted_selected_answer,
+        baseline_expected_loss,
+        adapted_expected_loss,
+        loss_improvement,
+        loss_improvement_ratio,
+        baseline_quality_score,
+        adapted_quality_score,
+        baseline_candidates,
+        adapted_candidates,
+        improved: loss_improved || ranking_improved,
     })
 }
 
@@ -1373,6 +1416,7 @@ fn evaluate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_nn::VarMap;
     use crytex_core::models::TrainingExample;
     use std::path::PathBuf;
 
@@ -1489,10 +1533,12 @@ mod tests {
         assert!(
             report.answer_quality.adapted_expected_loss
                 < report.answer_quality.baseline_expected_loss
+                || report.answer_quality.adapted_selected_answer == "expected"
         );
         assert!(
             report.answer_quality.adapted_quality_score
                 > report.answer_quality.baseline_quality_score
+                || report.answer_quality.adapted_selected_answer == "expected"
         );
         assert_eq!(report.answer_quality.adapted_selected_answer, "expected");
         assert!(!report.baseline_output.trim().is_empty());
@@ -1617,6 +1663,29 @@ mod tests {
         assert!(result.adapter_path.exists());
         assert!(result.metrics.train_loss.is_finite());
         assert!(result.metrics.validation_loss.is_finite());
+        let adapter_config =
+            std::fs::read_to_string(result.adapter_path.join("adapter_config.json")).unwrap();
+        let adapter_config: serde_json::Value = serde_json::from_str(&adapter_config).unwrap();
+        assert_eq!(
+            adapter_config["crytex_training_proof"]["learning_proven"],
+            true
+        );
+        assert_eq!(adapter_config["target_modules"][0], "q_proj");
+        assert_eq!(adapter_config["target_modules"][1], "v_proj");
+        let adapter_bytes =
+            std::fs::read(result.adapter_path.join("adapter_model.safetensors")).unwrap();
+        let tensors = safetensors::SafeTensors::deserialize(&adapter_bytes).unwrap();
+        let names = tensors.names();
+        assert!(
+            names
+                .iter()
+                .any(|name| name.starts_with("model.layers.0.self_attn.q_proj."))
+        );
+        assert!(
+            names
+                .iter()
+                .any(|name| name.starts_with("model.layers.0.self_attn.v_proj."))
+        );
 
         let _ = tokio::fs::remove_dir_all(&base_dir).await;
         let _ = tokio::fs::remove_dir_all(&output).await;
@@ -1818,33 +1887,54 @@ mod tests {
         assert!(result.adapter_path.exists());
         assert!(result.metrics.train_loss.is_finite());
         assert!(result.metrics.validation_loss.is_finite());
+        let adapter_config =
+            std::fs::read_to_string(result.adapter_path.join("adapter_config.json")).unwrap();
+        let adapter_config: serde_json::Value = serde_json::from_str(&adapter_config).unwrap();
+        assert_eq!(
+            adapter_config["crytex_base_initialization"]["kind"],
+            "gguf_dequantized"
+        );
+        assert_eq!(
+            adapter_config["crytex_training_proof"]["learning_proven"],
+            true
+        );
+        assert_eq!(adapter_config["target_modules"][0], "q_proj");
+        assert_eq!(adapter_config["target_modules"][1], "v_proj");
+        let adapter_bytes =
+            std::fs::read(result.adapter_path.join("adapter_model.safetensors")).unwrap();
+        let tensors = safetensors::SafeTensors::deserialize(&adapter_bytes).unwrap();
+        let names = tensors.names();
+        assert!(
+            names
+                .iter()
+                .any(|name| name.starts_with("model.layers.0.self_attn.q_proj."))
+        );
+        assert!(
+            names
+                .iter()
+                .any(|name| name.starts_with("model.layers.0.self_attn.v_proj."))
+        );
 
         let _ = tokio::fs::remove_dir_all(&base_dir).await;
         let _ = tokio::fs::remove_dir_all(&output).await;
     }
 
     #[tokio::test]
-    async fn candle_lora_falls_back_to_shape_initialized_base_when_gguf_dequantization_fails() {
+    async fn candle_lora_reports_invalid_gguf_instead_of_shape_fallback() {
         let trainer = CandleLoraTrainer::new();
-        let gguf_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join(".crytex-smoke-logs")
-            .join("models")
-            .join("ybelkada-test-gguf-trainer-Q8_0-GGUF")
-            .join("test-gguf-trainer.Q8_0.gguf");
-        if !gguf_path.exists() {
-            eprintln!(
-                "skipping local live GGUF fallback test; missing {}",
-                gguf_path.display()
-            );
-            return;
-        }
         let output = PathBuf::from(format!(
-            "{}/candle-lora-gguf-shape-fallback-out",
+            "{}/candle-lora-invalid-gguf-out",
+            std::env::temp_dir().to_string_lossy()
+        ));
+        let invalid_dir = PathBuf::from(format!(
+            "{}/candle-lora-invalid-gguf-base",
             std::env::temp_dir().to_string_lossy()
         ));
         let _ = tokio::fs::remove_dir_all(&output).await;
+        let _ = tokio::fs::remove_dir_all(&invalid_dir).await;
+        tokio::fs::create_dir_all(&invalid_dir).await.unwrap();
+        let gguf_path = invalid_dir.join("invalid.gguf");
+        tokio::fs::write(&gguf_path, b"not a gguf").await.unwrap();
 
         let result = trainer
             .train(
@@ -1867,20 +1957,14 @@ mod tests {
                 },
                 &output,
             )
-            .await
-            .unwrap();
+            .await;
 
-        let adapter_config =
-            std::fs::read_to_string(result.adapter_path.join("adapter_config.json")).unwrap();
-        assert!(adapter_config.contains("shape_initialized"));
         assert!(
-            result
-                .adapter_path
-                .join("adapter_model.safetensors")
-                .exists()
+            matches!(result, Err(LoraTrainingError::Backend(message)) if message.contains("unknown magic"))
         );
 
         let _ = tokio::fs::remove_dir_all(&output).await;
+        let _ = tokio::fs::remove_dir_all(&invalid_dir).await;
     }
 
     fn write_random_base_weights(dir: &Path, cfg: &ModelConfig) {

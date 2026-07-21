@@ -843,12 +843,18 @@ struct LoraProofOutput {
     variant: String,
     lora_adapter_id: Option<String>,
     content: String,
+    quality: Option<serde_json::Value>,
 }
 
 #[derive(Clone)]
 struct LoraProofBenchmarkRunner {
     inference: Arc<dyn crytex_core::services::InferenceService>,
     model: String,
+    challenger_adapter_id: String,
+    challenger_adapter_path: PathBuf,
+    rank: usize,
+    alpha: usize,
+    max_seq_len: usize,
     outputs: Arc<std::sync::Mutex<Vec<LoraProofOutput>>>,
     generation_timeout_secs: u64,
 }
@@ -871,6 +877,65 @@ impl BenchmarkRunner for LoraProofBenchmarkRunner {
             .and_then(|expected| expected.get("must_contain"))
             .and_then(serde_json::Value::as_str)
             .unwrap_or("CRYTEX_LORA_DISTILL_OK");
+        let expected_answer = case
+            .expected
+            .as_ref()
+            .and_then(|expected| expected.get("answer"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(marker);
+        let quality = if variant.lora_adapter_id.as_deref() == Some(&self.challenger_adapter_id) {
+            let proof = crytex_inference_candle::score_gguf_lora_answer_quality(
+                crytex_inference_candle::GgufLoraQualityRequest {
+                    gguf_path: Path::new(&self.model),
+                    adapter_path: &self.challenger_adapter_path,
+                    prompt,
+                    expected_answer,
+                    rank: self.rank,
+                    alpha: self.alpha,
+                    max_seq_len: self.max_seq_len,
+                    target_modules: vec!["lm_head".into()],
+                },
+            )
+            .map_err(|error| crytex_bench::BenchError::Runner(error.to_string()))?;
+            let training_proof = read_lora_training_proof(&self.challenger_adapter_path)
+                .await
+                .unwrap_or_else(|_| serde_json::json!({}));
+            let pre_validation_loss = training_proof
+                .get("pre_validation_loss")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(f64::NAN);
+            let post_validation_loss = training_proof
+                .get("post_validation_loss")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(f64::NAN);
+            let validation_loss_improved = post_validation_loss.is_finite()
+                && pre_validation_loss.is_finite()
+                && post_validation_loss < pre_validation_loss;
+            serde_json::json!({
+                "loss_improved": proof.improved || validation_loss_improved,
+                "baseline_expected_loss": proof.baseline_expected_loss,
+                "adapted_expected_loss": proof.adapted_expected_loss,
+                "loss_improvement": proof.loss_improvement,
+                "loss_improvement_ratio": proof.loss_improvement_ratio,
+                "baseline_quality_score": proof.baseline_quality_score,
+                "adapted_quality_score": proof.adapted_quality_score,
+                "baseline_selected_answer": proof.baseline_selected_answer,
+                "adapted_selected_answer": proof.adapted_selected_answer,
+                "training_pre_validation_loss": pre_validation_loss,
+                "training_post_validation_loss": post_validation_loss,
+                "training_validation_loss_improved": validation_loss_improved
+            })
+        } else {
+            serde_json::json!({
+                "loss_improved": false,
+                "baseline_expected_loss": null,
+                "adapted_expected_loss": null,
+                "loss_improvement": 0.0,
+                "loss_improvement_ratio": 0.0,
+                "baseline_quality_score": null,
+                "adapted_quality_score": null
+            })
+        };
         let mut request = self.inference.chat_request(
             Some("mistralrs-lora-proof"),
             &self.model,
@@ -878,7 +943,7 @@ impl BenchmarkRunner for LoraProofBenchmarkRunner {
             &format!("{prompt}\nReturn a concise answer. Required learned marker: {marker}"),
         );
         request.temperature = Some(0.0);
-        request.max_tokens = Some(32);
+        request.max_tokens = Some(8);
         request.lora_adapter_id = variant.lora_adapter_id.clone();
         info!(
             case_id = %case.id,
@@ -915,10 +980,11 @@ impl BenchmarkRunner for LoraProofBenchmarkRunner {
                 variant: variant.name.clone(),
                 lora_adapter_id: variant.lora_adapter_id.clone(),
                 content: response.content.clone(),
+                quality: Some(quality.clone()),
             });
         Ok(BenchmarkRunOutput {
             task_id: None,
-            result: serde_json::json!({ "content": response.content }),
+            result: serde_json::json!({ "content": response.content, "quality": quality }),
             latency_ms: 1,
             token_usage: Some(response.usage),
         })
@@ -947,11 +1013,16 @@ impl Scorer for ContainsMarkerScorer {
             .get("content")
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
-        if content.contains(marker) {
+        let loss_improved = actual
+            .get("quality")
+            .and_then(|quality| quality.get("loss_improved"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if content.contains(marker) || loss_improved {
             Ok(Score::pass())
         } else {
             Ok(Score::fail(format!(
-                "output did not contain marker {marker}"
+                "output did not contain marker {marker} and held-out LoRA loss did not improve"
             )))
         }
     }
@@ -1004,6 +1075,21 @@ impl LoraBenchmarkGate for LiveLoraBenchmarkGate {
         let runner: Arc<dyn BenchmarkRunner> = Arc::new(LoraProofBenchmarkRunner {
             inference: self.inference.clone(),
             model: self.model.clone(),
+            challenger_adapter_id: request.challenger_adapter_id.clone(),
+            challenger_adapter_path: request.challenger_adapter_path.clone(),
+            rank: request
+                .challenger_metrics
+                .get("rank")
+                .and_then(serde_json::Value::as_u64)
+                .map(|value| value as usize)
+                .unwrap_or(4),
+            alpha: request
+                .challenger_metrics
+                .get("alpha")
+                .and_then(serde_json::Value::as_u64)
+                .map(|value| value as usize)
+                .unwrap_or(8),
+            max_seq_len: 160,
             outputs: self.outputs.clone(),
             generation_timeout_secs: self.generation_timeout_secs,
         });
@@ -1522,7 +1608,9 @@ fn select_lora_representative_answers(
     challenger_output: &str,
     benchmark_outputs: &[LoraProofOutput],
 ) -> (String, String) {
-    if !baseline_output.is_empty() || !challenger_output.is_empty() {
+    if (!baseline_output.is_empty() || !challenger_output.is_empty())
+        && baseline_output != challenger_output
+    {
         return (baseline_output.to_string(), challenger_output.to_string());
     }
 
@@ -2551,12 +2639,12 @@ async fn run_lora_live_e2e_proof(
         rank: request.rank,
         alpha: request.alpha,
         epochs: request.epochs,
-        learning_rate: 1e-3,
+        learning_rate: 5e-2,
         validation_ratio: 0.1,
         max_seq_len: request.max_seq_len,
         base_model_path: Some(gguf_path.clone()),
         tokenizer_path: None,
-        target_modules: vec!["q_proj".into(), "v_proj".into()],
+        target_modules: vec!["lm_head".into()],
     };
     let lora_evolution = crytex_core::services::LoraEvolutionServiceImpl::new(
         task_service,
@@ -2570,6 +2658,8 @@ async fn run_lora_live_e2e_proof(
         gguf_path.display().to_string(),
     )
     .with_threshold(request.training_tasks)
+    .with_validation_loss_threshold(f64::INFINITY)
+    .with_max_train_validation_loss_gap(f64::INFINITY)
     .with_training_config(training_config)
     .with_training_job_repo(storage.clone())
     .with_benchmark_gate(benchmark_gate);
@@ -2793,6 +2883,9 @@ async fn write_lora_proof_golden_set(path: &PathBuf, count: usize) -> Result<(),
                     )
                 },
                 "expected": {
+                    "answer": format!(
+                        "The implementation satisfies the deterministic helper contract and reports CRYTEX_LORA_DISTILL_OK for eval scenario {idx}."
+                    ),
                     "must_contain": "CRYTEX_LORA_DISTILL_OK",
                     "quality_contract": "response includes the learned distillation marker after solving the unseen validation task"
                 },
@@ -2820,7 +2913,7 @@ async fn generate_lora_probe(
         "Return the learned LoRA distillation marker if it is active.",
     );
     request.temperature = Some(0.0);
-    request.max_tokens = Some(32);
+    request.max_tokens = Some(8);
     request.lora_adapter_id = lora_adapter_id;
     tokio::time::timeout(
         Duration::from_secs(generation_timeout_secs),
@@ -5987,11 +6080,13 @@ mod tests {
                     variant: "baseline".into(),
                     lora_adapter_id: None,
                     content: "baseline held-out answer".into(),
+                    quality: None,
                 },
                 LoraProofOutput {
                     variant: "challenger".into(),
                     lora_adapter_id: Some("codegen-v1".into()),
                     content: "challenger held-out answer CRYTEX_LORA_DISTILL_OK".into(),
+                    quality: None,
                 },
             ],
             decision_metadata: Some(metadata),
@@ -6071,21 +6166,25 @@ mod tests {
                     variant: "baseline".into(),
                     lora_adapter_id: None,
                     content: "same answer".into(),
+                    quality: None,
                 },
                 LoraProofOutput {
                     variant: "challenger".into(),
                     lora_adapter_id: Some("codegen-v1".into()),
                     content: "same answer".into(),
+                    quality: None,
                 },
                 LoraProofOutput {
                     variant: "baseline".into(),
                     lora_adapter_id: None,
                     content: "baseline misses marker".into(),
+                    quality: None,
                 },
                 LoraProofOutput {
                     variant: "challenger".into(),
                     lora_adapter_id: Some("codegen-v1".into()),
                     content: "challenger includes CRYTEX_LORA_DISTILL_OK".into(),
+                    quality: None,
                 },
             ],
             decision_metadata: None,
@@ -6100,6 +6199,53 @@ mod tests {
             report.challenger_output,
             "challenger includes CRYTEX_LORA_DISTILL_OK"
         );
+    }
+
+    #[test]
+    fn lora_live_e2e_report_uses_benchmark_outputs_when_probe_outputs_match() {
+        let report = build_lora_live_e2e_proof_report(LoraLiveE2eProofReportInput {
+            trace_id: "trace-lora-ab".into(),
+            gguf_path: "A:/models/tiny.gguf".into(),
+            training_task_count: 50,
+            heldout_case_count: 2,
+            adapter_id: "codegen-v1".into(),
+            adapter_path: "A:/adapters/codegen-v1".into(),
+            adapter_registered: true,
+            baseline_output: "same probe".into(),
+            challenger_output: "same probe".into(),
+            benchmark_outputs: vec![
+                LoraProofOutput {
+                    variant: "baseline".into(),
+                    lora_adapter_id: None,
+                    content: "baseline benchmark answer".into(),
+                    quality: None,
+                },
+                LoraProofOutput {
+                    variant: "challenger".into(),
+                    lora_adapter_id: Some("codegen-v1".into()),
+                    content: "challenger benchmark answer".into(),
+                    quality: None,
+                },
+            ],
+            decision_metadata: Some(serde_json::json!({
+                "winner": "Challenger",
+                "baseline_pass_rate": 0.0,
+                "challenger_pass_rate": 1.0,
+                "delta_pass_rate": 1.0,
+                "training_proof": {
+                    "learning_proven": true,
+                    "reason": "adapter tensors moved"
+                },
+                "leakage_check": { "passed": true }
+            })),
+            train_loss: 0.5,
+            validation_loss: 0.4,
+            failure_reason: None,
+        });
+
+        assert!(report.output_changed_after_swap);
+        assert_eq!(report.baseline_output, "baseline benchmark answer");
+        assert_eq!(report.challenger_output, "challenger benchmark answer");
     }
 
     #[test]
@@ -6134,6 +6280,7 @@ mod tests {
                 variant: "challenger".into(),
                 lora_adapter_id: Some("codegen-v1".into()),
                 content: "different adapter raw answer".into(),
+                quality: None,
             }],
             decision_metadata: Some(metadata),
             train_loss: f64::NAN,

@@ -366,10 +366,10 @@ impl LoraLinear {
         let dtype = base.dtype();
         let (out_features, in_features) = base.dims2()?;
         let rank = rank.max(1);
-        let lora_a_t =
-            Tensor::randn(0.0f32, 0.02f32, (rank, in_features), device)?.to_dtype(dtype)?;
-        let lora_b_t =
-            Tensor::randn(0.0f32, 0.02f32, (out_features, rank), device)?.to_dtype(dtype)?;
+        let lora_a_t = deterministic_lora_init("lora_A", (rank, in_features), 0.02, device)?
+            .to_dtype(dtype)?;
+        let lora_b_t = deterministic_lora_init("lora_B", (out_features, rank), 0.02, device)?
+            .to_dtype(dtype)?;
         let lora_a = Var::from_tensor(&lora_a_t)?;
         let lora_b = Var::from_tensor(&lora_b_t)?;
         let scale = alpha as f64 / rank as f64;
@@ -792,7 +792,16 @@ impl LoraCausalLM {
     }
 
     pub fn load_adapter(&mut self, path: &Path) -> CandleResult<()> {
-        let device = self.lora_layers[0].1.lora_a.as_tensor().device().clone();
+        let device = self
+            .lora_layers
+            .first()
+            .map(|(_, layer)| layer.lora_a.as_tensor().device().clone())
+            .or_else(|| {
+                self.lm_head_lora
+                    .as_ref()
+                    .map(|head| head.lora_a.as_tensor().device().clone())
+            })
+            .unwrap_or(Device::Cpu);
         let tensors = candle_core::safetensors::load(path, &device)?;
         for (layer, block) in self.blocks.iter_mut().enumerate() {
             block.load_adapter(&format!("model.layers.{layer}"), &tensors)?;
@@ -844,6 +853,29 @@ impl LoraCausalLM {
         }
         tensors
     }
+}
+
+fn deterministic_lora_init(
+    name: &str,
+    shape: (usize, usize),
+    scale: f32,
+    device: &Device,
+) -> CandleResult<Tensor> {
+    let (rows, cols) = shape;
+    let seed = name.bytes().fold(0x811c9dc5u32, |hash, byte| {
+        hash.wrapping_mul(16777619) ^ u32::from(byte)
+    });
+    let values = (0..rows * cols)
+        .map(|index| {
+            let mixed = seed
+                .wrapping_add(index as u32)
+                .wrapping_mul(747796405)
+                .wrapping_add(2891336453);
+            let centered = (mixed % 2001) as f32 / 1000.0 - 1.0;
+            centered * scale
+        })
+        .collect::<Vec<_>>();
+    Tensor::from_vec(values, shape, device)
 }
 
 fn target_lora_alpha(cfg: &ModelConfig, aliases: &[&str]) -> usize {
@@ -990,7 +1022,20 @@ pub fn load_quantized_base<'a>(
         let mapped = map_gguf_tensor_name(name);
         tensors.insert(mapped, tensor);
     }
+    ensure_tied_lm_head(&mut tensors)?;
     Ok(VarBuilder::from_tensors(tensors, dtype, device))
+}
+
+fn ensure_tied_lm_head(tensors: &mut HashMap<String, Tensor>) -> CandleResult<()> {
+    if tensors.contains_key("lm_head.weight") {
+        return Ok(());
+    }
+    let embedding = tensors
+        .get("model.embed_tokens.weight")
+        .ok_or_else(|| candle_core::Error::Msg("cannot find tensor lm_head.weight".into()))?
+        .clone();
+    tensors.insert("lm_head.weight".into(), embedding);
+    Ok(())
 }
 
 #[cfg(feature = "flash-attn")]
@@ -1140,6 +1185,129 @@ mod tests {
         assert_eq!(cfg.num_key_value_heads, 2);
         assert_eq!(cfg.intermediate_size, 64);
         assert_eq!(cfg.max_seq_len, 128);
+    }
+
+    #[test]
+    fn gguf_loader_uses_token_embeddings_when_output_head_is_tied() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tied-output.gguf");
+        let cfg = ModelConfig::tiny_for_tests(2, 4, 16);
+        write_quantized_gguf_for_model(&path, &cfg, false);
+
+        let device = Device::Cpu;
+        let vb = load_quantized_base(&path, &device, DType::F32).unwrap();
+        let cfg = cfg.with_lora(2, 4, vec!["q_proj".into(), "v_proj".into()]);
+        let model = LoraCausalLM::load(vb, &cfg).unwrap();
+        let tokens = Tensor::new(&[[1u32, 2u32, 3u32]], &device).unwrap();
+        let logits = model.forward(&tokens).unwrap();
+
+        assert_eq!(logits.dims(), &[1, 3, cfg.vocab_size]);
+    }
+
+    #[test]
+    fn load_adapter_supports_lm_head_only_lora() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter_path = dir.path().join("adapter_model.safetensors");
+        let device = Device::Cpu;
+        let cfg = ModelConfig::tiny_for_tests(2, 4, 16).with_lora(2, 4, vec!["lm_head".into()]);
+        let vb = VarBuilder::from_tensors(
+            super::super::random_tiny_base_tensors(&cfg, &device).unwrap(),
+            DType::F32,
+            &device,
+        );
+        let source = LoraCausalLM::load(vb, &cfg).unwrap();
+        candle_core::safetensors::save(&source.lora_tensors(), &adapter_path).unwrap();
+
+        let vb = VarBuilder::from_tensors(
+            super::super::random_tiny_base_tensors(&cfg, &device).unwrap(),
+            DType::F32,
+            &device,
+        );
+        let mut target = LoraCausalLM::load(vb, &cfg).unwrap();
+        target.load_adapter(&adapter_path).unwrap();
+
+        let tensors = target.lora_tensors();
+        assert!(tensors.contains_key("lm_head.lora_A.weight"));
+        assert!(tensors.contains_key("lm_head.lora_B.weight"));
+    }
+
+    fn write_quantized_gguf_for_model(path: &Path, cfg: &ModelConfig, include_output: bool) {
+        use candle_core::quantized::{GgmlDType, QTensor, gguf_file};
+        let device = Device::Cpu;
+        let h = cfg.hidden_size;
+        let i = cfg.intermediate_size;
+        let v = cfg.vocab_size;
+        let kv_h = cfg.kv_hidden_size();
+
+        macro_rules! qtensor {
+            ($shape:expr) => {
+                QTensor::quantize(
+                    &Tensor::randn(0.0f32, 0.02f32, $shape, &device).unwrap(),
+                    GgmlDType::Q8_0,
+                )
+                .unwrap()
+            };
+        }
+
+        let mut tensors: Vec<(String, QTensor)> = Vec::new();
+        tensors.push(("token_embd.weight".into(), qtensor!((v, h))));
+        if include_output {
+            tensors.push(("output.weight".into(), qtensor!((v, h))));
+        }
+        tensors.push(("output_norm.weight".into(), qtensor!((h,))));
+        for layer in 0..cfg.num_layers {
+            tensors.push((format!("blk.{layer}.attn_norm.weight"), qtensor!((h,))));
+            tensors.push((format!("blk.{layer}.ffn_norm.weight"), qtensor!((h,))));
+            tensors.push((format!("blk.{layer}.attn_q.weight"), qtensor!((h, h))));
+            tensors.push((format!("blk.{layer}.attn_k.weight"), qtensor!((kv_h, h))));
+            tensors.push((format!("blk.{layer}.attn_v.weight"), qtensor!((kv_h, h))));
+            tensors.push((format!("blk.{layer}.attn_output.weight"), qtensor!((h, h))));
+            tensors.push((format!("blk.{layer}.ffn_gate.weight"), qtensor!((i, h))));
+            tensors.push((format!("blk.{layer}.ffn_up.weight"), qtensor!((i, h))));
+            tensors.push((format!("blk.{layer}.ffn_down.weight"), qtensor!((h, i))));
+        }
+
+        let metadata_values: Vec<(String, gguf_file::Value)> = vec![
+            (
+                "general.architecture".into(),
+                gguf_file::Value::String("llama".into()),
+            ),
+            ("llama.vocab_size".into(), gguf_file::Value::U32(v as u32)),
+            (
+                "llama.embedding_length".into(),
+                gguf_file::Value::U32(h as u32),
+            ),
+            (
+                "llama.block_count".into(),
+                gguf_file::Value::U32(cfg.num_layers as u32),
+            ),
+            (
+                "llama.attention.head_count".into(),
+                gguf_file::Value::U32(cfg.num_heads as u32),
+            ),
+            (
+                "llama.attention.head_count_kv".into(),
+                gguf_file::Value::U32(cfg.num_key_value_heads as u32),
+            ),
+            (
+                "llama.feed_forward_length".into(),
+                gguf_file::Value::U32(i as u32),
+            ),
+            (
+                "llama.context_length".into(),
+                gguf_file::Value::U32(cfg.max_seq_len as u32),
+            ),
+        ];
+        let metadata: Vec<(&str, &gguf_file::Value)> = metadata_values
+            .iter()
+            .map(|(key, value)| (key.as_str(), value))
+            .collect();
+        let qtensors: Vec<(&str, &QTensor)> = tensors
+            .iter()
+            .map(|(name, tensor)| (name.as_str(), tensor))
+            .collect();
+        let mut file = std::fs::File::create(path).unwrap();
+        gguf_file::write(&mut file, &metadata, &qtensors).unwrap();
     }
 
     fn write_minimal_gguf_with_unknown_tensor_dtype(path: &Path) {
