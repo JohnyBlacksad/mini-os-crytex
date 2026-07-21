@@ -201,7 +201,12 @@ enum Commands {
         report_path: Option<PathBuf>,
     },
     /// Prove the kernel happy path as one JSON artifact without requiring a desktop UI
-    #[command(alias = "prove-business-e2e", alias = "business-test")]
+    #[command(
+        alias = "prove-business-e2e",
+        alias = "business-test",
+        alias = "canonical-backend-acceptance",
+        alias = "backend-acceptance"
+    )]
     ProveKernelE2e {
         #[arg(short, long)]
         path: PathBuf,
@@ -761,6 +766,7 @@ struct KernelBusinessProofStep {
 
 #[derive(Debug, Clone, Serialize)]
 struct KernelE2eProofReport {
+    acceptance_scope: String,
     business_outcome: String,
     business_steps: Vec<KernelBusinessProofStep>,
     trace_id: String,
@@ -772,15 +778,20 @@ struct KernelE2eProofReport {
     live_generation_count: usize,
     live_generation_evidence: Vec<KernelLiveGenerationEvidence>,
     goal_task_id: String,
+    orchestrated_task_ids: Vec<String>,
     task_ids: Vec<String>,
     critic_rejection_task_id: String,
+    human_rejected_task_id: String,
     remediation_task_id: String,
     human_approved_task_id: String,
     indexed_files: usize,
     indexed_chunks: usize,
     diagnostics_event_count: usize,
+    diagnostics_artifact_path: String,
+    diagnostics_task_count: usize,
     benchmark_baseline_run_id: String,
     benchmark_challenger_run_id: String,
+    benchmark_winner: String,
     prompt_baseline_version_id: String,
     prompt_challenger_version_id: String,
     prompt_promoted: bool,
@@ -1625,6 +1636,7 @@ struct KernelLiveGenerationEvidence {
 }
 
 struct KernelE2eProofInput {
+    acceptance_scope: String,
     trace_id: String,
     project_id: String,
     project_root: String,
@@ -1633,15 +1645,20 @@ struct KernelE2eProofInput {
     live_model: Option<String>,
     live_generation_evidence: Vec<KernelLiveGenerationEvidence>,
     goal_task_id: String,
+    orchestrated_task_ids: Vec<String>,
     task_ids: Vec<String>,
     critic_rejection_task_id: String,
+    human_rejected_task_id: String,
     remediation_task_id: String,
     human_approved_task_id: String,
     indexed_files: usize,
     indexed_chunks: usize,
     diagnostics_event_count: usize,
+    diagnostics_artifact_path: String,
+    diagnostics_task_count: usize,
     benchmark_baseline_run_id: String,
     benchmark_challenger_run_id: String,
+    benchmark_winner: String,
     prompt_baseline_version_id: String,
     prompt_challenger_version_id: String,
     prompt_promoted: bool,
@@ -1684,9 +1701,23 @@ impl KernelE2eProofReport {
                 ),
             ),
             proof_gate(
+                "orchestrator_decomposed_goal",
+                input.orchestrated_task_ids.len() >= 5,
+                &format!(
+                    "orchestrated_tasks={}",
+                    input.orchestrated_task_ids.join(",")
+                ),
+            ),
+            proof_gate(
                 "agent_chain_executed",
                 input.task_ids.len() >= 5,
                 &input.task_ids.join(","),
+            ),
+            proof_gate(
+                "human_rejection_recorded",
+                !input.human_rejected_task_id.is_empty()
+                    && input.human_rejected_task_id == input.critic_rejection_task_id,
+                &input.human_rejected_task_id,
             ),
             proof_gate(
                 "critic_rejection_remediated",
@@ -1707,6 +1738,14 @@ impl KernelE2eProofReport {
                 &format!("events={}", input.diagnostics_event_count),
             ),
             proof_gate(
+                "diagnostics_artifact_written",
+                !input.diagnostics_artifact_path.is_empty() && input.diagnostics_task_count > 0,
+                &format!(
+                    "path={}, tasks={}",
+                    input.diagnostics_artifact_path, input.diagnostics_task_count
+                ),
+            ),
+            proof_gate(
                 "benchmark_executed",
                 !input.benchmark_baseline_run_id.is_empty()
                     && !input.benchmark_challenger_run_id.is_empty(),
@@ -1714,6 +1753,11 @@ impl KernelE2eProofReport {
                     "baseline={}, challenger={}",
                     input.benchmark_baseline_run_id, input.benchmark_challenger_run_id
                 ),
+            ),
+            proof_gate(
+                "benchmark_challenger_won",
+                input.benchmark_winner == "Challenger",
+                &input.benchmark_winner,
             ),
             proof_gate(
                 "prompt_evolution_proved",
@@ -1743,6 +1787,7 @@ impl KernelE2eProofReport {
             format!("BUSINESS_E2E_FAILED: failed gates={failed}")
         };
         Self {
+            acceptance_scope: input.acceptance_scope,
             business_outcome,
             business_steps,
             trace_id: input.trace_id,
@@ -1754,15 +1799,20 @@ impl KernelE2eProofReport {
             live_generation_count: input.live_generation_evidence.len(),
             live_generation_evidence: input.live_generation_evidence,
             goal_task_id: input.goal_task_id,
+            orchestrated_task_ids: input.orchestrated_task_ids,
             task_ids: input.task_ids,
             critic_rejection_task_id: input.critic_rejection_task_id,
+            human_rejected_task_id: input.human_rejected_task_id,
             remediation_task_id: input.remediation_task_id,
             human_approved_task_id: input.human_approved_task_id,
             indexed_files: input.indexed_files,
             indexed_chunks: input.indexed_chunks,
             diagnostics_event_count: input.diagnostics_event_count,
+            diagnostics_artifact_path: input.diagnostics_artifact_path,
+            diagnostics_task_count: input.diagnostics_task_count,
             benchmark_baseline_run_id: input.benchmark_baseline_run_id,
             benchmark_challenger_run_id: input.benchmark_challenger_run_id,
+            benchmark_winner: input.benchmark_winner,
             prompt_baseline_version_id: input.prompt_baseline_version_id,
             prompt_challenger_version_id: input.prompt_challenger_version_id,
             prompt_promoted: input.prompt_promoted,
@@ -1791,11 +1841,15 @@ fn business_step_name(gate_name: &str) -> &str {
         "project_created" => "Project was created",
         "project_indexed" => "Project was indexed for RAG/code context",
         "goal_plan_approved" => "Goal was decomposed into an approved task plan",
+        "orchestrator_decomposed_goal" => "Orchestrator created the agent task graph",
         "agent_chain_executed" => "Agent chain executed with artifacts",
+        "human_rejection_recorded" => "Human rejection was simulated and recorded",
         "critic_rejection_remediated" => "Critic rejected work and remediation was created",
         "human_approval_recorded" => "Human approval/reward was recorded",
         "diagnostics_exported" => "Diagnostics/trace evidence was exported",
+        "diagnostics_artifact_written" => "Diagnostics artifact was written to disk",
         "benchmark_executed" => "Baseline/challenger benchmark was executed",
+        "benchmark_challenger_won" => "Benchmark challenger beat baseline",
         "prompt_evolution_proved" => "Prompt evolution promoted the winning challenger",
         "lora_evolution_proved" => "LoRA evolution trained and promoted an adapter",
         _ => gate_name,
@@ -2499,18 +2553,40 @@ async fn run_kernel_e2e_proof(
             parent_id: None,
             title: goal.clone(),
             description: Some(goal.clone()),
-            kind: "goal".into(),
+            kind: "codegen".into(),
             assigned_agent: Some("architect".into()),
             priority: 10,
-            payload: serde_json::json!({ "goal": goal.clone() }),
+            payload: serde_json::json!({
+                "goal": goal.clone(),
+                "prompt": goal.clone(),
+                "acceptance_scope": "canonical_backend_acceptance_runner"
+            }),
             trace_id: Some(trace_id.clone()),
         })
         .await
         .map_err(|error| format!("failed to submit goal: {error}"))?;
+
+    let orchestrator = OrchestratorImpl::new(task_service.clone());
+    let orchestrated_tasks = orchestrator
+        .orchestrate(&goal_task)
+        .await
+        .map_err(|error| format!("failed to orchestrate goal: {error}"))?;
+    let orchestrated_task_ids = orchestrated_tasks
+        .iter()
+        .map(|task| task.id.clone())
+        .collect::<Vec<_>>();
+
     let mut goal_result = serde_json::json!({
         "source": "kernel_e2e_proof",
         "plan_approved": true,
-        "tasks": ["architect", "coder", "qa", "security", "critic"]
+        "tasks": orchestrated_tasks.iter().map(|task| {
+            serde_json::json!({
+                "id": task.id,
+                "kind": task.kind,
+                "agent": task.assigned_agent,
+                "title": task.title
+            })
+        }).collect::<Vec<_>>()
     });
     if let Some(inference) = live_inference.as_ref() {
         let evidence = run_live_agent_generation(
@@ -2535,21 +2611,18 @@ async fn run_kernel_e2e_proof(
         "source_task_id": goal_task.id,
         "content": "approved plan"
     });
-    for (agent, title) in [
-        ("architect", "Decompose approved goal"),
-        ("coder", "Implement artifact"),
-        ("qa", "Validate artifact"),
-        ("security", "Review security posture"),
-    ] {
-        let task = submit_agent_chain_task(
-            task_service.as_ref(),
-            &project.id,
-            &trace_id,
-            agent,
-            title,
-            &previous_artifact,
-        )
-        .await?;
+    let review_task_id = orchestrated_tasks
+        .iter()
+        .find(|task| task.kind == "review" || task.assigned_agent.as_deref() == Some("critic"))
+        .map(|task| task.id.clone())
+        .ok_or_else(|| "orchestrator did not create a critic/review task".to_string())?;
+
+    for task in orchestrated_tasks
+        .iter()
+        .filter(|task| task.id != review_task_id)
+    {
+        let agent = task.assigned_agent.as_deref().unwrap_or("agent");
+        let title = task.title.as_str();
         let result = serde_json::json!({
             "source": "kernel_e2e_proof",
             "agent": agent,
@@ -2587,15 +2660,11 @@ async fn run_kernel_e2e_proof(
         chain_task_ids.push(completed.id);
     }
 
-    let critic = submit_agent_chain_task(
-        task_service.as_ref(),
-        &project.id,
-        &trace_id,
-        "critic",
-        "Reject first pass with actionable feedback",
-        &previous_artifact,
-    )
-    .await?;
+    let critic = task_service
+        .get(&review_task_id)
+        .await
+        .map_err(|error| format!("failed to load orchestrated critic task: {error}"))?
+        .ok_or_else(|| format!("orchestrated critic task {review_task_id} not found"))?;
     let mut critic_result = serde_json::json!({
         "source": "kernel_e2e_proof",
         "agent": "critic",
@@ -2623,6 +2692,10 @@ async fn run_kernel_e2e_proof(
         .set_critic_score(&critic.id, 2.0)
         .await
         .map_err(|error| format!("failed to set critic score: {error}"))?;
+    task_service
+        .set_human_score(&critic.id, 1.0)
+        .await
+        .map_err(|error| format!("failed to record human rejection score: {error}"))?;
     let rejected = task_service
         .retry(
             &critic.id,
@@ -2706,6 +2779,12 @@ async fn run_kernel_e2e_proof(
     )
     .await
     .map_err(|error| format!("failed to export diagnostics: {error}"))?;
+    let diagnostics_artifact_path = project_path.join("project_state_diagnostics.json");
+    let diagnostics_payload = serde_json::to_string_pretty(&diagnostics)
+        .map_err(|error| format!("failed to serialize diagnostics artifact: {error}"))?;
+    tokio::fs::write(&diagnostics_artifact_path, diagnostics_payload)
+        .await
+        .map_err(|error| format!("failed to write diagnostics artifact: {error}"))?;
 
     let golden_set_path = project_path.join("kernel_e2e_golden.jsonl");
     write_kernel_proof_golden_set(&golden_set_path).await?;
@@ -2735,7 +2814,7 @@ async fn run_kernel_e2e_proof(
         },
     )
     .await?;
-    let _benchmark_report = ABTest::new(baseline_run.clone(), challenger_run.clone())
+    let benchmark_report = ABTest::new(baseline_run.clone(), challenger_run.clone())
         .compare(benchmark_repo.as_ref())
         .await
         .map_err(|error| format!("failed to compare proof benchmark: {error}"))?;
@@ -2774,6 +2853,7 @@ async fn run_kernel_e2e_proof(
         .map_err(|error| format!("failed to train/register lora adapter: {error}"))?;
 
     Ok(KernelE2eProofReport::from_input(KernelE2eProofInput {
+        acceptance_scope: "canonical_backend_acceptance_runner".into(),
         trace_id,
         project_id: project.id,
         project_root: project_path.display().to_string(),
@@ -2782,15 +2862,20 @@ async fn run_kernel_e2e_proof(
         live_model,
         live_generation_evidence,
         goal_task_id: goal_task.id,
+        orchestrated_task_ids,
         task_ids: chain_task_ids,
         critic_rejection_task_id: rejected.id,
+        human_rejected_task_id: critic.id,
         remediation_task_id: remediation.id.clone(),
         human_approved_task_id: remediation.id,
         indexed_files: index_stats.files_indexed,
         indexed_chunks: index_stats.chunks_indexed,
         diagnostics_event_count: diagnostics.recent_logs.len(),
+        diagnostics_artifact_path: diagnostics_artifact_path.display().to_string(),
+        diagnostics_task_count: diagnostics.tasks.len(),
         benchmark_baseline_run_id: baseline_run,
         benchmark_challenger_run_id: challenger_run,
+        benchmark_winner: format!("{:?}", benchmark_report.winner),
         prompt_baseline_version_id: prompt_baseline.id,
         prompt_challenger_version_id: prompt_challenger.id,
         prompt_promoted: prompt_decision.accepted,
@@ -2872,17 +2957,24 @@ async fn run_kernel_e2e_proof_command(
             &live_url,
         )?)
     };
-    let lora_evolution = create_lora_evolution_service(
-        persistence.clone(),
-        task_service.clone(),
-        storage.clone(),
-        lora_inference,
-        event_service,
-        Some(embedder.clone()),
-        Some(vector_store.clone()),
-        config.paths.data_dir.join("adapters").join("kernel-e2e"),
-        "kernel-proof-base".into(),
-        None,
+    let lora_evolution = Arc::new(
+        crytex_core::services::LoraEvolutionServiceImpl::new(
+            task_service.clone(),
+            storage.clone(),
+            persistence.clone(),
+            storage.clone(),
+            lora_inference,
+            event_service,
+            Arc::new(crytex_inference_candle::CandleLoraTrainer::new()),
+            config.paths.data_dir.join("adapters").join("kernel-e2e"),
+            "kernel-proof-base".into(),
+        )
+        .with_threshold(50)
+        .with_validation_loss_threshold(f64::INFINITY)
+        .with_max_train_validation_loss_gap(f64::INFINITY)
+        .with_experience_repo(persistence.clone())
+        .with_training_job_repo(storage.clone())
+        .with_vector_index(embedder.clone(), vector_store.clone()),
     );
 
     run_kernel_e2e_proof(
@@ -7645,6 +7737,7 @@ mod tests {
     #[test]
     fn kernel_e2e_proof_report_requires_every_critical_gate() {
         let report = KernelE2eProofReport::from_input(KernelE2eProofInput {
+            acceptance_scope: "canonical_backend_acceptance_runner".into(),
             trace_id: "trace-kernel-e2e".into(),
             project_id: "project-1".into(),
             project_root: "A:/tmp/project".into(),
@@ -7662,6 +7755,13 @@ mod tests {
                 excerpt: "live model produced an artifact".into(),
             }],
             goal_task_id: "goal-1".into(),
+            orchestrated_task_ids: vec![
+                "architect-1".into(),
+                "coder-1".into(),
+                "qa-1".into(),
+                "security-1".into(),
+                "critic-1".into(),
+            ],
             task_ids: vec![
                 "goal-1".into(),
                 "architect-1".into(),
@@ -7672,13 +7772,17 @@ mod tests {
                 "remediation-1".into(),
             ],
             critic_rejection_task_id: "critic-1".into(),
+            human_rejected_task_id: "critic-1".into(),
             remediation_task_id: "remediation-1".into(),
             human_approved_task_id: "remediation-1".into(),
             indexed_files: 2,
             indexed_chunks: 4,
             diagnostics_event_count: 12,
+            diagnostics_artifact_path: "A:/tmp/project/project_state_diagnostics.json".into(),
+            diagnostics_task_count: 7,
             benchmark_baseline_run_id: "bench-baseline".into(),
             benchmark_challenger_run_id: "bench-challenger".into(),
+            benchmark_winner: "Challenger".into(),
             prompt_baseline_version_id: "prompt-v1".into(),
             prompt_challenger_version_id: "prompt-v2".into(),
             prompt_promoted: true,
@@ -7687,14 +7791,30 @@ mod tests {
         });
 
         assert!(report.passed);
+        assert_eq!(
+            report.acceptance_scope,
+            "canonical_backend_acceptance_runner"
+        );
         assert!(report.business_outcome.starts_with("BUSINESS_E2E_PASSED"));
         assert!(report.business_steps.iter().any(|step| step.name
             == "Goal was decomposed into an approved task plan"
             && step.status == "passed"));
         assert!(report.business_steps.iter().any(|step| step.name
+            == "Orchestrator created the agent task graph"
+            && step.status == "passed"));
+        assert!(report.business_steps.iter().any(|step| step.name
+            == "Human rejection was simulated and recorded"
+            && step.status == "passed"));
+        assert!(report.business_steps.iter().any(|step| step.name
+            == "Diagnostics artifact was written to disk"
+            && step.status == "passed"));
+        assert!(report.business_steps.iter().any(|step| step.name
+            == "Benchmark challenger beat baseline"
+            && step.status == "passed"));
+        assert!(report.business_steps.iter().any(|step| step.name
             == "LoRA evolution trained and promoted an adapter"
             && step.status == "passed"));
-        assert_eq!(report.gates.len(), 11);
+        assert_eq!(report.gates.len(), 15);
         assert!(
             report
                 .gates
@@ -7720,20 +7840,26 @@ mod tests {
                 trace_id: report.trace_id,
                 project_id: report.project_id,
                 project_root: report.project_root,
+                acceptance_scope: report.acceptance_scope,
                 runtime_kind: report.runtime_kind,
                 live_backend: report.live_backend,
                 live_model: report.live_model,
                 live_generation_evidence: report.live_generation_evidence,
                 goal_task_id: report.goal_task_id,
+                orchestrated_task_ids: report.orchestrated_task_ids,
                 task_ids: report.task_ids,
                 critic_rejection_task_id: report.critic_rejection_task_id,
+                human_rejected_task_id: report.human_rejected_task_id,
                 remediation_task_id: report.remediation_task_id,
                 human_approved_task_id: report.human_approved_task_id,
                 indexed_files: report.indexed_files,
                 indexed_chunks: report.indexed_chunks,
                 diagnostics_event_count: report.diagnostics_event_count,
+                diagnostics_artifact_path: report.diagnostics_artifact_path,
+                diagnostics_task_count: report.diagnostics_task_count,
                 benchmark_baseline_run_id: report.benchmark_baseline_run_id,
                 benchmark_challenger_run_id: report.benchmark_challenger_run_id,
+                benchmark_winner: report.benchmark_winner,
                 prompt_baseline_version_id: report.prompt_baseline_version_id,
                 prompt_challenger_version_id: report.prompt_challenger_version_id,
                 prompt_promoted: report.prompt_promoted,

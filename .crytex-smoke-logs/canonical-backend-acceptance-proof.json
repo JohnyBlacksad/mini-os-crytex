@@ -1,0 +1,201 @@
+{
+  "acceptance_scope": "canonical_backend_acceptance_runner",
+  "business_outcome": "BUSINESS_E2E_PASSED: goal decomposed, agent chain executed, critic rejection remediated, human approval recorded, benchmark ran, prompt evolution promoted, LoRA evolution promoted",
+  "business_steps": [
+    {
+      "name": "Live model generated agent evidence",
+      "status": "passed",
+      "evidence": "runtime=deterministic, generations=0"
+    },
+    {
+      "name": "Project was created",
+      "status": "passed",
+      "evidence": "01KY3C1RYSYGM78FY97M13RQ7D"
+    },
+    {
+      "name": "Project was indexed for RAG/code context",
+      "status": "passed",
+      "evidence": "files=2, chunks=2"
+    },
+    {
+      "name": "Goal was decomposed into an approved task plan",
+      "status": "passed",
+      "evidence": "goal=01KY3C1RZ78FR44QR1TCZFPHHK, tasks=7"
+    },
+    {
+      "name": "Orchestrator created the agent task graph",
+      "status": "passed",
+      "evidence": "orchestrated_tasks=01KY3C1RZF69DMPD73CH5ARWX4,01KY3C1RZK2BP6RB71DWNJF3DR,01KY3C1RZV850X8WXB1899Z90W,01KY3C1S04H66129KKDV6FG57M,01KY3C1S0BM94TT7GKYN02RRWX"
+    },
+    {
+      "name": "Agent chain executed with artifacts",
+      "status": "passed",
+      "evidence": "01KY3C1RZ78FR44QR1TCZFPHHK,01KY3C1RZF69DMPD73CH5ARWX4,01KY3C1RZK2BP6RB71DWNJF3DR,01KY3C1RZV850X8WXB1899Z90W,01KY3C1S04H66129KKDV6FG57M,01KY3C1S0BM94TT7GKYN02RRWX,01KY3C1S6BRPVNG4CRGAK6YGGW"
+    },
+    {
+      "name": "Human rejection was simulated and recorded",
+      "status": "passed",
+      "evidence": "01KY3C1S0BM94TT7GKYN02RRWX"
+    },
+    {
+      "name": "Critic rejected work and remediation was created",
+      "status": "passed",
+      "evidence": "rejected=01KY3C1S0BM94TT7GKYN02RRWX, remediation=01KY3C1S6BRPVNG4CRGAK6YGGW"
+    },
+    {
+      "name": "Human approval/reward was recorded",
+      "status": "passed",
+      "evidence": "01KY3C1S6BRPVNG4CRGAK6YGGW"
+    },
+    {
+      "name": "Diagnostics/trace evidence was exported",
+      "status": "passed",
+      "evidence": "events=25"
+    },
+    {
+      "name": "Diagnostics artifact was written to disk",
+      "status": "passed",
+      "evidence": "path=A:\\Projects\\mini-os-crytex\\.crytex-smoke-logs\\canonical-backend-acceptance-project\\project_state_diagnostics.json, tasks=7"
+    },
+    {
+      "name": "Baseline/challenger benchmark was executed",
+      "status": "passed",
+      "evidence": "baseline=01KY3C1SBPMM6NMX1EE2WNTKMF, challenger=01KY3C1SCHJWYQV4WH2DF0K1ZZ"
+    },
+    {
+      "name": "Benchmark challenger beat baseline",
+      "status": "passed",
+      "evidence": "Challenger"
+    },
+    {
+      "name": "Prompt evolution promoted the winning challenger",
+      "status": "passed",
+      "evidence": "baseline=01KY3C1SDEFXHNFP6NFY4CCYRN, challenger=01KY3C1SDT8ARPWBK37KT7SXD9"
+    },
+    {
+      "name": "LoRA evolution trained and promoted an adapter",
+      "status": "passed",
+      "evidence": "codegen-v1"
+    }
+  ],
+  "trace_id": "kernel-e2e-01KY3C1RYS61NFN03RNZ8KWYK6",
+  "project_id": "01KY3C1RYSYGM78FY97M13RQ7D",
+  "project_root": "A:\\Projects\\mini-os-crytex\\.crytex-smoke-logs\\canonical-backend-acceptance-project",
+  "runtime_kind": "deterministic",
+  "live_backend": null,
+  "live_model": null,
+  "live_generation_count": 0,
+  "live_generation_evidence": [],
+  "goal_task_id": "01KY3C1RZ78FR44QR1TCZFPHHK",
+  "orchestrated_task_ids": [
+    "01KY3C1RZF69DMPD73CH5ARWX4",
+    "01KY3C1RZK2BP6RB71DWNJF3DR",
+    "01KY3C1RZV850X8WXB1899Z90W",
+    "01KY3C1S04H66129KKDV6FG57M",
+    "01KY3C1S0BM94TT7GKYN02RRWX"
+  ],
+  "task_ids": [
+    "01KY3C1RZ78FR44QR1TCZFPHHK",
+    "01KY3C1RZF69DMPD73CH5ARWX4",
+    "01KY3C1RZK2BP6RB71DWNJF3DR",
+    "01KY3C1RZV850X8WXB1899Z90W",
+    "01KY3C1S04H66129KKDV6FG57M",
+    "01KY3C1S0BM94TT7GKYN02RRWX",
+    "01KY3C1S6BRPVNG4CRGAK6YGGW"
+  ],
+  "critic_rejection_task_id": "01KY3C1S0BM94TT7GKYN02RRWX",
+  "human_rejected_task_id": "01KY3C1S0BM94TT7GKYN02RRWX",
+  "remediation_task_id": "01KY3C1S6BRPVNG4CRGAK6YGGW",
+  "human_approved_task_id": "01KY3C1S6BRPVNG4CRGAK6YGGW",
+  "indexed_files": 2,
+  "indexed_chunks": 2,
+  "diagnostics_event_count": 25,
+  "diagnostics_artifact_path": "A:\\Projects\\mini-os-crytex\\.crytex-smoke-logs\\canonical-backend-acceptance-project\\project_state_diagnostics.json",
+  "diagnostics_task_count": 7,
+  "benchmark_baseline_run_id": "01KY3C1SBPMM6NMX1EE2WNTKMF",
+  "benchmark_challenger_run_id": "01KY3C1SCHJWYQV4WH2DF0K1ZZ",
+  "benchmark_winner": "Challenger",
+  "prompt_baseline_version_id": "01KY3C1SDEFXHNFP6NFY4CCYRN",
+  "prompt_challenger_version_id": "01KY3C1SDT8ARPWBK37KT7SXD9",
+  "prompt_promoted": true,
+  "lora_adapter_id": "codegen-v1",
+  "lora_promoted": true,
+  "gates": [
+    {
+      "name": "live_model_executed",
+      "passed": true,
+      "evidence": "runtime=deterministic, generations=0"
+    },
+    {
+      "name": "project_created",
+      "passed": true,
+      "evidence": "01KY3C1RYSYGM78FY97M13RQ7D"
+    },
+    {
+      "name": "project_indexed",
+      "passed": true,
+      "evidence": "files=2, chunks=2"
+    },
+    {
+      "name": "goal_plan_approved",
+      "passed": true,
+      "evidence": "goal=01KY3C1RZ78FR44QR1TCZFPHHK, tasks=7"
+    },
+    {
+      "name": "orchestrator_decomposed_goal",
+      "passed": true,
+      "evidence": "orchestrated_tasks=01KY3C1RZF69DMPD73CH5ARWX4,01KY3C1RZK2BP6RB71DWNJF3DR,01KY3C1RZV850X8WXB1899Z90W,01KY3C1S04H66129KKDV6FG57M,01KY3C1S0BM94TT7GKYN02RRWX"
+    },
+    {
+      "name": "agent_chain_executed",
+      "passed": true,
+      "evidence": "01KY3C1RZ78FR44QR1TCZFPHHK,01KY3C1RZF69DMPD73CH5ARWX4,01KY3C1RZK2BP6RB71DWNJF3DR,01KY3C1RZV850X8WXB1899Z90W,01KY3C1S04H66129KKDV6FG57M,01KY3C1S0BM94TT7GKYN02RRWX,01KY3C1S6BRPVNG4CRGAK6YGGW"
+    },
+    {
+      "name": "human_rejection_recorded",
+      "passed": true,
+      "evidence": "01KY3C1S0BM94TT7GKYN02RRWX"
+    },
+    {
+      "name": "critic_rejection_remediated",
+      "passed": true,
+      "evidence": "rejected=01KY3C1S0BM94TT7GKYN02RRWX, remediation=01KY3C1S6BRPVNG4CRGAK6YGGW"
+    },
+    {
+      "name": "human_approval_recorded",
+      "passed": true,
+      "evidence": "01KY3C1S6BRPVNG4CRGAK6YGGW"
+    },
+    {
+      "name": "diagnostics_exported",
+      "passed": true,
+      "evidence": "events=25"
+    },
+    {
+      "name": "diagnostics_artifact_written",
+      "passed": true,
+      "evidence": "path=A:\\Projects\\mini-os-crytex\\.crytex-smoke-logs\\canonical-backend-acceptance-project\\project_state_diagnostics.json, tasks=7"
+    },
+    {
+      "name": "benchmark_executed",
+      "passed": true,
+      "evidence": "baseline=01KY3C1SBPMM6NMX1EE2WNTKMF, challenger=01KY3C1SCHJWYQV4WH2DF0K1ZZ"
+    },
+    {
+      "name": "benchmark_challenger_won",
+      "passed": true,
+      "evidence": "Challenger"
+    },
+    {
+      "name": "prompt_evolution_proved",
+      "passed": true,
+      "evidence": "baseline=01KY3C1SDEFXHNFP6NFY4CCYRN, challenger=01KY3C1SDT8ARPWBK37KT7SXD9"
+    },
+    {
+      "name": "lora_evolution_proved",
+      "passed": true,
+      "evidence": "codegen-v1"
+    }
+  ],
+  "passed": true
+}

@@ -1,0 +1,799 @@
+{
+  "project": {
+    "id": "01KY3C1RYSYGM78FY97M13RQ7D",
+    "name": "Canonical Backend Acceptance",
+    "root_path": "A:\\Projects\\mini-os-crytex\\.crytex-smoke-logs\\canonical-backend-acceptance-project",
+    "created_at": 1784672216025,
+    "updated_at": 1784672216025,
+    "metadata": {}
+  },
+  "kanban": {
+    "project_id": "01KY3C1RYSYGM78FY97M13RQ7D",
+    "columns": [
+      {
+        "status": "Backlog",
+        "title": "backlog",
+        "tasks": []
+      },
+      {
+        "status": "Pending",
+        "title": "pending",
+        "tasks": [
+          {
+            "id": "01KY3C1S0BM94TT7GKYN02RRWX",
+            "title": "critic: Implement a validated utility with tests and diagnostics",
+            "kind": "review",
+            "status": "Pending",
+            "priority": 10,
+            "assigned_agent": "critic"
+          }
+        ]
+      },
+      {
+        "status": "InProgress",
+        "title": "in_progress",
+        "tasks": []
+      },
+      {
+        "status": "Review",
+        "title": "review",
+        "tasks": [
+          {
+            "id": "01KY3C1RZ78FR44QR1TCZFPHHK",
+            "title": "Implement a validated utility with tests and diagnostics",
+            "kind": "codegen",
+            "status": "Review",
+            "priority": 10,
+            "assigned_agent": "architect"
+          },
+          {
+            "id": "01KY3C1RZF69DMPD73CH5ARWX4",
+            "title": "architect: Implement a validated utility with tests and diagnostics",
+            "kind": "architecture",
+            "status": "Review",
+            "priority": 10,
+            "assigned_agent": "architect"
+          },
+          {
+            "id": "01KY3C1RZK2BP6RB71DWNJF3DR",
+            "title": "coder: Implement a validated utility with tests and diagnostics",
+            "kind": "codegen",
+            "status": "Review",
+            "priority": 10,
+            "assigned_agent": "coder"
+          },
+          {
+            "id": "01KY3C1RZV850X8WXB1899Z90W",
+            "title": "qa: Implement a validated utility with tests and diagnostics",
+            "kind": "qa",
+            "status": "Review",
+            "priority": 10,
+            "assigned_agent": "qa"
+          },
+          {
+            "id": "01KY3C1S04H66129KKDV6FG57M",
+            "title": "security: Implement a validated utility with tests and diagnostics",
+            "kind": "security",
+            "status": "Review",
+            "priority": 10,
+            "assigned_agent": "security"
+          },
+          {
+            "id": "01KY3C1S6BRPVNG4CRGAK6YGGW",
+            "title": "Remediate critic rejection",
+            "kind": "codegen",
+            "status": "Review",
+            "priority": 5,
+            "assigned_agent": "coder"
+          }
+        ]
+      },
+      {
+        "status": "Completed",
+        "title": "completed",
+        "tasks": []
+      },
+      {
+        "status": "Failed",
+        "title": "failed",
+        "tasks": []
+      },
+      {
+        "status": "Cancelled",
+        "title": "cancelled",
+        "tasks": []
+      }
+    ]
+  },
+  "tasks": [
+    {
+      "id": "01KY3C1RZ78FR44QR1TCZFPHHK",
+      "project_id": "01KY3C1RYSYGM78FY97M13RQ7D",
+      "parent_id": null,
+      "title": "Implement a validated utility with tests and diagnostics",
+      "description": "Implement a validated utility with tests and diagnostics",
+      "kind": "codegen",
+      "status": "Review",
+      "assigned_agent": "architect",
+      "priority": 10,
+      "created_at": 1784672216039,
+      "started_at": 1784672216102,
+      "finished_at": 1784672216106,
+      "payload": {
+        "goal": "Implement a validated utility with tests and diagnostics",
+        "prompt": "Implement a validated utility with tests and diagnostics",
+        "acceptance_scope": "canonical_backend_acceptance_runner"
+      },
+      "result": {
+        "source": "kernel_e2e_proof",
+        "plan_approved": true,
+        "tasks": [
+          {
+            "id": "01KY3C1RZF69DMPD73CH5ARWX4",
+            "kind": "architecture",
+            "agent": "architect",
+            "title": "architect: Implement a validated utility with tests and diagnostics"
+          },
+          {
+            "id": "01KY3C1RZK2BP6RB71DWNJF3DR",
+            "kind": "codegen",
+            "agent": "coder",
+            "title": "coder: Implement a validated utility with tests and diagnostics"
+          },
+          {
+            "id": "01KY3C1RZV850X8WXB1899Z90W",
+            "kind": "qa",
+            "agent": "qa",
+            "title": "qa: Implement a validated utility with tests and diagnostics"
+          },
+          {
+            "id": "01KY3C1S04H66129KKDV6FG57M",
+            "kind": "security",
+            "agent": "security",
+            "title": "security: Implement a validated utility with tests and diagnostics"
+          },
+          {
+            "id": "01KY3C1S0BM94TT7GKYN02RRWX",
+            "kind": "review",
+            "agent": "critic",
+            "title": "critic: Implement a validated utility with tests and diagnostics"
+          }
+        ]
+      },
+      "iteration_count": 0,
+      "priority_score": 10.0,
+      "critic_score": null,
+      "human_score": null,
+      "prompt_version_id": "01KY3C1RWFFD8CERMDJBPR6SYH",
+      "lora_adapter_id": null,
+      "trace_id": "kernel-e2e-01KY3C1RYS61NFN03RNZ8KWYK6"
+    },
+    {
+      "id": "01KY3C1RZF69DMPD73CH5ARWX4",
+      "project_id": "01KY3C1RYSYGM78FY97M13RQ7D",
+      "parent_id": "01KY3C1RZ78FR44QR1TCZFPHHK",
+      "title": "architect: Implement a validated utility with tests and diagnostics",
+      "description": "Implement a validated utility with tests and diagnostics",
+      "kind": "architecture",
+      "status": "Review",
+      "assigned_agent": "architect",
+      "priority": 10,
+      "created_at": 1784672216043,
+      "started_at": 1784672216118,
+      "finished_at": 1784672216126,
+      "payload": {
+        "goal": "Implement a validated utility with tests and diagnostics",
+        "prompt": "Implement a validated utility with tests and diagnostics",
+        "acceptance_scope": "canonical_backend_acceptance_runner"
+      },
+      "result": {
+        "source": "kernel_e2e_proof",
+        "agent": "architect",
+        "artifact": {
+          "artifact_id": "artifact-01KY3C1RZF69DMPD73CH5ARWX4",
+          "source_task_id": "01KY3C1RZF69DMPD73CH5ARWX4",
+          "previous": {
+            "artifact_id": "artifact-01KY3C1RZ78FR44QR1TCZFPHHK",
+            "source_task_id": "01KY3C1RZ78FR44QR1TCZFPHHK",
+            "content": "approved plan"
+          },
+          "summary": "architect completed architect: Implement a validated utility with tests and diagnostics"
+        }
+      },
+      "iteration_count": 0,
+      "priority_score": 10.0,
+      "critic_score": null,
+      "human_score": null,
+      "prompt_version_id": "01KY3C1RVXXRSBKTCK3N3W7MJV",
+      "lora_adapter_id": null,
+      "trace_id": "kernel-e2e-01KY3C1RYS61NFN03RNZ8KWYK6"
+    },
+    {
+      "id": "01KY3C1RZK2BP6RB71DWNJF3DR",
+      "project_id": "01KY3C1RYSYGM78FY97M13RQ7D",
+      "parent_id": "01KY3C1RZ78FR44QR1TCZFPHHK",
+      "title": "coder: Implement a validated utility with tests and diagnostics",
+      "description": "Implement a validated utility with tests and diagnostics",
+      "kind": "codegen",
+      "status": "Review",
+      "assigned_agent": "coder",
+      "priority": 10,
+      "created_at": 1784672216051,
+      "started_at": 1784672216138,
+      "finished_at": 1784672216145,
+      "payload": {
+        "goal": "Implement a validated utility with tests and diagnostics",
+        "prompt": "Implement a validated utility with tests and diagnostics",
+        "acceptance_scope": "canonical_backend_acceptance_runner"
+      },
+      "result": {
+        "source": "kernel_e2e_proof",
+        "agent": "coder",
+        "artifact": {
+          "artifact_id": "artifact-01KY3C1RZK2BP6RB71DWNJF3DR",
+          "source_task_id": "01KY3C1RZK2BP6RB71DWNJF3DR",
+          "previous": {
+            "artifact_id": "artifact-01KY3C1RZF69DMPD73CH5ARWX4",
+            "source_task_id": "01KY3C1RZF69DMPD73CH5ARWX4",
+            "previous": {
+              "artifact_id": "artifact-01KY3C1RZ78FR44QR1TCZFPHHK",
+              "source_task_id": "01KY3C1RZ78FR44QR1TCZFPHHK",
+              "content": "approved plan"
+            },
+            "summary": "architect completed architect: Implement a validated utility with tests and diagnostics"
+          },
+          "summary": "coder completed coder: Implement a validated utility with tests and diagnostics"
+        }
+      },
+      "iteration_count": 0,
+      "priority_score": 10.0,
+      "critic_score": null,
+      "human_score": null,
+      "prompt_version_id": "01KY3C1RWFFD8CERMDJBPR6SYH",
+      "lora_adapter_id": null,
+      "trace_id": "kernel-e2e-01KY3C1RYS61NFN03RNZ8KWYK6"
+    },
+    {
+      "id": "01KY3C1RZV850X8WXB1899Z90W",
+      "project_id": "01KY3C1RYSYGM78FY97M13RQ7D",
+      "parent_id": "01KY3C1RZ78FR44QR1TCZFPHHK",
+      "title": "qa: Implement a validated utility with tests and diagnostics",
+      "description": "Implement a validated utility with tests and diagnostics",
+      "kind": "qa",
+      "status": "Review",
+      "assigned_agent": "qa",
+      "priority": 10,
+      "created_at": 1784672216059,
+      "started_at": 1784672216156,
+      "finished_at": 1784672216163,
+      "payload": {
+        "goal": "Implement a validated utility with tests and diagnostics",
+        "prompt": "Implement a validated utility with tests and diagnostics",
+        "acceptance_scope": "canonical_backend_acceptance_runner"
+      },
+      "result": {
+        "source": "kernel_e2e_proof",
+        "agent": "qa",
+        "artifact": {
+          "artifact_id": "artifact-01KY3C1RZV850X8WXB1899Z90W",
+          "source_task_id": "01KY3C1RZV850X8WXB1899Z90W",
+          "previous": {
+            "artifact_id": "artifact-01KY3C1RZK2BP6RB71DWNJF3DR",
+            "source_task_id": "01KY3C1RZK2BP6RB71DWNJF3DR",
+            "previous": {
+              "artifact_id": "artifact-01KY3C1RZF69DMPD73CH5ARWX4",
+              "source_task_id": "01KY3C1RZF69DMPD73CH5ARWX4",
+              "previous": {
+                "artifact_id": "artifact-01KY3C1RZ78FR44QR1TCZFPHHK",
+                "source_task_id": "01KY3C1RZ78FR44QR1TCZFPHHK",
+                "content": "approved plan"
+              },
+              "summary": "architect completed architect: Implement a validated utility with tests and diagnostics"
+            },
+            "summary": "coder completed coder: Implement a validated utility with tests and diagnostics"
+          },
+          "summary": "qa completed qa: Implement a validated utility with tests and diagnostics"
+        }
+      },
+      "iteration_count": 0,
+      "priority_score": 10.0,
+      "critic_score": null,
+      "human_score": null,
+      "prompt_version_id": "01KY3C1RWYA72VAFN2BJ3D3V1S",
+      "lora_adapter_id": null,
+      "trace_id": "kernel-e2e-01KY3C1RYS61NFN03RNZ8KWYK6"
+    },
+    {
+      "id": "01KY3C1S04H66129KKDV6FG57M",
+      "project_id": "01KY3C1RYSYGM78FY97M13RQ7D",
+      "parent_id": "01KY3C1RZ78FR44QR1TCZFPHHK",
+      "title": "security: Implement a validated utility with tests and diagnostics",
+      "description": "Implement a validated utility with tests and diagnostics",
+      "kind": "security",
+      "status": "Review",
+      "assigned_agent": "security",
+      "priority": 10,
+      "created_at": 1784672216067,
+      "started_at": 1784672216173,
+      "finished_at": 1784672216181,
+      "payload": {
+        "goal": "Implement a validated utility with tests and diagnostics",
+        "prompt": "Implement a validated utility with tests and diagnostics",
+        "acceptance_scope": "canonical_backend_acceptance_runner"
+      },
+      "result": {
+        "source": "kernel_e2e_proof",
+        "agent": "security",
+        "artifact": {
+          "artifact_id": "artifact-01KY3C1S04H66129KKDV6FG57M",
+          "source_task_id": "01KY3C1S04H66129KKDV6FG57M",
+          "previous": {
+            "artifact_id": "artifact-01KY3C1RZV850X8WXB1899Z90W",
+            "source_task_id": "01KY3C1RZV850X8WXB1899Z90W",
+            "previous": {
+              "artifact_id": "artifact-01KY3C1RZK2BP6RB71DWNJF3DR",
+              "source_task_id": "01KY3C1RZK2BP6RB71DWNJF3DR",
+              "previous": {
+                "artifact_id": "artifact-01KY3C1RZF69DMPD73CH5ARWX4",
+                "source_task_id": "01KY3C1RZF69DMPD73CH5ARWX4",
+                "previous": {
+                  "artifact_id": "artifact-01KY3C1RZ78FR44QR1TCZFPHHK",
+                  "source_task_id": "01KY3C1RZ78FR44QR1TCZFPHHK",
+                  "content": "approved plan"
+                },
+                "summary": "architect completed architect: Implement a validated utility with tests and diagnostics"
+              },
+              "summary": "coder completed coder: Implement a validated utility with tests and diagnostics"
+            },
+            "summary": "qa completed qa: Implement a validated utility with tests and diagnostics"
+          },
+          "summary": "security completed security: Implement a validated utility with tests and diagnostics"
+        }
+      },
+      "iteration_count": 0,
+      "priority_score": 10.0,
+      "critic_score": null,
+      "human_score": null,
+      "prompt_version_id": "01KY3C1RXNC28ABS64XY1XFSSY",
+      "lora_adapter_id": null,
+      "trace_id": "kernel-e2e-01KY3C1RYS61NFN03RNZ8KWYK6"
+    },
+    {
+      "id": "01KY3C1S0BM94TT7GKYN02RRWX",
+      "project_id": "01KY3C1RYSYGM78FY97M13RQ7D",
+      "parent_id": "01KY3C1RZ78FR44QR1TCZFPHHK",
+      "title": "critic: Implement a validated utility with tests and diagnostics",
+      "description": "Implement a validated utility with tests and diagnostics",
+      "kind": "review",
+      "status": "Pending",
+      "assigned_agent": "critic",
+      "priority": 10,
+      "created_at": 1784672216075,
+      "started_at": null,
+      "finished_at": null,
+      "payload": {
+        "goal": "Implement a validated utility with tests and diagnostics",
+        "prompt": "Implement a validated utility with tests and diagnostics",
+        "acceptance_scope": "canonical_backend_acceptance_runner",
+        "retry_feedback": [
+          {
+            "iteration": 1,
+            "comment": "missing deterministic regression evidence",
+            "timestamp": 1784672216221
+          }
+        ]
+      },
+      "result": {
+        "source": "kernel_e2e_proof",
+        "agent": "critic",
+        "decision": "reject",
+        "feedback": "missing deterministic regression evidence"
+      },
+      "iteration_count": 1,
+      "priority_score": 10.0,
+      "critic_score": 2.0,
+      "human_score": 1.0,
+      "prompt_version_id": "01KY3C1RXAJKYNBDAQEM7GNQFD",
+      "lora_adapter_id": null,
+      "trace_id": "kernel-e2e-01KY3C1RYS61NFN03RNZ8KWYK6"
+    },
+    {
+      "id": "01KY3C1S6BRPVNG4CRGAK6YGGW",
+      "project_id": "01KY3C1RYSYGM78FY97M13RQ7D",
+      "parent_id": null,
+      "title": "Remediate critic rejection",
+      "description": "Remediate critic rejection",
+      "kind": "codegen",
+      "status": "Review",
+      "assigned_agent": "coder",
+      "priority": 5,
+      "created_at": 1784672216264,
+      "started_at": 1784672216275,
+      "finished_at": 1784672216278,
+      "payload": {
+        "prompt": "Remediate critic rejection",
+        "artifact_in": {
+          "artifact_id": "artifact-01KY3C1S04H66129KKDV6FG57M",
+          "source_task_id": "01KY3C1S04H66129KKDV6FG57M",
+          "previous": {
+            "artifact_id": "artifact-01KY3C1RZV850X8WXB1899Z90W",
+            "source_task_id": "01KY3C1RZV850X8WXB1899Z90W",
+            "previous": {
+              "artifact_id": "artifact-01KY3C1RZK2BP6RB71DWNJF3DR",
+              "source_task_id": "01KY3C1RZK2BP6RB71DWNJF3DR",
+              "previous": {
+                "artifact_id": "artifact-01KY3C1RZF69DMPD73CH5ARWX4",
+                "source_task_id": "01KY3C1RZF69DMPD73CH5ARWX4",
+                "previous": {
+                  "artifact_id": "artifact-01KY3C1RZ78FR44QR1TCZFPHHK",
+                  "source_task_id": "01KY3C1RZ78FR44QR1TCZFPHHK",
+                  "content": "approved plan"
+                },
+                "summary": "architect completed architect: Implement a validated utility with tests and diagnostics"
+              },
+              "summary": "coder completed coder: Implement a validated utility with tests and diagnostics"
+            },
+            "summary": "qa completed qa: Implement a validated utility with tests and diagnostics"
+          },
+          "summary": "security completed security: Implement a validated utility with tests and diagnostics"
+        }
+      },
+      "result": {
+        "source": "kernel_e2e_proof",
+        "agent": "coder",
+        "remediation_for": "01KY3C1S0BM94TT7GKYN02RRWX",
+        "evidence": "deterministic regression benchmark added"
+      },
+      "iteration_count": 0,
+      "priority_score": 5.0,
+      "critic_score": null,
+      "human_score": 5.0,
+      "prompt_version_id": "01KY3C1RWFFD8CERMDJBPR6SYH",
+      "lora_adapter_id": null,
+      "trace_id": "kernel-e2e-01KY3C1RYS61NFN03RNZ8KWYK6"
+    }
+  ],
+  "recent_logs": [
+    {
+      "id": "01KY3C1S8P3YSFYY7FX9ADCT8J",
+      "project_id": "01KY3C1RYSYGM78FY97M13RQ7D",
+      "task_id": "01KY3C1S6BRPVNG4CRGAK6YGGW",
+      "agent": "task_service",
+      "action": "set_human_score",
+      "message": null,
+      "level": "info",
+      "timestamp": 1784672216342,
+      "metadata": {
+        "human_score": 5.0
+      }
+    },
+    {
+      "id": "01KY3C1S86Y0HJF5NQ7YS4SC0W",
+      "project_id": "01KY3C1RYSYGM78FY97M13RQ7D",
+      "task_id": "01KY3C1S6BRPVNG4CRGAK6YGGW",
+      "agent": "task_service",
+      "action": "set_result",
+      "message": "task completed with result",
+      "level": "info",
+      "timestamp": 1784672216326,
+      "metadata": null
+    },
+    {
+      "id": "01KY3C1S6P980C9HGCZXG5GST9",
+      "project_id": "01KY3C1RYSYGM78FY97M13RQ7D",
+      "task_id": "01KY3C1S6BRPVNG4CRGAK6YGGW",
+      "agent": "task_service",
+      "action": "set_status",
+      "message": null,
+      "level": "info",
+      "timestamp": 1784672216278,
+      "metadata": {
+        "status": "in_progress"
+      }
+    },
+    {
+      "id": "01KY3C1S6KRABY7G32EEPCP0P0",
+      "project_id": "01KY3C1RYSYGM78FY97M13RQ7D",
+      "task_id": "01KY3C1S6BRPVNG4CRGAK6YGGW",
+      "agent": "task_service",
+      "action": "submit",
+      "message": null,
+      "level": "info",
+      "timestamp": 1784672216275,
+      "metadata": {
+        "kind": "codegen"
+      }
+    },
+    {
+      "id": "01KY3C1S68JV26YMA7BNFH31DA",
+      "project_id": "01KY3C1RYSYGM78FY97M13RQ7D",
+      "task_id": "01KY3C1S0BM94TT7GKYN02RRWX",
+      "agent": "task_service",
+      "action": "retry",
+      "message": null,
+      "level": "info",
+      "timestamp": 1784672216264,
+      "metadata": {
+        "iteration_count": 1,
+        "feedback": "missing deterministic regression evidence"
+      }
+    },
+    {
+      "id": "01KY3C1S4X6E4MXDMTFRJVY64Z",
+      "project_id": "01KY3C1RYSYGM78FY97M13RQ7D",
+      "task_id": "01KY3C1S0BM94TT7GKYN02RRWX",
+      "agent": "task_service",
+      "action": "set_human_score",
+      "message": null,
+      "level": "info",
+      "timestamp": 1784672216221,
+      "metadata": {
+        "human_score": 1.0
+      }
+    },
+    {
+      "id": "01KY3C1S4SPPNCGHDEDH3STDSV",
+      "project_id": "01KY3C1RYSYGM78FY97M13RQ7D",
+      "task_id": "01KY3C1S0BM94TT7GKYN02RRWX",
+      "agent": "task_service",
+      "action": "set_critic_score",
+      "message": null,
+      "level": "info",
+      "timestamp": 1784672216217,
+      "metadata": {
+        "critic_score": 2.0
+      }
+    },
+    {
+      "id": "01KY3C1S4BM191BYRY9YBJ26DY",
+      "project_id": "01KY3C1RYSYGM78FY97M13RQ7D",
+      "task_id": "01KY3C1S0BM94TT7GKYN02RRWX",
+      "agent": "task_service",
+      "action": "set_result",
+      "message": "task completed with result",
+      "level": "info",
+      "timestamp": 1784672216203,
+      "metadata": null
+    },
+    {
+      "id": "01KY3C1S47SZ3P97VTGE28WPER",
+      "project_id": "01KY3C1RYSYGM78FY97M13RQ7D",
+      "task_id": "01KY3C1S0BM94TT7GKYN02RRWX",
+      "agent": "task_service",
+      "action": "set_status",
+      "message": null,
+      "level": "info",
+      "timestamp": 1784672216199,
+      "metadata": {
+        "status": "in_progress"
+      }
+    },
+    {
+      "id": "01KY3C1S3WT8YEXHD1WPP0ASR8",
+      "project_id": "01KY3C1RYSYGM78FY97M13RQ7D",
+      "task_id": "01KY3C1S04H66129KKDV6FG57M",
+      "agent": "task_service",
+      "action": "set_result",
+      "message": "task completed with result",
+      "level": "info",
+      "timestamp": 1784672216188,
+      "metadata": null
+    },
+    {
+      "id": "01KY3C1S3N7ZBT8W5YFF1CXWQ3",
+      "project_id": "01KY3C1RYSYGM78FY97M13RQ7D",
+      "task_id": "01KY3C1S04H66129KKDV6FG57M",
+      "agent": "task_service",
+      "action": "set_status",
+      "message": null,
+      "level": "info",
+      "timestamp": 1784672216181,
+      "metadata": {
+        "status": "in_progress"
+      }
+    },
+    {
+      "id": "01KY3C1S3AF3FYM0CQKJGZGKXZ",
+      "project_id": "01KY3C1RYSYGM78FY97M13RQ7D",
+      "task_id": "01KY3C1RZV850X8WXB1899Z90W",
+      "agent": "task_service",
+      "action": "set_result",
+      "message": "task completed with result",
+      "level": "info",
+      "timestamp": 1784672216170,
+      "metadata": null
+    },
+    {
+      "id": "01KY3C1S3336QKMKDEKZVWKJ7Z",
+      "project_id": "01KY3C1RYSYGM78FY97M13RQ7D",
+      "task_id": "01KY3C1RZV850X8WXB1899Z90W",
+      "agent": "task_service",
+      "action": "set_status",
+      "message": null,
+      "level": "info",
+      "timestamp": 1784672216163,
+      "metadata": {
+        "status": "in_progress"
+      }
+    },
+    {
+      "id": "01KY3C1S2NWE722BRCH9NQ3VCM",
+      "project_id": "01KY3C1RYSYGM78FY97M13RQ7D",
+      "task_id": "01KY3C1RZK2BP6RB71DWNJF3DR",
+      "agent": "task_service",
+      "action": "set_result",
+      "message": "task completed with result",
+      "level": "info",
+      "timestamp": 1784672216149,
+      "metadata": null
+    },
+    {
+      "id": "01KY3C1S2HASGY3NWRDWVTGQ54",
+      "project_id": "01KY3C1RYSYGM78FY97M13RQ7D",
+      "task_id": "01KY3C1RZK2BP6RB71DWNJF3DR",
+      "agent": "task_service",
+      "action": "set_status",
+      "message": null,
+      "level": "info",
+      "timestamp": 1784672216145,
+      "metadata": {
+        "status": "in_progress"
+      }
+    },
+    {
+      "id": "01KY3C1S220KR9D3MA0GMXETAK",
+      "project_id": "01KY3C1RYSYGM78FY97M13RQ7D",
+      "task_id": "01KY3C1RZF69DMPD73CH5ARWX4",
+      "agent": "task_service",
+      "action": "set_result",
+      "message": "task completed with result",
+      "level": "info",
+      "timestamp": 1784672216130,
+      "metadata": null
+    },
+    {
+      "id": "01KY3C1S1Y4AT4XAZXH5G1A05X",
+      "project_id": "01KY3C1RYSYGM78FY97M13RQ7D",
+      "task_id": "01KY3C1RZF69DMPD73CH5ARWX4",
+      "agent": "task_service",
+      "action": "set_status",
+      "message": null,
+      "level": "info",
+      "timestamp": 1784672216126,
+      "metadata": {
+        "status": "in_progress"
+      }
+    },
+    {
+      "id": "01KY3C1S1HJPRWTMG7S2JQDBW4",
+      "project_id": "01KY3C1RYSYGM78FY97M13RQ7D",
+      "task_id": "01KY3C1RZ78FR44QR1TCZFPHHK",
+      "agent": "task_service",
+      "action": "set_result",
+      "message": "task completed with result",
+      "level": "info",
+      "timestamp": 1784672216114,
+      "metadata": null
+    },
+    {
+      "id": "01KY3C1S1A20TYHHFMAEQESX1H",
+      "project_id": "01KY3C1RYSYGM78FY97M13RQ7D",
+      "task_id": "01KY3C1RZ78FR44QR1TCZFPHHK",
+      "agent": "task_service",
+      "action": "set_status",
+      "message": null,
+      "level": "info",
+      "timestamp": 1784672216106,
+      "metadata": {
+        "status": "in_progress"
+      }
+    },
+    {
+      "id": "01KY3C1S0K3TFWN7Y9A7KJCMXQ",
+      "project_id": "01KY3C1RYSYGM78FY97M13RQ7D",
+      "task_id": "01KY3C1S0BM94TT7GKYN02RRWX",
+      "agent": "task_service",
+      "action": "submit",
+      "message": null,
+      "level": "info",
+      "timestamp": 1784672216083,
+      "metadata": {
+        "kind": "review"
+      }
+    },
+    {
+      "id": "01KY3C1S0BCT673689NMXF1VSJ",
+      "project_id": "01KY3C1RYSYGM78FY97M13RQ7D",
+      "task_id": "01KY3C1S04H66129KKDV6FG57M",
+      "agent": "task_service",
+      "action": "submit",
+      "message": null,
+      "level": "info",
+      "timestamp": 1784672216075,
+      "metadata": {
+        "kind": "security"
+      }
+    },
+    {
+      "id": "01KY3C1S03RY4AWSD3CF992EZA",
+      "project_id": "01KY3C1RYSYGM78FY97M13RQ7D",
+      "task_id": "01KY3C1RZV850X8WXB1899Z90W",
+      "agent": "task_service",
+      "action": "submit",
+      "message": null,
+      "level": "info",
+      "timestamp": 1784672216067,
+      "metadata": {
+        "kind": "qa"
+      }
+    },
+    {
+      "id": "01KY3C1RZV0M0K0KTH2B4CS28E",
+      "project_id": "01KY3C1RYSYGM78FY97M13RQ7D",
+      "task_id": "01KY3C1RZK2BP6RB71DWNJF3DR",
+      "agent": "task_service",
+      "action": "submit",
+      "message": null,
+      "level": "info",
+      "timestamp": 1784672216059,
+      "metadata": {
+        "kind": "codegen"
+      }
+    },
+    {
+      "id": "01KY3C1RZKZ560MSE96RYJFPQS",
+      "project_id": "01KY3C1RYSYGM78FY97M13RQ7D",
+      "task_id": "01KY3C1RZF69DMPD73CH5ARWX4",
+      "agent": "task_service",
+      "action": "submit",
+      "message": null,
+      "level": "info",
+      "timestamp": 1784672216051,
+      "metadata": {
+        "kind": "architecture"
+      }
+    },
+    {
+      "id": "01KY3C1RZBYZAGZWMC9R2HKHE3",
+      "project_id": "01KY3C1RYSYGM78FY97M13RQ7D",
+      "task_id": "01KY3C1RZ78FR44QR1TCZFPHHK",
+      "agent": "task_service",
+      "action": "submit",
+      "message": null,
+      "level": "info",
+      "timestamp": 1784672216043,
+      "metadata": {
+        "kind": "codegen"
+      }
+    }
+  ],
+  "latest_snapshot": null,
+  "metrics": {
+    "timestamp": 1784672216431,
+    "cpu_usage_percent": 22.97631,
+    "memory_used_mb": 12194,
+    "memory_total_mb": 32596,
+    "swap_used_mb": 0,
+    "swap_total_mb": 32055,
+    "disk_used_gb": 1369,
+    "disk_total_gb": 2889,
+    "network_rx_mb": 49590,
+    "network_tx_mb": 7033,
+    "gpus": [
+      {
+        "name": "NVIDIA GeForce RTX 5080",
+        "usage_percent": 6,
+        "memory_used_mb": 3271,
+        "memory_total_mb": 16303,
+        "temperature_c": 42,
+        "power_draw_w": 28,
+        "fan_speed_percent": 46
+      }
+    ],
+    "tasks_completed": 0,
+    "tasks_failed": 0,
+    "average_latency_ms": 0,
+    "cache_hits": 0,
+    "cache_misses": 0
+  }
+}
