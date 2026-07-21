@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -73,6 +74,31 @@ impl RoleAdapterRegistry for MemoryRoleAdapterRegistry {
 }
 
 /// Decides which LoRA adapter (if any) should be active for a task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoraSelection {
+    pub adapter_id: String,
+    pub role: Option<String>,
+    pub source: String,
+    pub reason: String,
+}
+
+impl LoraSelection {
+    fn new(
+        adapter_id: String,
+        role: Option<AgentRole>,
+        source: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            adapter_id,
+            role: role.map(|r| r.as_str().to_string()),
+            source: source.into(),
+            reason: reason.into(),
+        }
+    }
+}
+
+/// Decides which LoRA adapter (if any) should be active for a task.
 #[async_trait]
 pub trait LoraRouter: Send + Sync {
     /// Resolve the adapter id for `task`.
@@ -88,6 +114,44 @@ pub trait LoraRouter: Send + Sync {
         role: AgentRole,
         project_id: &str,
     ) -> Result<Option<String>, LoraRouterError>;
+
+    /// Resolve the adapter selection with diagnostics for `task`.
+    async fn resolve_selection(
+        &self,
+        task: &Task,
+        project_id: &str,
+    ) -> Result<Option<LoraSelection>, LoraRouterError> {
+        Ok(self
+            .resolve(task, project_id)
+            .await?
+            .map(|adapter_id| LoraSelection {
+                adapter_id,
+                role: task
+                    .assigned_agent
+                    .as_deref()
+                    .and_then(AgentRole::from_agent)
+                    .map(|role| role.as_str().to_string()),
+                source: "legacy_router".to_string(),
+                reason: "adapter selected by LoraRouter::resolve".to_string(),
+            }))
+    }
+
+    /// Resolve the adapter selection with diagnostics for a specific agent `role`.
+    async fn resolve_selection_for_role(
+        &self,
+        role: AgentRole,
+        project_id: &str,
+    ) -> Result<Option<LoraSelection>, LoraRouterError> {
+        Ok(self
+            .resolve_for_role(role, project_id)
+            .await?
+            .map(|adapter_id| LoraSelection {
+                adapter_id,
+                role: Some(role.as_str().to_string()),
+                source: "legacy_role_router".to_string(),
+                reason: format!("adapter selected for {} role", role.as_str()),
+            }))
+    }
 }
 
 /// Default implementation of [`LoraRouter`].
@@ -195,17 +259,46 @@ impl LoraRouter for LoraRouterImpl {
         task: &Task,
         project_id: &str,
     ) -> Result<Option<String>, LoraRouterError> {
-        if let Some(id) = Self::explicit_override(&task.payload)? {
-            return Ok(Some(id));
-        }
+        Ok(self
+            .resolve_selection(task, project_id)
+            .await?
+            .map(|selection| selection.adapter_id))
+    }
 
-        if let Some(role) = task
+    async fn resolve_for_role(
+        &self,
+        role: AgentRole,
+        project_id: &str,
+    ) -> Result<Option<String>, LoraRouterError> {
+        Ok(self
+            .resolve_selection_for_role(role, project_id)
+            .await?
+            .map(|selection| selection.adapter_id))
+    }
+
+    async fn resolve_selection(
+        &self,
+        task: &Task,
+        project_id: &str,
+    ) -> Result<Option<LoraSelection>, LoraRouterError> {
+        let role = task
             .assigned_agent
             .as_deref()
-            .and_then(AgentRole::from_agent)
-            && let Some(id) = self.resolve_for_role(role, project_id).await?
+            .and_then(AgentRole::from_agent);
+
+        if let Some(id) = Self::explicit_override(&task.payload)? {
+            return Ok(Some(LoraSelection::new(
+                id,
+                role,
+                "explicit_override",
+                "task payload requested a specific LoRA adapter",
+            )));
+        }
+
+        if let Some(role) = role
+            && let Some(selection) = self.resolve_selection_for_role(role, project_id).await?
         {
-            return Ok(Some(id));
+            return Ok(Some(selection));
         }
 
         if let Some(id) = self
@@ -214,21 +307,41 @@ impl LoraRouter for LoraRouterImpl {
             .await
             .map_err(LoraRouterError::Evolution)?
         {
-            return Ok(Some(id));
+            return Ok(Some(LoraSelection::new(
+                id,
+                role,
+                "task_evolution",
+                "evolution service selected the best adapter for this task",
+            )));
         }
 
-        self.semantic_fallback(&Self::task_text(task)).await
+        Ok(self
+            .semantic_fallback(&Self::task_text(task))
+            .await?
+            .map(|id| {
+                LoraSelection::new(
+                    id,
+                    role,
+                    "semantic_fallback",
+                    "semantic adapter search matched the task text",
+                )
+            }))
     }
 
-    async fn resolve_for_role(
+    async fn resolve_selection_for_role(
         &self,
         role: AgentRole,
         project_id: &str,
-    ) -> Result<Option<String>, LoraRouterError> {
+    ) -> Result<Option<LoraSelection>, LoraRouterError> {
         if let Some(registry) = &self.role_registry
             && let Some(id) = registry.get(role)
         {
-            return Ok(Some(id));
+            return Ok(Some(LoraSelection::new(
+                id,
+                Some(role),
+                "role_registry",
+                format!("active adapter registered for {} role", role.as_str()),
+            )));
         }
 
         if let Some(id) = self
@@ -237,10 +350,25 @@ impl LoraRouter for LoraRouterImpl {
             .await
             .map_err(LoraRouterError::Evolution)?
         {
-            return Ok(Some(id));
+            return Ok(Some(LoraSelection::new(
+                id,
+                Some(role),
+                "role_evolution",
+                format!(
+                    "evolution service selected adapter for {} role",
+                    role.as_str()
+                ),
+            )));
         }
 
-        self.semantic_fallback(role.as_str()).await
+        Ok(self.semantic_fallback(role.as_str()).await?.map(|id| {
+            LoraSelection::new(
+                id,
+                Some(role),
+                "semantic_fallback",
+                format!("semantic adapter search matched {} role", role.as_str()),
+            )
+        }))
     }
 }
 

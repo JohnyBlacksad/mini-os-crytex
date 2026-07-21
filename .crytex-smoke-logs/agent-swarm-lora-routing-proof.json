@@ -1,0 +1,78 @@
+{
+  "proof_outcome": "AGENT_SWARM_LORA_ROUTING_PASSED",
+  "passed": true,
+  "trace_id": "trace-agent-swarm-lora-01KY2P9194QQC6KQH8T7GQZ7YN",
+  "sessions_clean": true,
+  "role_adapters_distinct": true,
+  "artifact_lineage_has_adapter_ids": true,
+  "agents": [
+    {
+      "role": "coder",
+      "session_id": "01KY2P9196KC5BVEE9ZK9V7FQ4",
+      "adapter_id": "coder-lora-v1",
+      "selection": {
+        "adapter_id": "coder-lora-v1",
+        "role": "coder",
+        "source": "role_registry",
+        "reason": "active adapter registered for coder role"
+      }
+    },
+    {
+      "role": "critic",
+      "session_id": "01KY2P9198V4AYMGZBDVKYMTM2",
+      "adapter_id": "critic-lora-v1",
+      "selection": {
+        "adapter_id": "critic-lora-v1",
+        "role": "critic",
+        "source": "role_registry",
+        "reason": "active adapter registered for critic role"
+      }
+    }
+  ],
+  "artifact_lineage": {
+    "patch_artifact_lora_selection": {
+      "adapter_id": "coder-lora-v1",
+      "role": "coder",
+      "source": "role_registry",
+      "reason": "active adapter registered for coder role"
+    },
+    "review_artifact_lora_selection": {
+      "adapter_id": "critic-lora-v1",
+      "role": "critic",
+      "source": "role_registry",
+      "reason": "active adapter registered for critic role"
+    },
+    "critic_upstream_artifact": {
+      "agent_result": {
+        "summary": "implemented requested behavior",
+        "files_changed": [
+          "src/lib.rs"
+        ],
+        "adapter_seen": "coder-lora-v1"
+      },
+      "agent_session": {
+        "session_id": "01KY2P9196KC5BVEE9ZK9V7FQ4",
+        "trace_id": "trace-agent-swarm-lora-01KY2P9194QQC6KQH8T7GQZ7YN",
+        "role": "coder",
+        "node_id": "coder",
+        "input_key": "goal",
+        "clean_context": true,
+        "lora_adapter_id": "coder-lora-v1",
+        "lora_selection_reason": "active adapter registered for coder role"
+      },
+      "lora_selection_seen_by_agent": {
+        "adapter_id": "coder-lora-v1",
+        "role": "coder",
+        "source": "role_registry",
+        "reason": "active adapter registered for coder role"
+      },
+      "upstream_artifact_seen": "Implement a validated utility and pass it to critic",
+      "lora_selection": {
+        "adapter_id": "coder-lora-v1",
+        "role": "coder",
+        "source": "role_registry",
+        "reason": "active adapter registered for coder role"
+      }
+    }
+  }
+}

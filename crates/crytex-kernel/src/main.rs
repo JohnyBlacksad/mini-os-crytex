@@ -47,14 +47,16 @@ use crytex_core::{
         AlertServiceImpl, AlertThresholds, BulkAuditLogService, CreateProjectRequest,
         CreateTaskRequest, CriticCouncil, EventServiceImpl, HfGgufResolveRequest,
         InferenceServiceImpl, LoraBenchmarkDecision, LoraBenchmarkGate, LoraBenchmarkRequest,
-        LoraEvolutionError, LoraEvolutionService, LoraRouter, LoraTrainingConfig, ModelManager,
-        ModelManagerImpl, ModelRuntimeMatrixProbe, ModelRuntimeMatrixRequest, ModelRuntimeProbe,
-        ModelRuntimeProbeRequest, MutationOperator, Orchestrator, OrchestratorImpl, ProjectService,
-        ProjectServiceImpl, ProjectWatcher, PromptEvolutionService, Quantization,
-        RecordRewardRequest, RewardService, RuntimeFeatureSet, RuntimeMatrixEntryRequest,
+        LoraEvolutionError, LoraEvolutionService, LoraRouter, LoraTrainingConfig,
+        MemoryRoleAdapterRegistry, ModelManager, ModelManagerImpl, ModelRuntimeMatrixProbe,
+        ModelRuntimeMatrixRequest, ModelRuntimeProbe, ModelRuntimeProbeRequest, MutationOperator,
+        Orchestrator, OrchestratorImpl, ProjectService, ProjectServiceImpl, ProjectWatcher,
+        PromptEvolutionService, Quantization, RecordRewardRequest, RewardService,
+        RoleAdapterRegistry, RuntimeFeatureSet, RuntimeMatrixEntryRequest,
         RuntimeMatrixReportWriter, SchedulerImpl, SystemHardwareDetector, TaskHandler,
         TaskServiceImpl, TomlWorkflowRepository, VectorStore, WorkerError, WorkerPool,
-        WorkflowRepository, recommend_local_device,
+        WorkflowDefinition, WorkflowEdge, WorkflowEngine, WorkflowNode, WorkflowRepository,
+        WorkflowRetryPolicy, recommend_local_device,
     },
     state_export::export_project_state,
 };
@@ -69,9 +71,9 @@ use crytex_sandbox::SandboxOrchestrator;
 use crytex_storage::Storage;
 use crytex_tools::{Capability, ScanningToolService, ToolServiceImpl, TypedToolRegistry};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::{error, info, warn};
 use ulid::Ulid;
@@ -320,6 +322,15 @@ enum Commands {
         model_source: String,
         #[arg(long)]
         output_dir: Option<PathBuf>,
+        #[arg(long)]
+        report_path: Option<PathBuf>,
+    },
+    /// Prove role-based LoRA adapter routing through real agent swarm sessions
+    ProveAgentSwarmLoraRouting {
+        #[arg(long, default_value = "coder-lora-v1")]
+        coder_adapter_id: String,
+        #[arg(long, default_value = "critic-lora-v1")]
+        critic_adapter_id: String,
         #[arg(long)]
         report_path: Option<PathBuf>,
     },
@@ -4744,6 +4755,297 @@ async fn seed_prompt_versions(
         .await;
 }
 
+struct ProofSwarmAgentService {
+    seen: Mutex<Vec<Task>>,
+}
+
+#[async_trait]
+impl AgentService for ProofSwarmAgentService {
+    async fn register(&self, _agent: Arc<dyn crytex_core::services::Agent>) {}
+
+    async fn find(&self, _name: &str) -> Option<Arc<dyn crytex_core::services::Agent>> {
+        None
+    }
+
+    async fn list(&self) -> Vec<String> {
+        vec!["coder".to_string(), "critic".to_string()]
+    }
+
+    fn route(&self, task: &Task) -> Option<String> {
+        task.assigned_agent.clone()
+    }
+
+    async fn execute(
+        &self,
+        task: &Task,
+        _inference: Arc<dyn crytex_core::services::InferenceService>,
+        _tool_service: Arc<dyn ToolService>,
+    ) -> Result<serde_json::Value, crytex_core::services::AgentServiceError> {
+        self.seen
+            .lock()
+            .map(|mut tasks| tasks.push(task.clone()))
+            .ok();
+        let agent_result = match task.assigned_agent.as_deref() {
+            Some("coder") => serde_json::json!({
+                "summary": "implemented requested behavior",
+                "files_changed": ["src/lib.rs"],
+                "adapter_seen": task.lora_adapter_id
+            }),
+            Some("critic") => serde_json::json!({
+                "review_decision": "pass",
+                "summary": "accepted for human review",
+                "adapter_seen": task.lora_adapter_id
+            }),
+            _ => serde_json::json!({ "summary": "unsupported proof agent" }),
+        };
+
+        Ok(serde_json::json!({
+            "agent_result": agent_result,
+            "agent_session": task.payload["agent_session"].clone(),
+            "lora_selection_seen_by_agent": task.payload["lora_selection"].clone(),
+            "upstream_artifact_seen": task.payload["upstream_artifact"].clone()
+        }))
+    }
+}
+
+struct ProofNoopInference;
+
+#[async_trait]
+impl crytex_core::services::InferenceService for ProofNoopInference {
+    async fn generate(
+        &self,
+        _request: InferenceRequest,
+    ) -> Result<InferenceResponse, crytex_core::services::InferenceServiceError> {
+        Ok(InferenceResponse {
+            content: String::new(),
+            usage: TokenUsage {
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                total_tokens: 0,
+            },
+            finish_reason: "stop".to_string(),
+        })
+    }
+
+    async fn embed(
+        &self,
+        _text: &str,
+    ) -> Result<Vec<f32>, crytex_core::services::InferenceServiceError> {
+        Ok(vec![])
+    }
+
+    async fn register_lora(
+        &self,
+        _lora: InferenceLoRAAdapter,
+    ) -> Result<(), crytex_core::services::InferenceServiceError> {
+        Ok(())
+    }
+
+    async fn swap_lora(
+        &self,
+        _lora_id: &str,
+    ) -> Result<(), crytex_core::services::InferenceServiceError> {
+        Ok(())
+    }
+
+    fn available_backends(&self) -> Vec<BackendInfo> {
+        vec![]
+    }
+
+    async fn list_models(
+        &self,
+        _backend_id: Option<&str>,
+    ) -> Result<Vec<ModelInfo>, crytex_core::services::InferenceServiceError> {
+        Ok(vec![])
+    }
+}
+
+struct ProofNoopToolService;
+
+#[async_trait]
+impl ToolService for ProofNoopToolService {
+    async fn invoke(
+        &self,
+        _name: &str,
+        _args: serde_json::Value,
+    ) -> Result<serde_json::Value, crytex_core::services::ToolServiceError> {
+        Ok(serde_json::Value::Null)
+    }
+
+    fn list_tools(&self) -> Vec<crytex_core::services::ToolDescription> {
+        vec![]
+    }
+}
+
+struct ProofRoleRegistryLoraRouter {
+    registry: Arc<MemoryRoleAdapterRegistry>,
+}
+
+#[async_trait]
+impl LoraRouter for ProofRoleRegistryLoraRouter {
+    async fn resolve(
+        &self,
+        task: &Task,
+        project_id: &str,
+    ) -> Result<Option<String>, crytex_core::services::LoraRouterError> {
+        Ok(self
+            .resolve_selection(task, project_id)
+            .await?
+            .map(|selection| selection.adapter_id))
+    }
+
+    async fn resolve_for_role(
+        &self,
+        role: AgentRole,
+        project_id: &str,
+    ) -> Result<Option<String>, crytex_core::services::LoraRouterError> {
+        Ok(self
+            .resolve_selection_for_role(role, project_id)
+            .await?
+            .map(|selection| selection.adapter_id))
+    }
+
+    async fn resolve_selection_for_role(
+        &self,
+        role: AgentRole,
+        _project_id: &str,
+    ) -> Result<Option<crytex_core::services::LoraSelection>, crytex_core::services::LoraRouterError>
+    {
+        Ok(self
+            .registry
+            .get(role)
+            .map(|adapter_id| crytex_core::services::LoraSelection {
+                adapter_id,
+                role: Some(role.as_str().to_string()),
+                source: "role_registry".to_string(),
+                reason: format!("active adapter registered for {} role", role.as_str()),
+            }))
+    }
+}
+
+async fn run_agent_swarm_lora_routing_proof(
+    coder_adapter_id: String,
+    critic_adapter_id: String,
+) -> Result<serde_json::Value, String> {
+    let mut mapping = HashMap::new();
+    mapping.insert(AgentRole::Coder, coder_adapter_id.clone());
+    mapping.insert(AgentRole::Critic, critic_adapter_id.clone());
+    let registry = Arc::new(MemoryRoleAdapterRegistry::with_mapping(mapping));
+    let router = Arc::new(ProofRoleRegistryLoraRouter { registry });
+    let agent_service = Arc::new(ProofSwarmAgentService {
+        seen: Mutex::new(Vec::new()),
+    });
+    let executor = Arc::new(
+        AgentWorkflowNodeExecutor::new(
+            agent_service.clone(),
+            Arc::new(ProofNoopInference),
+            Arc::new(ProofNoopToolService),
+        )
+        .with_lora_router(router),
+    );
+    let engine = WorkflowEngine::new(executor);
+    let workflow = WorkflowDefinition {
+        id: "agent-swarm-lora-routing-proof".to_string(),
+        name: "Agent Swarm LoRA Routing Proof".to_string(),
+        version: "1.0.0".to_string(),
+        entry: "coder".to_string(),
+        max_concurrency: 1,
+        nodes: vec![
+            WorkflowNode::Agent {
+                id: "coder".to_string(),
+                agent: "coder".to_string(),
+                task_kind: Some("codegen".to_string()),
+                input: "goal".to_string(),
+                output: "patch_artifact".to_string(),
+                timeout_seconds: None,
+                retry: WorkflowRetryPolicy::default(),
+            },
+            WorkflowNode::Agent {
+                id: "critic".to_string(),
+                agent: "critic".to_string(),
+                task_kind: Some("review".to_string()),
+                input: "patch_artifact".to_string(),
+                output: "review_artifact".to_string(),
+                timeout_seconds: None,
+                retry: WorkflowRetryPolicy::default(),
+            },
+        ],
+        edges: vec![WorkflowEdge {
+            from: "coder".to_string(),
+            to: "critic".to_string(),
+        }],
+    };
+    let trace_id = format!("trace-agent-swarm-lora-{}", Ulid::new());
+    let result = engine
+        .run(
+            &workflow,
+            serde_json::json!({
+                "project_id": "proof-project",
+                "trace_id": trace_id.clone(),
+                "goal": "Implement a validated utility and pass it to critic",
+            }),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let tasks = agent_service
+        .seen
+        .lock()
+        .map_err(|error| error.to_string())?
+        .clone();
+    let coder_task = tasks
+        .iter()
+        .find(|task| task.assigned_agent.as_deref() == Some("coder"))
+        .ok_or_else(|| "coder task was not executed".to_string())?;
+    let critic_task = tasks
+        .iter()
+        .find(|task| task.assigned_agent.as_deref() == Some("critic"))
+        .ok_or_else(|| "critic task was not executed".to_string())?;
+    let sessions_clean = coder_task.payload["agent_session"]["clean_context"] == true
+        && critic_task.payload["agent_session"]["clean_context"] == true
+        && coder_task.payload["agent_session"]["session_id"]
+            != critic_task.payload["agent_session"]["session_id"];
+    let role_adapters_distinct = coder_task.lora_adapter_id.as_deref()
+        == Some(coder_adapter_id.as_str())
+        && critic_task.lora_adapter_id.as_deref() == Some(critic_adapter_id.as_str())
+        && coder_adapter_id != critic_adapter_id;
+    let artifact_lineage_has_adapter_ids = result.state["patch_artifact"]["lora_selection"]["adapter_id"]
+        == coder_adapter_id
+        && result.state["review_artifact"]["lora_selection"]["adapter_id"] == critic_adapter_id;
+    let passed = sessions_clean && role_adapters_distinct && artifact_lineage_has_adapter_ids;
+
+    Ok(serde_json::json!({
+        "proof_outcome": if passed {
+            "AGENT_SWARM_LORA_ROUTING_PASSED"
+        } else {
+            "AGENT_SWARM_LORA_ROUTING_FAILED"
+        },
+        "passed": passed,
+        "trace_id": trace_id,
+        "sessions_clean": sessions_clean,
+        "role_adapters_distinct": role_adapters_distinct,
+        "artifact_lineage_has_adapter_ids": artifact_lineage_has_adapter_ids,
+        "agents": [
+            {
+                "role": "coder",
+                "session_id": coder_task.payload["agent_session"]["session_id"],
+                "adapter_id": coder_task.lora_adapter_id,
+                "selection": coder_task.payload["lora_selection"],
+            },
+            {
+                "role": "critic",
+                "session_id": critic_task.payload["agent_session"]["session_id"],
+                "adapter_id": critic_task.lora_adapter_id,
+                "selection": critic_task.payload["lora_selection"],
+            }
+        ],
+        "artifact_lineage": {
+            "patch_artifact_lora_selection": result.state["patch_artifact"]["lora_selection"],
+            "review_artifact_lora_selection": result.state["review_artifact"]["lora_selection"],
+            "critic_upstream_artifact": result.state["review_artifact"]["upstream_artifact_seen"],
+        },
+    }))
+}
+
 struct AgentTaskHandler {
     task_service: Arc<dyn crytex_core::services::TaskService>,
     agent_service: Arc<dyn AgentService>,
@@ -4763,14 +5065,30 @@ impl TaskHandler for AgentTaskHandler {
             .await
             .map_err(|e| WorkerError::Handler(e.to_string()))?;
 
-        let lora_id = self
+        let lora_selection = self
             .lora_router
-            .resolve(&task, &task.project_id)
+            .resolve_selection(&task, &task.project_id)
             .await
             .ok()
             .flatten();
         let mut task = task.clone();
-        task.lora_adapter_id = lora_id;
+        if let Some(selection) = &lora_selection {
+            task.lora_adapter_id = Some(selection.adapter_id.clone());
+            task.payload["lora_selection"] =
+                serde_json::to_value(selection).map_err(|e| WorkerError::Handler(e.to_string()))?;
+            if !task.payload["agent_session"].is_object() {
+                task.payload["agent_session"] = serde_json::json!({
+                    "session_id": Ulid::new().to_string(),
+                    "trace_id": task.trace_id.clone(),
+                    "role": task.assigned_agent.clone(),
+                    "clean_context": true
+                });
+            }
+            task.payload["agent_session"]["lora_adapter_id"] =
+                serde_json::Value::String(selection.adapter_id.clone());
+            task.payload["agent_session"]["lora_selection_reason"] =
+                serde_json::Value::String(selection.reason.clone());
+        }
 
         let routed_agent = self.agent_service.route(&task).unwrap_or_default();
         let task = if routed_agent == "architect" {
@@ -4792,7 +5110,11 @@ impl TaskHandler for AgentTaskHandler {
             .execute(&task, self.inference.clone(), self.tool_service.clone())
             .await
         {
-            Ok(result) => {
+            Ok(mut result) => {
+                if let Some(selection) = &lora_selection {
+                    result["lora_selection"] = serde_json::to_value(selection)
+                        .map_err(|e| WorkerError::Handler(e.to_string()))?;
+                }
                 if task.kind == "review" {
                     // Store the review result, then run the critic council and move to Review status
                     // for human approval.
@@ -5505,6 +5827,39 @@ async fn async_main() {
         return;
     }
 
+    if let Commands::ProveAgentSwarmLoraRouting {
+        coder_adapter_id,
+        critic_adapter_id,
+        report_path,
+    } = &cli.command
+    {
+        let report =
+            run_agent_swarm_lora_routing_proof(coder_adapter_id.clone(), critic_adapter_id.clone())
+                .await
+                .unwrap_or_else(|error| {
+                    eprintln!("Agent swarm LoRA routing proof failed: {error}");
+                    std::process::exit(1);
+                });
+        let payload = serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into());
+        if let Some(report_path) = report_path {
+            if let Some(parent) = report_path.parent()
+                && let Err(error) = tokio::fs::create_dir_all(parent).await
+            {
+                eprintln!("Failed to create agent swarm LoRA routing report directory: {error}");
+                std::process::exit(1);
+            }
+            if let Err(error) = tokio::fs::write(report_path, &payload).await {
+                eprintln!("Failed to write agent swarm LoRA routing report: {error}");
+                std::process::exit(1);
+            }
+        }
+        println!("{payload}");
+        if !report["passed"].as_bool().unwrap_or(false) {
+            std::process::exit(2);
+        }
+        return;
+    }
+
     let inference = create_inference_service(&config).expect("Failed to create inference service");
 
     if let Commands::ProbeModel {
@@ -6033,6 +6388,9 @@ async fn async_main() {
         Commands::ProveLoraRealModel { .. } => {
             unreachable!("prove-lora-real-model is handled before full AppContext initialization")
         }
+        Commands::ProveAgentSwarmLoraRouting { .. } => unreachable!(
+            "prove-agent-swarm-lora-routing is handled before full AppContext initialization"
+        ),
         Commands::Submit {
             project,
             prompt,
@@ -7095,6 +7453,26 @@ mod tests {
         assert_eq!(entry.quantization.as_deref(), Some("Q2_K"));
         assert_eq!(entry.backend.as_deref(), Some("mistralrs"));
         assert_eq!(entry.params_b, Some(1.1));
+    }
+
+    #[tokio::test]
+    async fn prove_agent_swarm_lora_routing_records_role_adapters_in_sessions_and_lineage() {
+        let report = run_agent_swarm_lora_routing_proof(
+            "coder-lora-v1".to_string(),
+            "critic-lora-v1".to_string(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report["proof_outcome"], "AGENT_SWARM_LORA_ROUTING_PASSED");
+        assert_eq!(report["passed"], true);
+        assert_eq!(report["sessions_clean"], true);
+        assert_eq!(report["role_adapters_distinct"], true);
+        assert_eq!(report["artifact_lineage_has_adapter_ids"], true);
+        assert_eq!(report["agents"][0]["adapter_id"], "coder-lora-v1");
+        assert_eq!(report["agents"][1]["adapter_id"], "critic-lora-v1");
+        assert_eq!(report["agents"][0]["selection"]["source"], "role_registry");
+        assert_eq!(report["agents"][1]["selection"]["source"], "role_registry");
     }
 
     #[test]

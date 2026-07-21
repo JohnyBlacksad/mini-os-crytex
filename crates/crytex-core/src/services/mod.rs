@@ -70,7 +70,10 @@ pub use lora_evolution::{
     LoraBenchmarkDecision, LoraBenchmarkGate, LoraBenchmarkRequest, LoraEvolutionError,
     LoraEvolutionService, LoraEvolutionServiceImpl,
 };
-pub use lora_router::{LoraRouter, LoraRouterError, LoraRouterImpl};
+pub use lora_router::{
+    LoraRouter, LoraRouterError, LoraRouterImpl, LoraSelection, MemoryRoleAdapterRegistry,
+    RoleAdapterRegistry,
+};
 pub use lora_trainer::{
     LoraMetrics, LoraTrainer, LoraTrainingConfig, LoraTrainingError, LoraTrainingResult,
 };

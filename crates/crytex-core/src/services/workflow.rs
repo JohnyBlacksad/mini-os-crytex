@@ -797,25 +797,38 @@ impl WorkflowNodeExecutor for AgentWorkflowNodeExecutor {
     ) -> Result<WorkflowState, WorkflowError> {
         let mut task = Self::build_task(node, state)?;
 
-        if let Some(router) = &self.lora_router
+        let lora_selection = if let Some(router) = &self.lora_router
             && let Some(role) = task
                 .assigned_agent
                 .as_deref()
                 .and_then(AgentRole::from_agent)
-            && let Some(adapter_id) = router
-                .resolve_for_role(role, &task.project_id)
+            && let Some(selection) = router
+                .resolve_selection_for_role(role, &task.project_id)
                 .await
                 .map_err(|e| WorkflowError::Execution(e.to_string()))?
         {
-            task.lora_adapter_id = Some(adapter_id);
-        }
+            task.lora_adapter_id = Some(selection.adapter_id.clone());
+            task.payload["lora_selection"] = serde_json::to_value(&selection)
+                .map_err(|e| WorkflowError::Execution(e.to_string()))?;
+            task.payload["agent_session"]["lora_adapter_id"] =
+                serde_json::Value::String(selection.adapter_id.clone());
+            task.payload["agent_session"]["lora_selection_reason"] =
+                serde_json::Value::String(selection.reason.clone());
+            Some(selection)
+        } else {
+            None
+        };
 
-        let result = self
+        let mut result = self
             .agent_service
             .execute(&task, self.inference.clone(), self.tool_service.clone())
             .await
             .map_err(|e| WorkflowError::Execution(e.to_string()))?;
         validate_workflow_agent_result(&task, &result)?;
+        if let Some(selection) = lora_selection {
+            result["lora_selection"] = serde_json::to_value(&selection)
+                .map_err(|e| WorkflowError::Execution(e.to_string()))?;
+        }
         Ok(result)
     }
 }
@@ -1118,6 +1131,70 @@ task_kind = "codegen"
         ) -> Result<Option<String>, crate::services::LoraRouterError> {
             Ok((role == AgentRole::Coder).then_some("coder-lora-v1".to_string()))
         }
+
+        async fn resolve_selection_for_role(
+            &self,
+            role: AgentRole,
+            _project_id: &str,
+        ) -> Result<Option<crate::services::LoraSelection>, crate::services::LoraRouterError>
+        {
+            Ok(
+                (role == AgentRole::Coder).then_some(crate::services::LoraSelection {
+                    adapter_id: "coder-lora-v1".to_string(),
+                    role: Some("coder".to_string()),
+                    source: "role_registry".to_string(),
+                    reason: "active adapter registered for coder role".to_string(),
+                }),
+            )
+        }
+    }
+
+    struct RolePairLoraRouter;
+
+    #[async_trait::async_trait]
+    impl LoraRouter for RolePairLoraRouter {
+        async fn resolve(
+            &self,
+            _task: &Task,
+            _project_id: &str,
+        ) -> Result<Option<String>, crate::services::LoraRouterError> {
+            Ok(None)
+        }
+
+        async fn resolve_for_role(
+            &self,
+            role: AgentRole,
+            _project_id: &str,
+        ) -> Result<Option<String>, crate::services::LoraRouterError> {
+            Ok(match role {
+                AgentRole::Coder => Some("coder-lora-v1".to_string()),
+                AgentRole::Critic => Some("critic-lora-v1".to_string()),
+                _ => None,
+            })
+        }
+
+        async fn resolve_selection_for_role(
+            &self,
+            role: AgentRole,
+            _project_id: &str,
+        ) -> Result<Option<crate::services::LoraSelection>, crate::services::LoraRouterError>
+        {
+            Ok(match role {
+                AgentRole::Coder => Some(crate::services::LoraSelection {
+                    adapter_id: "coder-lora-v1".to_string(),
+                    role: Some("coder".to_string()),
+                    source: "role_registry".to_string(),
+                    reason: "active adapter registered for coder role".to_string(),
+                }),
+                AgentRole::Critic => Some(crate::services::LoraSelection {
+                    adapter_id: "critic-lora-v1".to_string(),
+                    role: Some("critic".to_string()),
+                    source: "role_registry".to_string(),
+                    reason: "active adapter registered for critic role".to_string(),
+                }),
+                _ => None,
+            })
+        }
     }
 
     struct NoopInference;
@@ -1224,6 +1301,16 @@ task_kind = "codegen"
         assert_eq!(output["agent_result"]["files_changed"][0], "src/lib.rs");
         let task = agent_service.seen.lock().unwrap().clone().unwrap();
         assert_eq!(task.lora_adapter_id.as_deref(), Some("coder-lora-v1"));
+        assert_eq!(
+            task.payload["lora_selection"]["adapter_id"],
+            "coder-lora-v1"
+        );
+        assert_eq!(task.payload["lora_selection"]["source"], "role_registry");
+        assert_eq!(
+            task.payload["agent_session"]["lora_adapter_id"],
+            "coder-lora-v1"
+        );
+        assert_eq!(output["lora_selection"]["adapter_id"], "coder-lora-v1");
         assert_eq!(
             task.payload["upstream_artifact"]["artifact"],
             "write minimal patch"
@@ -1369,6 +1456,91 @@ task_kind = "codegen"
         assert_eq!(
             result.state["patch_artifact"]["upstream_artifact_seen"],
             result.state["design_artifact"]
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_workflow_chain_routes_role_loras_into_sessions_and_artifact_lineage() {
+        let agent_service = Arc::new(ChainedAgentService {
+            seen: Mutex::new(Vec::new()),
+        });
+        let executor = Arc::new(
+            AgentWorkflowNodeExecutor::new(
+                agent_service.clone(),
+                Arc::new(NoopInference),
+                Arc::new(NoopToolService),
+            )
+            .with_lora_router(Arc::new(RolePairLoraRouter)),
+        );
+        let engine = WorkflowEngine::new(executor);
+        let workflow = WorkflowDefinition {
+            id: "agent-chain-lora".to_string(),
+            entry: "coder".to_string(),
+            max_concurrency: 1,
+            nodes: vec![
+                WorkflowNode::Agent {
+                    id: "coder".to_string(),
+                    agent: "coder".to_string(),
+                    task_kind: Some("codegen".to_string()),
+                    input: "task".to_string(),
+                    output: "patch_artifact".to_string(),
+                    timeout_seconds: None,
+                    retry: WorkflowRetryPolicy::default(),
+                },
+                WorkflowNode::Agent {
+                    id: "critic".to_string(),
+                    agent: "critic".to_string(),
+                    task_kind: Some("review".to_string()),
+                    input: "patch_artifact".to_string(),
+                    output: "review_artifact".to_string(),
+                    timeout_seconds: None,
+                    retry: WorkflowRetryPolicy::default(),
+                },
+            ],
+            edges: vec![edge("coder", "critic")],
+            ..Default::default()
+        };
+
+        let result = engine
+            .run(
+                &workflow,
+                serde_json::json!({
+                    "project_id": "p1",
+                    "trace_id": "trace-swarm-lora",
+                    "task": "implement a validated parser",
+                }),
+            )
+            .await
+            .unwrap();
+
+        let tasks = agent_service.seen.lock().unwrap().clone();
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].lora_adapter_id.as_deref(), Some("coder-lora-v1"));
+        assert_eq!(tasks[1].lora_adapter_id.as_deref(), Some("critic-lora-v1"));
+        assert_ne!(
+            tasks[0].payload["agent_session"]["session_id"],
+            tasks[1].payload["agent_session"]["session_id"]
+        );
+        assert_eq!(
+            tasks[0].payload["agent_session"]["lora_adapter_id"],
+            "coder-lora-v1"
+        );
+        assert_eq!(
+            tasks[1].payload["agent_session"]["lora_adapter_id"],
+            "critic-lora-v1"
+        );
+        assert_eq!(
+            result.state["patch_artifact"]["lora_selection"]["adapter_id"],
+            "coder-lora-v1"
+        );
+        assert_eq!(
+            result.state["review_artifact"]["lora_selection"]["adapter_id"],
+            "critic-lora-v1"
+        );
+        assert!(
+            result.state["review_artifact"]["lora_selection"]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("critic role"))
         );
     }
 
