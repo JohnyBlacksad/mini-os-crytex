@@ -69,6 +69,7 @@ use crytex_sandbox::SandboxOrchestrator;
 use crytex_storage::Storage;
 use crytex_tools::{Capability, ScanningToolService, ToolServiceImpl, TypedToolRegistry};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -270,6 +271,10 @@ enum Commands {
         rank: usize,
         #[arg(long, default_value = "8")]
         alpha: usize,
+        #[arg(long, default_value = "0.10")]
+        min_improvement_delta: f64,
+        #[arg(long, default_value = "1.0")]
+        max_overfit_gap: f64,
         #[arg(long, default_value = "180")]
         train_timeout_secs: u64,
         #[arg(long, default_value = "45")]
@@ -903,6 +908,8 @@ struct LoraEvolutionLoopProofRequest {
     epochs: usize,
     rank: usize,
     alpha: usize,
+    min_improvement_delta: f64,
+    max_overfit_gap: f64,
     train_timeout_secs: u64,
     generation_timeout_secs: u64,
 }
@@ -928,6 +935,7 @@ struct LoraEvolutionLoopProofReport {
     rollback_artifact_removed: bool,
     active_adapter_after_rollback: Option<String>,
     dataset_proof: serde_json::Value,
+    anti_garbage_proof: serde_json::Value,
     gates: Vec<KernelE2eProofGate>,
     passed: bool,
 }
@@ -952,6 +960,7 @@ struct LoraEvolutionLoopProofReportInput {
     rollback_artifact_path: Option<PathBuf>,
     active_adapter_after_rollback: Option<String>,
     dataset_proof: serde_json::Value,
+    anti_garbage_proof: serde_json::Value,
 }
 
 #[derive(Debug, Clone)]
@@ -1376,12 +1385,63 @@ impl LoraBenchmarkGate for ControlledRegressionLoraBenchmarkGate {
     }
 }
 
+fn normalized_fingerprint(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn training_duplicate_count(fingerprints: &[String]) -> usize {
+    let mut seen = HashSet::with_capacity(fingerprints.len());
+    fingerprints
+        .iter()
+        .filter(|fingerprint| !seen.insert(normalized_fingerprint(fingerprint)))
+        .count()
+}
+
+fn heldout_overlap_count(
+    training_fingerprints: &[String],
+    heldout_fingerprints: &[String],
+) -> usize {
+    let training = training_fingerprints
+        .iter()
+        .map(|fingerprint| normalized_fingerprint(fingerprint))
+        .collect::<HashSet<_>>();
+    heldout_fingerprints
+        .iter()
+        .filter(|fingerprint| training.contains(&normalized_fingerprint(fingerprint)))
+        .count()
+}
+
+fn loss_improvement_ratio(training_proof: &serde_json::Value) -> Option<f64> {
+    let pre = training_proof
+        .get("pre_validation_loss")
+        .and_then(serde_json::Value::as_f64)?;
+    let post = training_proof
+        .get("post_validation_loss")
+        .and_then(serde_json::Value::as_f64)?;
+    (pre > 0.0 && pre.is_finite() && post.is_finite()).then_some((pre - post) / pre)
+}
+
+fn overfit_gap(training_proof: &serde_json::Value) -> Option<f64> {
+    let train = training_proof
+        .get("post_train_loss")
+        .and_then(serde_json::Value::as_f64)?;
+    let validation = training_proof
+        .get("post_validation_loss")
+        .and_then(serde_json::Value::as_f64)?;
+    (train.is_finite() && validation.is_finite()).then_some(validation - train)
+}
+
 struct FastQualityLoraBenchmarkGate {
     gguf_path: PathBuf,
     heldout_cases: usize,
     rank: usize,
     alpha: usize,
     max_seq_len: usize,
+    min_improvement_delta: f64,
+    max_overfit_gap: f64,
     decision_metadata: Arc<std::sync::Mutex<Option<serde_json::Value>>>,
 }
 
@@ -1403,6 +1463,9 @@ impl LoraBenchmarkGate for FastQualityLoraBenchmarkGate {
             .get("learning_proven")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
+        let validation_improvement_ratio = loss_improvement_ratio(&training_proof).unwrap_or(0.0);
+        let post_overfit_gap = overfit_gap(&training_proof).unwrap_or(f64::INFINITY);
+        let mut heldout_fingerprints = Vec::with_capacity(self.heldout_cases);
         let mut per_case = Vec::with_capacity(self.heldout_cases);
         let mut improved_cases = 0usize;
         for idx in 0..self.heldout_cases {
@@ -1410,6 +1473,7 @@ impl LoraBenchmarkGate for FastQualityLoraBenchmarkGate {
                 "Held-out LoRA evolution scenario {idx}. Return the learned distillation marker."
             );
             let expected_answer = "CRYTEX_LORA_DISTILL_OK";
+            heldout_fingerprints.push(format!("{prompt} {expected_answer}"));
             let proof = crytex_inference_candle::score_gguf_lora_answer_quality(
                 crytex_inference_candle::GgufLoraQualityRequest {
                     gguf_path: &self.gguf_path,
@@ -1425,16 +1489,9 @@ impl LoraBenchmarkGate for FastQualityLoraBenchmarkGate {
             .map_err(|error| {
                 LoraEvolutionError::ValidationFailed("benchmark".into(), error.to_string())
             })?;
-            let validation_improved = training_proof
-                .get("post_validation_loss")
-                .and_then(serde_json::Value::as_f64)
-                .zip(
-                    training_proof
-                        .get("pre_validation_loss")
-                        .and_then(serde_json::Value::as_f64),
-                )
-                .is_some_and(|(post, pre)| post < pre);
-            let improved = proof.improved || validation_improved;
+            let quality_improved = proof.improved;
+            let improved =
+                quality_improved || validation_improvement_ratio >= self.min_improvement_delta;
             if improved {
                 improved_cases += 1;
             }
@@ -1444,6 +1501,7 @@ impl LoraBenchmarkGate for FastQualityLoraBenchmarkGate {
                 "challenger_passed": improved,
                 "baseline_score": 0.0,
                 "challenger_score": if improved { 1.0 } else { 0.0 },
+                "pass_reason": if quality_improved { "heldout_quality_improved" } else { "validation_loss_threshold_met" },
                 "quality": proof
             }));
         }
@@ -1452,7 +1510,64 @@ impl LoraBenchmarkGate for FastQualityLoraBenchmarkGate {
         } else {
             improved_cases as f64 / self.heldout_cases as f64
         };
-        let accepted = learning_proven && challenger_pass_rate > 0.0;
+        let leakage_overlap_count =
+            heldout_overlap_count(&request.training_fingerprints, &heldout_fingerprints);
+        let duplicate_count = training_duplicate_count(&request.training_fingerprints);
+        let low_information_count = request
+            .training_fingerprints
+            .iter()
+            .filter(|fingerprint| fingerprint.trim().chars().count() < 32)
+            .count();
+        let no_leakage = leakage_overlap_count == 0;
+        let heldout_isolated = no_leakage && !heldout_fingerprints.is_empty();
+        let overfit_ok = post_overfit_gap <= self.max_overfit_gap;
+        let min_improvement_met = validation_improvement_ratio >= self.min_improvement_delta
+            || challenger_pass_rate >= self.min_improvement_delta;
+        let dataset_quality_ok = duplicate_count == 0
+            && low_information_count == 0
+            && request.training_fingerprints.len() >= 50
+            && self.heldout_cases > 0;
+        let accepted = learning_proven
+            && challenger_pass_rate > 0.0
+            && no_leakage
+            && heldout_isolated
+            && overfit_ok
+            && min_improvement_met
+            && dataset_quality_ok;
+        let anti_garbage_proof = serde_json::json!({
+            "no_leakage": {
+                "passed": no_leakage,
+                "overlap_count": leakage_overlap_count,
+                "evidence": format!("{leakage_overlap_count} overlapping held-out fingerprints")
+            },
+            "heldout_isolated": {
+                "passed": heldout_isolated,
+                "heldout_fingerprint_count": heldout_fingerprints.len(),
+                "training_fingerprint_count": request.training_fingerprints.len(),
+                "evidence": "held-out prompts are generated outside TrainingExampleRepository and compared by normalized fingerprints"
+            },
+            "overfit_detection": {
+                "passed": overfit_ok,
+                "post_validation_train_gap": post_overfit_gap,
+                "max_allowed_gap": self.max_overfit_gap,
+                "evidence": format!("validation/train gap={post_overfit_gap:.4} <= max={:.4}", self.max_overfit_gap)
+            },
+            "min_improvement_threshold": {
+                "passed": min_improvement_met,
+                "validation_loss_improvement_ratio": validation_improvement_ratio,
+                "challenger_pass_rate_delta": challenger_pass_rate,
+                "min_required_delta": self.min_improvement_delta,
+                "evidence": format!("validation_delta={validation_improvement_ratio:.4}, pass_rate_delta={challenger_pass_rate:.4}, min_delta={:.4}", self.min_improvement_delta)
+            },
+            "dataset_quality_diagnostics": {
+                "passed": dataset_quality_ok,
+                "duplicate_fingerprints": duplicate_count,
+                "low_information_fingerprints": low_information_count,
+                "training_fingerprint_count": request.training_fingerprints.len(),
+                "counter_fingerprint_count": request.training_fingerprints.iter().filter(|fingerprint| fingerprint.contains("DO_NOT_LEARN_THIS")).count(),
+                "evidence": format!("duplicates={duplicate_count}, low_information={low_information_count}, training_fingerprints={}", request.training_fingerprints.len())
+            }
+        });
         let metadata = serde_json::json!({
             "challenger_adapter_id": request.challenger_adapter_id,
             "challenger_adapter_path": request.challenger_adapter_path,
@@ -1462,8 +1577,10 @@ impl LoraBenchmarkGate for FastQualityLoraBenchmarkGate {
             "delta_pass_rate": challenger_pass_rate,
             "per_case_comparison": per_case,
             "training_proof": training_proof,
+            "anti_garbage_proof": anti_garbage_proof,
             "leakage_check": {
-                "passed": true,
+                "passed": no_leakage,
+                "overlap_count": leakage_overlap_count,
                 "training_fingerprint_count": request.training_fingerprints.len()
             }
         });
@@ -1682,6 +1799,13 @@ fn proof_gate(name: &str, passed: bool, evidence: &str) -> KernelE2eProofGate {
     }
 }
 
+fn json_bool(value: &serde_json::Value, path: &[&str]) -> bool {
+    path.iter()
+        .try_fold(value, |current, key| current.get(*key))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
 fn build_lora_live_e2e_proof_report(input: LoraLiveE2eProofReportInput) -> LoraLiveE2eProofReport {
     let metadata = input.decision_metadata.unwrap_or_default();
     let ab_test = lora_ab_test_artifact_from_metadata(&metadata);
@@ -1857,6 +1981,17 @@ fn build_lora_evolution_loop_proof_report(
         .get("winner")
         .and_then(serde_json::Value::as_str)
         == Some("Challenger");
+    let no_leakage = json_bool(&input.anti_garbage_proof, &["no_leakage", "passed"]);
+    let heldout_isolated = json_bool(&input.anti_garbage_proof, &["heldout_isolated", "passed"]);
+    let overfit_ok = json_bool(&input.anti_garbage_proof, &["overfit_detection", "passed"]);
+    let min_improvement_met = json_bool(
+        &input.anti_garbage_proof,
+        &["min_improvement_threshold", "passed"],
+    );
+    let dataset_quality_ok = json_bool(
+        &input.anti_garbage_proof,
+        &["dataset_quality_diagnostics", "passed"],
+    );
     let gates = vec![
         proof_gate(
             "fifty_approved_tasks",
@@ -1889,6 +2024,51 @@ fn build_lora_evolution_loop_proof_report(
                 .promoted_adapter_id
                 .as_deref()
                 .unwrap_or("no promoted adapter"),
+        ),
+        proof_gate(
+            "no_training_heldout_leakage",
+            no_leakage,
+            input
+                .anti_garbage_proof
+                .pointer("/no_leakage/evidence")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("missing no-leakage diagnostics"),
+        ),
+        proof_gate(
+            "heldout_dataset_isolated",
+            heldout_isolated,
+            input
+                .anti_garbage_proof
+                .pointer("/heldout_isolated/evidence")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("missing held-out isolation diagnostics"),
+        ),
+        proof_gate(
+            "overfit_detection_passed",
+            overfit_ok,
+            input
+                .anti_garbage_proof
+                .pointer("/overfit_detection/evidence")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("missing overfit diagnostics"),
+        ),
+        proof_gate(
+            "min_improvement_threshold_met",
+            min_improvement_met,
+            input
+                .anti_garbage_proof
+                .pointer("/min_improvement_threshold/evidence")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("missing improvement threshold diagnostics"),
+        ),
+        proof_gate(
+            "dataset_quality_diagnostics_passed",
+            dataset_quality_ok,
+            input
+                .anti_garbage_proof
+                .pointer("/dataset_quality_diagnostics/evidence")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("missing dataset quality diagnostics"),
         ),
         proof_gate(
             "rollback_rejected_degraded_challenger",
@@ -1942,6 +2122,7 @@ fn build_lora_evolution_loop_proof_report(
         rollback_artifact_removed,
         active_adapter_after_rollback: input.active_adapter_after_rollback,
         dataset_proof: input.dataset_proof,
+        anti_garbage_proof: input.anti_garbage_proof,
         gates,
         passed,
     }
@@ -3286,6 +3467,8 @@ async fn run_lora_evolution_loop_proof(
         rank: request.rank,
         alpha: request.alpha,
         max_seq_len: request.max_seq_len,
+        min_improvement_delta: request.min_improvement_delta,
+        max_overfit_gap: request.max_overfit_gap,
         decision_metadata: promotion_metadata.clone(),
     });
     let training_config = LoraTrainingConfig {
@@ -3312,7 +3495,7 @@ async fn run_lora_evolution_loop_proof(
     )
     .with_threshold(request.approved_tasks)
     .with_validation_loss_threshold(f64::INFINITY)
-    .with_max_train_validation_loss_gap(f64::INFINITY)
+    .with_max_train_validation_loss_gap(request.max_overfit_gap)
     .with_training_config(training_config.clone())
     .with_training_job_repo(storage.clone())
     .with_benchmark_gate(promotion_gate);
@@ -3355,7 +3538,7 @@ async fn run_lora_evolution_loop_proof(
     )
     .with_threshold(request.approved_tasks)
     .with_validation_loss_threshold(f64::INFINITY)
-    .with_max_train_validation_loss_gap(f64::INFINITY)
+    .with_max_train_validation_loss_gap(request.max_overfit_gap)
     .with_training_config(training_config)
     .with_training_job_repo(storage.clone())
     .with_benchmark_gate(rollback_gate);
@@ -3409,6 +3592,18 @@ async fn run_lora_evolution_loop_proof(
         .iter()
         .filter(|example| example.reward == 0.0)
         .count();
+    let anti_garbage_proof = promotion_metadata
+        .get("anti_garbage_proof")
+        .cloned()
+        .unwrap_or_else(|| {
+            serde_json::json!({
+                "no_leakage": { "passed": false, "evidence": "missing anti-garbage diagnostics" },
+                "heldout_isolated": { "passed": false, "evidence": "missing anti-garbage diagnostics" },
+                "overfit_detection": { "passed": false, "evidence": "missing anti-garbage diagnostics" },
+                "min_improvement_threshold": { "passed": false, "evidence": "missing anti-garbage diagnostics" },
+                "dataset_quality_diagnostics": { "passed": false, "evidence": "missing anti-garbage diagnostics" }
+            })
+        });
 
     Ok(build_lora_evolution_loop_proof_report(
         LoraEvolutionLoopProofReportInput {
@@ -3429,6 +3624,7 @@ async fn run_lora_evolution_loop_proof(
             rollback_reason,
             rollback_artifact_path,
             active_adapter_after_rollback,
+            anti_garbage_proof,
             dataset_proof: serde_json::json!({
                 "approved_task_ids": task_proof.approved_task_ids,
                 "rejected_task_ids": task_proof.rejected_task_ids,
@@ -5103,6 +5299,8 @@ async fn async_main() {
         epochs,
         rank,
         alpha,
+        min_improvement_delta,
+        max_overfit_gap,
         train_timeout_secs,
         generation_timeout_secs,
         report_path,
@@ -5130,6 +5328,8 @@ async fn async_main() {
                 epochs: *epochs,
                 rank: *rank,
                 alpha: *alpha,
+                min_improvement_delta: *min_improvement_delta,
+                max_overfit_gap: *max_overfit_gap,
                 train_timeout_secs: *train_timeout_secs,
                 generation_timeout_secs: *generation_timeout_secs,
             },
@@ -7625,6 +7825,7 @@ mod tests {
                 "split": "train=50,counter=10,heldout=6",
                 "heldout_leakage": false
             }),
+            anti_garbage_proof: sample_anti_garbage_proof(true),
         });
 
         assert!(report.passed);
@@ -7667,6 +7868,7 @@ mod tests {
             rollback_artifact_path: Some(temp_dir.clone()),
             active_adapter_after_rollback: Some("codegen-v1".into()),
             dataset_proof: serde_json::json!({}),
+            anti_garbage_proof: sample_anti_garbage_proof(true),
         });
 
         assert!(!report.passed);
@@ -7677,6 +7879,78 @@ mod tests {
                 .any(|gate| gate.name == "rollback_removed_candidate_artifact" && !gate.passed)
         );
         std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[test]
+    fn lora_evolution_loop_report_fails_when_min_improvement_threshold_misses() {
+        let removed_path = std::env::temp_dir().join(format!("missing-{}", Ulid::new()));
+        let mut anti_garbage = sample_anti_garbage_proof(true);
+        anti_garbage["min_improvement_threshold"]["passed"] = serde_json::json!(false);
+        anti_garbage["min_improvement_threshold"]["evidence"] =
+            serde_json::json!("delta=0.0100 below min_delta=0.1000");
+
+        let report = build_lora_evolution_loop_proof_report(LoraEvolutionLoopProofReportInput {
+            trace_id: "trace-evolution-loop".into(),
+            gguf_path: "A:/models/tiny.gguf".into(),
+            project_id: "project-1".into(),
+            project_root: "A:/proof/project".into(),
+            approved_task_count: 50,
+            rejected_task_count: 10,
+            golden_example_count: 50,
+            counter_example_count: 10,
+            heldout_case_count: 6,
+            promoted_adapter_id: Some("codegen-v1".into()),
+            promoted_adapter_path: Some("A:/adapters/codegen-v1".into()),
+            promoted_adapter_active: true,
+            promoted_benchmark: serde_json::json!({
+                "winner": "Challenger",
+                "baseline_pass_rate": 0.0,
+                "challenger_pass_rate": 1.0,
+                "delta_pass_rate": 1.0
+            }),
+            rollback_candidate_id: Some("codegen-v2".into()),
+            rollback_reason: Some(
+                "benchmark gate rejected challenger: winner=Baseline, delta_pass_rate=-1.0000"
+                    .into(),
+            ),
+            rollback_artifact_path: Some(removed_path),
+            active_adapter_after_rollback: Some("codegen-v1".into()),
+            dataset_proof: serde_json::json!({}),
+            anti_garbage_proof: anti_garbage,
+        });
+
+        assert!(!report.passed);
+        assert!(
+            report
+                .gates
+                .iter()
+                .any(|gate| gate.name == "min_improvement_threshold_met" && !gate.passed)
+        );
+    }
+
+    fn sample_anti_garbage_proof(passed: bool) -> serde_json::Value {
+        serde_json::json!({
+            "no_leakage": {
+                "passed": passed,
+                "evidence": "0 overlapping held-out fingerprints"
+            },
+            "heldout_isolated": {
+                "passed": passed,
+                "evidence": "held-out JSONL is outside TrainingExampleRepository"
+            },
+            "overfit_detection": {
+                "passed": passed,
+                "evidence": "validation/train gap=0.1000 <= max=1.0000"
+            },
+            "min_improvement_threshold": {
+                "passed": passed,
+                "evidence": "delta=0.5000 >= min_delta=0.1000"
+            },
+            "dataset_quality_diagnostics": {
+                "passed": passed,
+                "evidence": "duplicates=0, low_information=0, counter_target_contamination=0"
+            }
+        })
     }
 
     #[test]
