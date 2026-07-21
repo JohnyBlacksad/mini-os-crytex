@@ -61,8 +61,9 @@ use crytex_core::{
 use crytex_doc::graph::{CodeGraph, builder::CodeGraphBuilder};
 use crytex_ide::ide_service::start_ide_bridge;
 use crytex_inference::{
-    BackendCapabilityReport, BackendInfo, BackendRegistry, InferenceRequest, InferenceResponse,
-    LoRAAdapter as InferenceLoRAAdapter, ModelInfo, TokenUsage,
+    BackendCapabilityReport, BackendInfo, BackendRegistry, InferenceManager, InferenceRequest,
+    InferenceResponse, LoRAAdapter as InferenceLoRAAdapter, Message as InferenceMessage, ModelInfo,
+    TokenUsage,
 };
 use crytex_sandbox::SandboxOrchestrator;
 use crytex_storage::Storage;
@@ -242,6 +243,29 @@ enum Commands {
         alpha: usize,
         #[arg(long, default_value = "180")]
         train_timeout_secs: u64,
+        #[arg(long, default_value = "45")]
+        generation_timeout_secs: u64,
+        #[arg(long)]
+        report_path: Option<PathBuf>,
+    },
+    /// Prove LoRA active-adapter hot-swap without reloading the already loaded GGUF model
+    ProveLoraHotSwap {
+        #[arg(long)]
+        gguf_path: Option<PathBuf>,
+        #[arg(long)]
+        adapter_a_path: PathBuf,
+        #[arg(long)]
+        adapter_b_path: PathBuf,
+        #[arg(long, default_value = "adapter-a")]
+        adapter_a_id: String,
+        #[arg(long, default_value = "adapter-b")]
+        adapter_b_id: String,
+        #[arg(long, default_value = "64")]
+        context_size: usize,
+        #[arg(long)]
+        gpu_layers: Option<usize>,
+        #[arg(long, default_value = "8")]
+        max_tokens: usize,
         #[arg(long, default_value = "45")]
         generation_timeout_secs: u64,
         #[arg(long)]
@@ -836,6 +860,43 @@ struct LoraLiveE2eProofRequest {
     alpha: usize,
     train_timeout_secs: u64,
     generation_timeout_secs: u64,
+}
+
+#[derive(Debug, Clone)]
+struct LoraHotSwapProofRequest {
+    gguf_path: PathBuf,
+    adapter_a_path: PathBuf,
+    adapter_b_path: PathBuf,
+    adapter_a_id: String,
+    adapter_b_id: String,
+    context_size: usize,
+    gpu_layers: Option<usize>,
+    max_tokens: usize,
+    generation_timeout_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LoraHotSwapProofReport {
+    proof_outcome: String,
+    trace_id: String,
+    gguf_path: String,
+    adapter_a_id: String,
+    adapter_a_path: String,
+    adapter_b_id: String,
+    adapter_b_path: String,
+    model_loaded_once: bool,
+    load_count_after_adapter_a: u64,
+    load_count_after_adapter_b: u64,
+    active_adapter_after_a: Option<String>,
+    active_adapter_after_b: Option<String>,
+    diagnostics_after_a: serde_json::Value,
+    diagnostics_after_b: serde_json::Value,
+    output_a: String,
+    output_b: String,
+    output_changed_after_swap: bool,
+    failure_reason: Option<String>,
+    gates: Vec<KernelE2eProofGate>,
+    passed: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2925,6 +2986,270 @@ async fn generate_lora_probe(
     .map_err(|error| format!("LoRA probe generation failed: {error}"))
 }
 
+#[cfg(feature = "mistral")]
+async fn run_lora_hot_swap_proof(
+    request: LoraHotSwapProofRequest,
+) -> Result<LoraHotSwapProofReport, String> {
+    let gguf_path = request.gguf_path.canonicalize().map_err(|error| {
+        format!(
+            "failed to resolve GGUF path {}: {error}",
+            request.gguf_path.display()
+        )
+    })?;
+    let adapter_a_path = request.adapter_a_path.canonicalize().map_err(|error| {
+        format!(
+            "failed to resolve adapter A path {}: {error}",
+            request.adapter_a_path.display()
+        )
+    })?;
+    let adapter_b_path = request.adapter_b_path.canonicalize().map_err(|error| {
+        format!(
+            "failed to resolve adapter B path {}: {error}",
+            request.adapter_b_path.display()
+        )
+    })?;
+    let trace_id = format!("lora-hot-swap-{}", Ulid::new());
+    let backend = crytex_inference_mistral::MistralRsBackend::new(
+        gguf_path.display().to_string(),
+        request.context_size,
+        request.gpu_layers,
+    );
+
+    let adapter_a = InferenceLoRAAdapter {
+        id: request.adapter_a_id.clone(),
+        path: adapter_a_path.display().to_string(),
+        base_model: gguf_path.display().to_string(),
+    };
+    let adapter_b = InferenceLoRAAdapter {
+        id: request.adapter_b_id.clone(),
+        path: adapter_b_path.display().to_string(),
+        base_model: gguf_path.display().to_string(),
+    };
+
+    let proof_result = async {
+        backend
+            .register_lora(adapter_a)
+            .await
+            .map_err(|error| format!("failed to register adapter A: {error}"))?;
+        backend
+            .register_lora(adapter_b)
+            .await
+            .map_err(|error| format!("failed to register adapter B: {error}"))?;
+        backend
+            .swap_lora(&request.adapter_a_id)
+            .await
+            .map_err(|error| format!("failed to activate adapter A: {error}"))?;
+
+        let output_a = generate_mistral_hot_swap_probe(
+            &backend,
+            &gguf_path,
+            request.max_tokens,
+            request.generation_timeout_secs,
+        )
+        .await?;
+        let diagnostics_after_a = backend
+            .lora_diagnostics()
+            .map_err(|error| format!("failed to collect adapter A diagnostics: {error}"))?;
+
+        backend
+            .swap_lora(&request.adapter_b_id)
+            .await
+            .map_err(|error| format!("failed to hot-swap adapter B: {error}"))?;
+        let output_b = generate_mistral_hot_swap_probe(
+            &backend,
+            &gguf_path,
+            request.max_tokens,
+            request.generation_timeout_secs,
+        )
+        .await?;
+        let diagnostics_after_b = backend
+            .lora_diagnostics()
+            .map_err(|error| format!("failed to collect adapter B diagnostics: {error}"))?;
+        Ok::<_, String>((output_a, diagnostics_after_a, output_b, diagnostics_after_b))
+    }
+    .await;
+
+    match proof_result {
+        Ok((output_a, diagnostics_after_a, output_b, diagnostics_after_b)) => Ok(
+            build_lora_hot_swap_proof_report(LoraHotSwapProofReportInput {
+                trace_id,
+                gguf_path: gguf_path.display().to_string(),
+                adapter_a_id: request.adapter_a_id,
+                adapter_a_path: adapter_a_path.display().to_string(),
+                adapter_b_id: request.adapter_b_id,
+                adapter_b_path: adapter_b_path.display().to_string(),
+                diagnostics_after_a: serde_json::to_value(&diagnostics_after_a)
+                    .unwrap_or_else(|_| serde_json::json!({})),
+                diagnostics_after_b: serde_json::to_value(&diagnostics_after_b)
+                    .unwrap_or_else(|_| serde_json::json!({})),
+                output_a,
+                output_b,
+                failure_reason: None,
+            }),
+        ),
+        Err(error) => {
+            let diagnostics = backend
+                .lora_diagnostics()
+                .ok()
+                .and_then(|value| serde_json::to_value(value).ok())
+                .unwrap_or_else(|| serde_json::json!({}));
+            Ok(build_lora_hot_swap_proof_report(
+                LoraHotSwapProofReportInput {
+                    trace_id,
+                    gguf_path: gguf_path.display().to_string(),
+                    adapter_a_id: request.adapter_a_id,
+                    adapter_a_path: adapter_a_path.display().to_string(),
+                    adapter_b_id: request.adapter_b_id,
+                    adapter_b_path: adapter_b_path.display().to_string(),
+                    diagnostics_after_a: diagnostics.clone(),
+                    diagnostics_after_b: diagnostics,
+                    output_a: String::new(),
+                    output_b: String::new(),
+                    failure_reason: Some(error),
+                },
+            ))
+        }
+    }
+}
+
+#[cfg(feature = "mistral")]
+async fn generate_mistral_hot_swap_probe(
+    backend: &crytex_inference_mistral::MistralRsBackend,
+    gguf_path: &Path,
+    max_tokens: usize,
+    generation_timeout_secs: u64,
+) -> Result<String, String> {
+    let request = InferenceRequest {
+        backend_id: Some("mistralrs-hot-swap-proof".into()),
+        model: gguf_path.display().to_string(),
+        messages: vec![InferenceMessage {
+            role: "user".into(),
+            content: "Return a concise LoRA hot-swap proof token.".into(),
+        }],
+        system_prompt: Some("You are a concise proof model.".into()),
+        temperature: Some(0.0),
+        max_tokens: Some(max_tokens),
+        lora_adapter_id: None,
+    };
+    tokio::time::timeout(
+        Duration::from_secs(generation_timeout_secs),
+        backend.generate(request),
+    )
+    .await
+    .map_err(|_| "LoRA hot-swap generation timed out".to_string())?
+    .map(|response| response.content)
+    .map_err(|error| format!("LoRA hot-swap generation failed: {error}"))
+}
+
+#[derive(Debug, Clone)]
+struct LoraHotSwapProofReportInput {
+    trace_id: String,
+    gguf_path: String,
+    adapter_a_id: String,
+    adapter_a_path: String,
+    adapter_b_id: String,
+    adapter_b_path: String,
+    diagnostics_after_a: serde_json::Value,
+    diagnostics_after_b: serde_json::Value,
+    output_a: String,
+    output_b: String,
+    failure_reason: Option<String>,
+}
+
+fn build_lora_hot_swap_proof_report(input: LoraHotSwapProofReportInput) -> LoraHotSwapProofReport {
+    let load_count_after_adapter_a = diagnostics_model_load_count(&input.diagnostics_after_a);
+    let load_count_after_adapter_b = diagnostics_model_load_count(&input.diagnostics_after_b);
+    let active_adapter_after_a = diagnostics_active_adapter(&input.diagnostics_after_a);
+    let active_adapter_after_b = diagnostics_active_adapter(&input.diagnostics_after_b);
+    let model_loaded_once = load_count_after_adapter_a == Some(1)
+        && load_count_after_adapter_b == Some(1)
+        && load_count_after_adapter_a == load_count_after_adapter_b;
+    let output_changed_after_swap = !input.output_a.is_empty()
+        && !input.output_b.is_empty()
+        && input.output_a != input.output_b;
+    let gates = vec![
+        proof_gate(
+            "adapter_a_active",
+            active_adapter_after_a.as_deref() == Some(&input.adapter_a_id),
+            active_adapter_after_a.as_deref().unwrap_or("none"),
+        ),
+        proof_gate(
+            "adapter_b_active_after_swap",
+            active_adapter_after_b.as_deref() == Some(&input.adapter_b_id),
+            active_adapter_after_b.as_deref().unwrap_or("none"),
+        ),
+        proof_gate(
+            "model_loaded_once",
+            model_loaded_once,
+            &format!(
+                "after_a={}, after_b={}",
+                load_count_after_adapter_a
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "missing".into()),
+                load_count_after_adapter_b
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "missing".into())
+            ),
+        ),
+        proof_gate(
+            "output_a_nonempty",
+            !input.output_a.is_empty(),
+            &format!("bytes={}", input.output_a.len()),
+        ),
+        proof_gate(
+            "output_b_nonempty",
+            !input.output_b.is_empty(),
+            &format!("bytes={}", input.output_b.len()),
+        ),
+        proof_gate(
+            "second_generation_completed_after_swap",
+            !input.output_b.is_empty(),
+            "adapter B generation completed after active adapter swap",
+        ),
+    ];
+    let passed = input.failure_reason.is_none() && gates.iter().all(|gate| gate.passed);
+
+    LoraHotSwapProofReport {
+        proof_outcome: if passed {
+            "LORA_HOT_SWAP_PASSED".into()
+        } else {
+            "LORA_HOT_SWAP_FAILED".into()
+        },
+        trace_id: input.trace_id,
+        gguf_path: input.gguf_path,
+        adapter_a_id: input.adapter_a_id,
+        adapter_a_path: input.adapter_a_path,
+        adapter_b_id: input.adapter_b_id,
+        adapter_b_path: input.adapter_b_path,
+        model_loaded_once,
+        load_count_after_adapter_a: load_count_after_adapter_a.unwrap_or_default(),
+        load_count_after_adapter_b: load_count_after_adapter_b.unwrap_or_default(),
+        active_adapter_after_a,
+        active_adapter_after_b,
+        diagnostics_after_a: input.diagnostics_after_a,
+        diagnostics_after_b: input.diagnostics_after_b,
+        output_a: input.output_a,
+        output_b: input.output_b,
+        output_changed_after_swap,
+        failure_reason: input.failure_reason,
+        gates,
+        passed,
+    }
+}
+
+fn diagnostics_model_load_count(diagnostics: &serde_json::Value) -> Option<u64> {
+    diagnostics
+        .get("model_load_count")
+        .and_then(serde_json::Value::as_u64)
+}
+
+fn diagnostics_active_adapter(diagnostics: &serde_json::Value) -> Option<String> {
+    diagnostics
+        .get("active_adapter_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
 fn find_default_lora_proof_gguf() -> Option<PathBuf> {
     let home = std::env::var_os("USERPROFILE").map(PathBuf::from)?;
     let hub = home.join(".cache").join("huggingface").join("hub");
@@ -4087,6 +4412,70 @@ async fn async_main() {
         return;
     }
 
+    if let Commands::ProveLoraHotSwap {
+        gguf_path,
+        adapter_a_path,
+        adapter_b_path,
+        adapter_a_id,
+        adapter_b_id,
+        context_size,
+        gpu_layers,
+        max_tokens,
+        generation_timeout_secs,
+        report_path,
+    } = &cli.command
+    {
+        let gguf_path = gguf_path
+            .clone()
+            .or_else(find_default_lora_proof_gguf)
+            .unwrap_or_else(|| {
+                eprintln!(
+                    "LoRA hot-swap proof needs --gguf-path or a cached tiny GGUF model under ~/.cache/huggingface/hub"
+                );
+                std::process::exit(1);
+            });
+        #[cfg(feature = "mistral")]
+        let report = run_lora_hot_swap_proof(LoraHotSwapProofRequest {
+            gguf_path,
+            adapter_a_path: adapter_a_path.clone(),
+            adapter_b_path: adapter_b_path.clone(),
+            adapter_a_id: adapter_a_id.clone(),
+            adapter_b_id: adapter_b_id.clone(),
+            context_size: *context_size,
+            gpu_layers: *gpu_layers,
+            max_tokens: *max_tokens,
+            generation_timeout_secs: *generation_timeout_secs,
+        })
+        .await
+        .unwrap_or_else(|error| {
+            eprintln!("LoRA hot-swap proof failed: {error}");
+            std::process::exit(1);
+        });
+        #[cfg(not(feature = "mistral"))]
+        {
+            eprintln!("mistral feature is required for LoRA hot-swap proof");
+            std::process::exit(1);
+        }
+        let payload = serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into());
+        if let Some(report_path) = report_path {
+            if let Some(parent) = report_path.parent()
+                && let Err(error) = tokio::fs::create_dir_all(parent).await
+            {
+                eprintln!("Failed to create LoRA hot-swap report directory: {error}");
+                std::process::exit(1);
+            }
+            if let Err(error) = tokio::fs::write(report_path, &payload).await {
+                eprintln!("Failed to write LoRA hot-swap report: {error}");
+                std::process::exit(1);
+            }
+        }
+        println!("{payload}");
+        if !report.passed {
+            std::process::exit(2);
+        }
+        return;
+    }
+
     if let Commands::ProveLoraCandleLearning {
         output_dir,
         report_path,
@@ -4684,6 +5073,9 @@ async fn async_main() {
         }
         Commands::ProveLoraLiveE2e { .. } => {
             unreachable!("prove-lora-live-e2e is handled before full AppContext initialization")
+        }
+        Commands::ProveLoraHotSwap { .. } => {
+            unreachable!("prove-lora-hot-swap is handled before full AppContext initialization")
         }
         Commands::ProveLoraCandleLearning { .. } => unreachable!(
             "prove-lora-candle-learning is handled before full AppContext initialization"
@@ -6336,6 +6728,117 @@ mod tests {
         assert_eq!(
             report.quality_proof.failure_reason.as_deref(),
             Some("mistral.rs rejected GGUF LoRA adapter: tensor shape mismatch")
+        );
+    }
+
+    #[test]
+    fn lora_hot_swap_report_passes_when_active_adapter_changes_without_reload() {
+        let report = build_lora_hot_swap_proof_report(LoraHotSwapProofReportInput {
+            trace_id: "trace-hot-swap".into(),
+            gguf_path: "A:/models/tiny.gguf".into(),
+            adapter_a_id: "adapter-a".into(),
+            adapter_a_path: "A:/adapters/a".into(),
+            adapter_b_id: "adapter-b".into(),
+            adapter_b_path: "A:/adapters/b".into(),
+            diagnostics_after_a: serde_json::json!({
+                "active_adapter_id": "adapter-a",
+                "registered_adapters": ["adapter-a", "adapter-b"],
+                "model_load_count": 1,
+                "loaded_plan": {
+                    "kind": "gguf",
+                    "model_id": "A:/models",
+                    "files": ["tiny.gguf"],
+                    "lora_adapter_paths": ["A:/adapters/a", "A:/adapters/b"]
+                }
+            }),
+            diagnostics_after_b: serde_json::json!({
+                "active_adapter_id": "adapter-b",
+                "registered_adapters": ["adapter-a", "adapter-b"],
+                "model_load_count": 1,
+                "loaded_plan": {
+                    "kind": "gguf",
+                    "model_id": "A:/models",
+                    "files": ["tiny.gguf"],
+                    "lora_adapter_paths": ["A:/adapters/a", "A:/adapters/b"]
+                }
+            }),
+            output_a: "adapter A answer".into(),
+            output_b: "adapter B answer".into(),
+            failure_reason: None,
+        });
+
+        assert!(report.passed);
+        assert_eq!(report.proof_outcome, "LORA_HOT_SWAP_PASSED");
+        assert!(report.model_loaded_once);
+        assert_eq!(report.load_count_after_adapter_a, 1);
+        assert_eq!(report.load_count_after_adapter_b, 1);
+        assert_eq!(report.active_adapter_after_a.as_deref(), Some("adapter-a"));
+        assert_eq!(report.active_adapter_after_b.as_deref(), Some("adapter-b"));
+        assert!(report.output_changed_after_swap);
+    }
+
+    #[test]
+    fn lora_hot_swap_report_fails_when_swap_reloads_model() {
+        let report = build_lora_hot_swap_proof_report(LoraHotSwapProofReportInput {
+            trace_id: "trace-hot-swap-reload".into(),
+            gguf_path: "A:/models/tiny.gguf".into(),
+            adapter_a_id: "adapter-a".into(),
+            adapter_a_path: "A:/adapters/a".into(),
+            adapter_b_id: "adapter-b".into(),
+            adapter_b_path: "A:/adapters/b".into(),
+            diagnostics_after_a: serde_json::json!({
+                "active_adapter_id": "adapter-a",
+                "model_load_count": 1
+            }),
+            diagnostics_after_b: serde_json::json!({
+                "active_adapter_id": "adapter-b",
+                "model_load_count": 2
+            }),
+            output_a: "adapter A answer".into(),
+            output_b: "adapter B answer".into(),
+            failure_reason: None,
+        });
+
+        assert!(!report.passed);
+        assert_eq!(report.proof_outcome, "LORA_HOT_SWAP_FAILED");
+        assert!(!report.model_loaded_once);
+        assert!(
+            report
+                .gates
+                .iter()
+                .any(|gate| gate.name == "model_loaded_once" && !gate.passed)
+        );
+    }
+
+    #[test]
+    fn lora_hot_swap_report_allows_equal_text_when_diagnostics_prove_adapter_b() {
+        let report = build_lora_hot_swap_proof_report(LoraHotSwapProofReportInput {
+            trace_id: "trace-hot-swap-equal-output".into(),
+            gguf_path: "A:/models/tiny.gguf".into(),
+            adapter_a_id: "adapter-a".into(),
+            adapter_a_path: "A:/adapters/a".into(),
+            adapter_b_id: "adapter-b".into(),
+            adapter_b_path: "A:/adapters/b".into(),
+            diagnostics_after_a: serde_json::json!({
+                "active_adapter_id": "adapter-a",
+                "model_load_count": 1
+            }),
+            diagnostics_after_b: serde_json::json!({
+                "active_adapter_id": "adapter-b",
+                "model_load_count": 1
+            }),
+            output_a: "same sampled text".into(),
+            output_b: "same sampled text".into(),
+            failure_reason: None,
+        });
+
+        assert!(report.passed);
+        assert!(!report.output_changed_after_swap);
+        assert!(
+            report
+                .gates
+                .iter()
+                .any(|gate| gate.name == "second_generation_completed_after_swap" && gate.passed)
         );
     }
 

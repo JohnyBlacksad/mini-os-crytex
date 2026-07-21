@@ -17,6 +17,7 @@ tokio = { version = "1", features = ["full"] }
 thiserror = "2.0"
 tracing = "0.1"
 serde_json = "1"
+serde = { version = "1", features = ["derive"] }
 mistralrs = "0.8.1"
 safetensors = "0.7"
 ulid = "1.1"

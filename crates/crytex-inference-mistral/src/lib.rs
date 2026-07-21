@@ -113,14 +113,15 @@ struct Inner {
     state: AsyncMutex<Option<LoadedModel>>,
     loras: Mutex<HashMap<String, LoRAAdapter>>,
     active_lora: Mutex<Option<String>>,
+    model_load_count: Mutex<u64>,
 }
 
 struct LoadedModel {
-    adapter_id: Option<String>,
+    load_plan: MistralLoadPlan,
     model: Arc<Model>,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 enum MistralLoadPlan {
     Plain {
         model_id: String,
@@ -154,6 +155,7 @@ impl MistralRsBackend {
                 state: AsyncMutex::new(None),
                 loras: Mutex::new(HashMap::new()),
                 active_lora: Mutex::new(None),
+                model_load_count: Mutex::new(0),
             }),
         }
     }
@@ -166,23 +168,30 @@ impl MistralRsBackend {
         &self,
         adapter_id: Option<String>,
     ) -> Result<Arc<Model>, InferenceError> {
+        let load_plan = self.load_plan(adapter_id.as_deref())?;
         let mut guard = self.inner.state.lock().await;
         if let Some(loaded) = guard.as_ref()
-            && loaded.adapter_id == adapter_id
+            && loaded.load_plan == load_plan
         {
             return Ok(loaded.model.clone());
         }
 
-        let model = Arc::new(self.load_model(adapter_id.clone()).await?);
+        let model = Arc::new(self.load_model(load_plan.clone()).await?);
         *guard = Some(LoadedModel {
-            adapter_id,
+            load_plan,
             model: model.clone(),
         });
         Ok(model)
     }
 
-    async fn load_model(&self, adapter_id: Option<String>) -> Result<Model, InferenceError> {
-        match self.load_plan(adapter_id.as_deref())? {
+    async fn load_model(&self, load_plan: MistralLoadPlan) -> Result<Model, InferenceError> {
+        {
+            let mut load_count = self.inner.model_load_count.lock().map_err(|e| {
+                InferenceError::GenerationFailed(format!("failed to lock model load count: {e}"))
+            })?;
+            *load_count += 1;
+        }
+        match load_plan {
             MistralLoadPlan::Plain {
                 model_id,
                 lora_adapter_paths,
@@ -227,14 +236,17 @@ impl MistralRsBackend {
         let loras = self.inner.loras.lock().map_err(|e| {
             InferenceError::LoRALoadFailed(format!("failed to lock LoRA registry: {e}"))
         })?;
-        loras
-            .get(adapter_id)
-            .map(|adapter| vec![adapter.path.clone()])
-            .ok_or_else(|| {
-                InferenceError::LoRALoadFailed(format!(
-                    "LoRA adapter {adapter_id} is not registered"
-                ))
-            })
+        if !loras.contains_key(adapter_id) {
+            return Err(InferenceError::LoRALoadFailed(format!(
+                "LoRA adapter {adapter_id} is not registered"
+            )));
+        }
+        let mut adapters = loras
+            .iter()
+            .map(|(id, adapter)| (id.clone(), adapter.path.clone()))
+            .collect::<Vec<_>>();
+        adapters.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(adapters.into_iter().map(|(_, path)| path).collect())
     }
 
     async fn load_gguf_model(
@@ -397,6 +409,75 @@ impl MistralRsBackend {
 
     fn supports_lora_capability(&self) -> bool {
         true
+    }
+
+    pub fn lora_diagnostics(&self) -> Result<MistralLoraDiagnostics, InferenceError> {
+        let active_adapter_id = self.active_adapter_name();
+        let registered_adapters = {
+            let loras = self.inner.loras.lock().map_err(|e| {
+                InferenceError::LoRALoadFailed(format!("failed to lock LoRA registry: {e}"))
+            })?;
+            let mut ids = loras.keys().cloned().collect::<Vec<_>>();
+            ids.sort();
+            ids
+        };
+        let loaded_plan = self
+            .inner
+            .state
+            .try_lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|loaded| loaded.load_plan.diagnostics()));
+        let model_load_count = *self.inner.model_load_count.lock().map_err(|e| {
+            InferenceError::GenerationFailed(format!("failed to lock model load count: {e}"))
+        })?;
+        Ok(MistralLoraDiagnostics {
+            active_adapter_id,
+            registered_adapters,
+            loaded_plan,
+            model_load_count,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct MistralLoraDiagnostics {
+    pub active_adapter_id: Option<String>,
+    pub registered_adapters: Vec<String>,
+    pub loaded_plan: Option<MistralLoadedPlanDiagnostics>,
+    pub model_load_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct MistralLoadedPlanDiagnostics {
+    pub kind: String,
+    pub model_id: String,
+    pub files: Vec<String>,
+    pub lora_adapter_paths: Vec<String>,
+}
+
+impl MistralLoadPlan {
+    fn diagnostics(&self) -> MistralLoadedPlanDiagnostics {
+        match self {
+            Self::Plain {
+                model_id,
+                lora_adapter_paths,
+            } => MistralLoadedPlanDiagnostics {
+                kind: "plain".into(),
+                model_id: model_id.clone(),
+                files: Vec::new(),
+                lora_adapter_paths: lora_adapter_paths.clone(),
+            },
+            Self::Gguf {
+                model_id,
+                files,
+                lora_adapter_paths,
+            } => MistralLoadedPlanDiagnostics {
+                kind: "gguf".into(),
+                model_id: model_id.clone(),
+                files: files.clone(),
+                lora_adapter_paths: lora_adapter_paths.clone(),
+            },
+        }
     }
 }
 
@@ -1247,6 +1328,74 @@ mod tests {
 
         let _ = tokio::fs::remove_dir_all(first_path).await;
         let _ = tokio::fs::remove_dir_all(second_path).await;
+    }
+
+    #[tokio::test]
+    async fn active_lora_swap_keeps_same_loaded_adapter_plan() {
+        let backend = MistralRsBackend::new("/tmp/model.gguf", 4096, None);
+        let first_path = valid_lora_adapter_path("first").await;
+        let second_path = valid_lora_adapter_path("second").await;
+        backend
+            .register_lora(LoRAAdapter {
+                id: "first".to_string(),
+                path: first_path.to_string_lossy().to_string(),
+                base_model: "mistral".to_string(),
+            })
+            .await
+            .unwrap();
+        backend
+            .register_lora(LoRAAdapter {
+                id: "second".to_string(),
+                path: second_path.to_string_lossy().to_string(),
+                base_model: "mistral".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let first_plan = backend.load_plan(Some("first")).unwrap();
+        let second_plan = backend.load_plan(Some("second")).unwrap();
+
+        assert_eq!(first_plan, second_plan);
+        match first_plan {
+            MistralLoadPlan::Gguf {
+                lora_adapter_paths, ..
+            } => {
+                assert_eq!(lora_adapter_paths.len(), 2);
+                assert_eq!(
+                    lora_adapter_paths,
+                    vec![
+                        first_path.to_string_lossy().to_string(),
+                        second_path.to_string_lossy().to_string()
+                    ]
+                );
+            }
+            other => panic!("expected GGUF LoRA load plan, got {other:?}"),
+        }
+
+        let _ = tokio::fs::remove_dir_all(first_path).await;
+        let _ = tokio::fs::remove_dir_all(second_path).await;
+    }
+
+    #[tokio::test]
+    async fn lora_diagnostics_reports_active_adapter_id() {
+        let backend = MistralRsBackend::new("/tmp/model.gguf", 4096, None);
+        let adapter_path = valid_lora_adapter_path("active").await;
+        backend
+            .register_lora(LoRAAdapter {
+                id: "active".to_string(),
+                path: adapter_path.to_string_lossy().to_string(),
+                base_model: "mistral".to_string(),
+            })
+            .await
+            .unwrap();
+
+        backend.swap_lora("active").await.unwrap();
+        let diagnostics = backend.lora_diagnostics().unwrap();
+
+        assert_eq!(diagnostics.active_adapter_id.as_deref(), Some("active"));
+        assert_eq!(diagnostics.registered_adapters, vec!["active".to_string()]);
+
+        let _ = tokio::fs::remove_dir_all(adapter_path).await;
     }
 
     #[tokio::test]
