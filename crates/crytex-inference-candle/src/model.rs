@@ -15,6 +15,7 @@ use candle_transformers::generation::{LogitsProcessor, Sampling};
 use candle_transformers::utils::repeat_kv;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::io::{Read, Seek};
 use std::path::Path;
 
 /// Configuration for the causal LM architecture and LoRA adapters.
@@ -90,10 +91,8 @@ impl ModelConfig {
 
     /// Load architecture hyper-parameters from a GGUF file's metadata.
     pub fn from_gguf(path: &Path) -> CandleResult<Self> {
-        use candle_core::quantized::gguf_file;
         let mut file = std::fs::File::open(path)?;
-        let content = gguf_file::Content::read(&mut file)?;
-        let m = &content.metadata;
+        let m = read_gguf_metadata_only(&mut file)?;
         let arch = m
             .get("general.architecture")
             .and_then(|v| v.to_string().ok())
@@ -151,6 +150,166 @@ impl ModelConfig {
     pub fn kv_hidden_size(&self) -> usize {
         self.num_key_value_heads * self.head_dim()
     }
+}
+
+fn read_gguf_metadata_only<R: Read + Seek>(
+    reader: &mut R,
+) -> CandleResult<HashMap<String, candle_core::quantized::gguf_file::Value>> {
+    let magic = read_u32_le(reader)?;
+    if !matches!(magic, 0x4655_4747 | 0x4747_5546) {
+        return Err(candle_core::Error::Msg(format!(
+            "gguf: unknown magic 0x{magic:08x}"
+        )));
+    }
+    let version = read_u32_le(reader)?;
+    if !matches!(version, 1..=3) {
+        return Err(candle_core::Error::Msg(format!(
+            "gguf: unsupported version {version}"
+        )));
+    }
+    let tensor_count = read_gguf_len(reader, version)?;
+    let metadata_count = read_gguf_len(reader, version)?;
+    let mut metadata = HashMap::new();
+    for _ in 0..metadata_count {
+        let key = read_gguf_string(reader, version)?;
+        let value_type = read_u32_le(reader)?;
+        let value = read_gguf_value(reader, version, value_type, 0)?;
+        metadata.insert(key, value);
+    }
+    tracing::debug!(
+        tensor_count,
+        metadata_count,
+        "read GGUF metadata without parsing tensor dtypes"
+    );
+    Ok(metadata)
+}
+
+fn read_gguf_value<R: Read + Seek>(
+    reader: &mut R,
+    version: u32,
+    value_type: u32,
+    depth: usize,
+) -> CandleResult<candle_core::quantized::gguf_file::Value> {
+    use candle_core::quantized::gguf_file::Value;
+    if depth > 64 {
+        return Err(candle_core::Error::Msg(
+            "gguf: metadata value nesting exceeds 64".into(),
+        ));
+    }
+    match value_type {
+        0 => Ok(Value::U8(read_u8(reader)?)),
+        1 => Ok(Value::I8(read_i8(reader)?)),
+        2 => Ok(Value::U16(read_u16_le(reader)?)),
+        3 => Ok(Value::I16(read_i16_le(reader)?)),
+        4 => Ok(Value::U32(read_u32_le(reader)?)),
+        5 => Ok(Value::I32(read_i32_le(reader)?)),
+        6 => Ok(Value::F32(read_f32_le(reader)?)),
+        7 => Ok(Value::Bool(match read_u8(reader)? {
+            0 => false,
+            1 => true,
+            other => {
+                return Err(candle_core::Error::Msg(format!(
+                    "gguf: invalid bool value {other}"
+                )));
+            }
+        })),
+        8 => Ok(Value::String(read_gguf_string(reader, version)?)),
+        9 => {
+            let inner_type = read_u32_le(reader)?;
+            let len = read_gguf_len(reader, version)?;
+            let mut values = Vec::with_capacity(len.min(1024) as usize);
+            for _ in 0..len {
+                values.push(read_gguf_value(reader, version, inner_type, depth + 1)?);
+            }
+            Ok(Value::Array(values))
+        }
+        10 => Ok(Value::U64(read_u64_le(reader)?)),
+        11 => Ok(Value::I64(read_i64_le(reader)?)),
+        12 => Ok(Value::F64(read_f64_le(reader)?)),
+        other => Err(candle_core::Error::Msg(format!(
+            "gguf: unrecognized metadata value type {other:#08x}"
+        ))),
+    }
+}
+
+fn read_gguf_len<R: Read>(reader: &mut R, version: u32) -> CandleResult<u64> {
+    match version {
+        1 => read_u32_le(reader).map(u64::from),
+        _ => read_u64_le(reader),
+    }
+}
+
+fn read_gguf_string<R: Read>(reader: &mut R, version: u32) -> CandleResult<String> {
+    let len = read_gguf_len(reader, version)?;
+    if len > (1 << 30) {
+        return Err(candle_core::Error::Msg(format!(
+            "gguf: string length {len} exceeds max"
+        )));
+    }
+    let mut bytes = vec![0u8; len as usize];
+    reader.read_exact(&mut bytes)?;
+    while bytes.last() == Some(&0) {
+        bytes.pop();
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn read_u8<R: Read>(reader: &mut R) -> CandleResult<u8> {
+    let mut bytes = [0u8; 1];
+    reader.read_exact(&mut bytes)?;
+    Ok(bytes[0])
+}
+
+fn read_i8<R: Read>(reader: &mut R) -> CandleResult<i8> {
+    Ok(read_u8(reader)? as i8)
+}
+
+fn read_u16_le<R: Read>(reader: &mut R) -> CandleResult<u16> {
+    let mut bytes = [0u8; 2];
+    reader.read_exact(&mut bytes)?;
+    Ok(u16::from_le_bytes(bytes))
+}
+
+fn read_i16_le<R: Read>(reader: &mut R) -> CandleResult<i16> {
+    let mut bytes = [0u8; 2];
+    reader.read_exact(&mut bytes)?;
+    Ok(i16::from_le_bytes(bytes))
+}
+
+fn read_u32_le<R: Read>(reader: &mut R) -> CandleResult<u32> {
+    let mut bytes = [0u8; 4];
+    reader.read_exact(&mut bytes)?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn read_i32_le<R: Read>(reader: &mut R) -> CandleResult<i32> {
+    let mut bytes = [0u8; 4];
+    reader.read_exact(&mut bytes)?;
+    Ok(i32::from_le_bytes(bytes))
+}
+
+fn read_u64_le<R: Read>(reader: &mut R) -> CandleResult<u64> {
+    let mut bytes = [0u8; 8];
+    reader.read_exact(&mut bytes)?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+fn read_i64_le<R: Read>(reader: &mut R) -> CandleResult<i64> {
+    let mut bytes = [0u8; 8];
+    reader.read_exact(&mut bytes)?;
+    Ok(i64::from_le_bytes(bytes))
+}
+
+fn read_f32_le<R: Read>(reader: &mut R) -> CandleResult<f32> {
+    let mut bytes = [0u8; 4];
+    reader.read_exact(&mut bytes)?;
+    Ok(f32::from_le_bytes(bytes))
+}
+
+fn read_f64_le<R: Read>(reader: &mut R) -> CandleResult<f64> {
+    let mut bytes = [0u8; 8];
+    reader.read_exact(&mut bytes)?;
+    Ok(f64::from_le_bytes(bytes))
 }
 
 #[derive(Debug, Deserialize)]
@@ -871,6 +1030,7 @@ fn flash_attention(
 mod tests {
     use super::*;
     use candle_nn::{AdamW, Optimizer, ParamsAdamW};
+    use std::io::Write;
 
     #[test]
     fn lora_linear_backward_step_updates_adapter_weight() {
@@ -963,5 +1123,61 @@ mod tests {
             .map(|(after, before)| (after - before).powi(2))
             .sum::<f32>();
         assert!(delta > 0.0, "expected model LoRA var update, got {delta}");
+    }
+
+    #[test]
+    fn gguf_metadata_reader_ignores_unknown_tensor_dtype() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unknown-dtype.gguf");
+        write_minimal_gguf_with_unknown_tensor_dtype(&path);
+
+        let cfg = ModelConfig::from_gguf(&path).unwrap();
+
+        assert_eq!(cfg.vocab_size, 32);
+        assert_eq!(cfg.hidden_size, 16);
+        assert_eq!(cfg.num_layers, 2);
+        assert_eq!(cfg.num_heads, 4);
+        assert_eq!(cfg.num_key_value_heads, 2);
+        assert_eq!(cfg.intermediate_size, 64);
+        assert_eq!(cfg.max_seq_len, 128);
+    }
+
+    fn write_minimal_gguf_with_unknown_tensor_dtype(path: &Path) {
+        let mut file = std::fs::File::create(path).unwrap();
+        file.write_all(&0x4655_4747u32.to_le_bytes()).unwrap();
+        file.write_all(&3u32.to_le_bytes()).unwrap();
+        file.write_all(&1u64.to_le_bytes()).unwrap();
+        file.write_all(&8u64.to_le_bytes()).unwrap();
+        write_metadata_string(&mut file, "general.architecture", "llama");
+        write_metadata_u32(&mut file, "llama.vocab_size", 32);
+        write_metadata_u32(&mut file, "llama.embedding_length", 16);
+        write_metadata_u32(&mut file, "llama.block_count", 2);
+        write_metadata_u32(&mut file, "llama.attention.head_count", 4);
+        write_metadata_u32(&mut file, "llama.attention.head_count_kv", 2);
+        write_metadata_u32(&mut file, "llama.feed_forward_length", 64);
+        write_metadata_u32(&mut file, "llama.context_length", 128);
+        write_gguf_string(&mut file, "token_embd.weight");
+        file.write_all(&2u32.to_le_bytes()).unwrap();
+        file.write_all(&16u64.to_le_bytes()).unwrap();
+        file.write_all(&32u64.to_le_bytes()).unwrap();
+        file.write_all(&20u32.to_le_bytes()).unwrap();
+        file.write_all(&0u64.to_le_bytes()).unwrap();
+    }
+
+    fn write_metadata_string(file: &mut std::fs::File, key: &str, value: &str) {
+        write_gguf_string(file, key);
+        file.write_all(&8u32.to_le_bytes()).unwrap();
+        write_gguf_string(file, value);
+    }
+
+    fn write_metadata_u32(file: &mut std::fs::File, key: &str, value: u32) {
+        write_gguf_string(file, key);
+        file.write_all(&4u32.to_le_bytes()).unwrap();
+        file.write_all(&value.to_le_bytes()).unwrap();
+    }
+
+    fn write_gguf_string(file: &mut std::fs::File, value: &str) {
+        file.write_all(&(value.len() as u64).to_le_bytes()).unwrap();
+        file.write_all(value.as_bytes()).unwrap();
     }
 }

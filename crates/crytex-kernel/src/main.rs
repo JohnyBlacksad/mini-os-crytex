@@ -726,6 +726,9 @@ struct LoraLiveE2eProofReport {
     proof_outcome: String,
     trace_id: String,
     gguf_path: String,
+    runtime_adapter_format: String,
+    runtime_application_proof: LoraRuntimeApplicationProof,
+    quality_proof: LoraQualityProofSummary,
     training_task_count: usize,
     heldout_case_count: usize,
     adapter_id: String,
@@ -753,6 +756,30 @@ struct LoraLiveE2eProofReport {
     overfit_gap: f64,
     gates: Vec<KernelE2eProofGate>,
     passed: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LoraRuntimeApplicationProof {
+    adapter_requested: bool,
+    adapter_registered: bool,
+    adapter_applied_in_mistralrs_request: bool,
+    baseline_output_nonempty: bool,
+    challenger_output_nonempty: bool,
+    output_changed_after_swap: bool,
+    failure_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LoraQualityProofSummary {
+    improved: bool,
+    learning_proven: bool,
+    heldout_challenger_won: bool,
+    no_training_leakage: bool,
+    overfit_gap_checked: bool,
+    baseline_pass_rate: f64,
+    challenger_pass_rate: f64,
+    delta_pass_rate: f64,
+    failure_reason: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1298,6 +1325,41 @@ fn build_lora_live_e2e_proof_report(input: LoraLiveE2eProofReportInput) -> LoraL
         output.variant == "challenger"
             && output.lora_adapter_id.as_deref() == Some(input.adapter_id.as_str())
     });
+    let heldout_challenger_won = ab_test.winner == "Challenger" && ab_test.delta_pass_rate > 0.0;
+    let overfit_gap_checked = overfit_gap.is_finite() && overfit_gap <= 1.0;
+    let runtime_application_proof = LoraRuntimeApplicationProof {
+        adapter_requested: !input.adapter_id.is_empty() && input.adapter_id != "unknown",
+        adapter_registered: input.adapter_registered,
+        adapter_applied_in_mistralrs_request: adapter_applied,
+        baseline_output_nonempty: !baseline_output.trim().is_empty(),
+        challenger_output_nonempty: !challenger_output.trim().is_empty(),
+        output_changed_after_swap,
+        failure_reason: lora_runtime_failure_reason(
+            adapter_applied,
+            &baseline_output,
+            &challenger_output,
+            input.failure_reason.as_deref(),
+        ),
+    };
+    let quality_failure_reason = lora_quality_failure_reason(
+        learning_proven,
+        heldout_challenger_won,
+        leakage_check_passed,
+        overfit_gap_checked,
+        input.failure_reason.as_deref(),
+        &ab_test,
+    );
+    let quality_proof = LoraQualityProofSummary {
+        improved: quality_failure_reason.is_none(),
+        learning_proven,
+        heldout_challenger_won,
+        no_training_leakage: leakage_check_passed,
+        overfit_gap_checked,
+        baseline_pass_rate: ab_test.baseline_pass_rate,
+        challenger_pass_rate: ab_test.challenger_pass_rate,
+        delta_pass_rate: ab_test.delta_pass_rate,
+        failure_reason: quality_failure_reason,
+    };
     let gates = vec![
         proof_gate(
             "real_gguf_path",
@@ -1330,7 +1392,7 @@ fn build_lora_live_e2e_proof_report(input: LoraLiveE2eProofReportInput) -> LoraL
         ),
         proof_gate(
             "heldout_challenger_won",
-            ab_test.winner == "Challenger" && ab_test.delta_pass_rate > 0.0,
+            heldout_challenger_won,
             &format!(
                 "winner={}, delta={:.4}, p_value={}",
                 ab_test.winner,
@@ -1348,7 +1410,7 @@ fn build_lora_live_e2e_proof_report(input: LoraLiveE2eProofReportInput) -> LoraL
         ),
         proof_gate(
             "overfit_gap_checked",
-            overfit_gap.is_finite() && overfit_gap <= 1.0,
+            overfit_gap_checked,
             &format!("gap={overfit_gap:.4}"),
         ),
     ];
@@ -1367,6 +1429,9 @@ fn build_lora_live_e2e_proof_report(input: LoraLiveE2eProofReportInput) -> LoraL
         },
         trace_id: input.trace_id,
         gguf_path: input.gguf_path,
+        runtime_adapter_format: "peft_safetensors_directory".into(),
+        runtime_application_proof,
+        quality_proof,
         training_task_count: input.training_task_count,
         heldout_case_count: input.heldout_case_count,
         adapter_id: input.adapter_id,
@@ -1395,6 +1460,61 @@ fn build_lora_live_e2e_proof_report(input: LoraLiveE2eProofReportInput) -> LoraL
         gates,
         passed,
     }
+}
+
+fn lora_runtime_failure_reason(
+    adapter_applied: bool,
+    baseline_output: &str,
+    challenger_output: &str,
+    upstream_failure: Option<&str>,
+) -> Option<String> {
+    if let Some(reason) = upstream_failure.filter(|_| !adapter_applied) {
+        return Some(reason.to_string());
+    }
+    if !adapter_applied {
+        return Some(
+            "challenger generation never reached mistral.rs with requested adapter id".into(),
+        );
+    }
+    if baseline_output.trim().is_empty() {
+        return Some("baseline generation produced an empty answer".into());
+    }
+    if challenger_output.trim().is_empty() {
+        return Some("challenger generation produced an empty answer".into());
+    }
+    None
+}
+
+fn lora_quality_failure_reason(
+    learning_proven: bool,
+    heldout_challenger_won: bool,
+    leakage_check_passed: bool,
+    overfit_gap_checked: bool,
+    upstream_failure: Option<&str>,
+    ab_test: &LoraAbTestArtifact,
+) -> Option<String> {
+    if let Some(reason) = upstream_failure {
+        return Some(reason.to_string());
+    }
+    if !learning_proven {
+        return Some("adapter training proof reports learning_proven=false".into());
+    }
+    if !heldout_challenger_won {
+        return Some(format!(
+            "held-out benchmark did not select challenger: winner={}, baseline_pass_rate={:.4}, challenger_pass_rate={:.4}, delta={:.4}",
+            ab_test.winner,
+            ab_test.baseline_pass_rate,
+            ab_test.challenger_pass_rate,
+            ab_test.delta_pass_rate
+        ));
+    }
+    if !leakage_check_passed {
+        return Some("held-out leakage check failed".into());
+    }
+    if !overfit_gap_checked {
+        return Some("validation/train overfit gap is missing or above threshold".into());
+    }
+    None
 }
 
 fn select_lora_representative_answers(
@@ -5892,6 +6012,22 @@ mod tests {
         assert_eq!(report.mc_nemar_p_value, Some(0.125));
         assert_eq!(report.bootstrap_ci, Some((-0.10, 0.60)));
         assert!(report.learning_proven);
+        assert!(report.runtime_application_proof.adapter_registered);
+        assert!(
+            report
+                .runtime_application_proof
+                .adapter_applied_in_mistralrs_request
+        );
+        assert!(report.runtime_application_proof.output_changed_after_swap);
+        assert!(!report.quality_proof.improved);
+        assert_eq!(report.quality_proof.challenger_pass_rate, 0.50);
+        assert!(
+            report
+                .quality_proof
+                .failure_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("benchmark gate rejected challenger"))
+        );
         assert_eq!(report.training_proof["kind"], "candle_lora_train_loop");
         assert_eq!(report.training_proof["learning_proven"], true);
         assert_eq!(report.per_case_comparison.len(), 1);
@@ -5963,6 +6099,96 @@ mod tests {
         assert_eq!(
             report.challenger_output,
             "challenger includes CRYTEX_LORA_DISTILL_OK"
+        );
+    }
+
+    #[test]
+    fn lora_live_e2e_report_separates_runtime_application_from_quality_failure() {
+        let metadata = serde_json::json!({
+            "winner": "Inconclusive",
+            "baseline_pass_rate": 0.0,
+            "challenger_pass_rate": 0.0,
+            "delta_pass_rate": 0.0,
+            "training_proof": {
+                "kind": "gguf_shape_initialized_adapter",
+                "learning_proven": false,
+                "reason": "GGUF path created shape-compatible tensors without causal-loss optimization"
+            },
+            "leakage_check": {
+                "passed": true,
+                "training_fingerprint_count": 50
+            }
+        });
+
+        let report = build_lora_live_e2e_proof_report(LoraLiveE2eProofReportInput {
+            trace_id: "trace-gguf-lora-runtime-ok-quality-failed".into(),
+            gguf_path: "A:/models/tiny.gguf".into(),
+            training_task_count: 50,
+            heldout_case_count: 6,
+            adapter_id: "codegen-v1".into(),
+            adapter_path: "A:/adapters/codegen-v1".into(),
+            adapter_registered: true,
+            baseline_output: "baseline raw answer".into(),
+            challenger_output: "different adapter raw answer".into(),
+            benchmark_outputs: vec![LoraProofOutput {
+                variant: "challenger".into(),
+                lora_adapter_id: Some("codegen-v1".into()),
+                content: "different adapter raw answer".into(),
+            }],
+            decision_metadata: Some(metadata),
+            train_loss: f64::NAN,
+            validation_loss: f64::NAN,
+            failure_reason: None,
+        });
+
+        assert!(!report.passed);
+        assert!(
+            report
+                .runtime_application_proof
+                .adapter_applied_in_mistralrs_request
+        );
+        assert!(report.runtime_application_proof.failure_reason.is_none());
+        assert!(report.output_changed_after_swap);
+        assert!(!report.quality_proof.improved);
+        assert_eq!(
+            report.quality_proof.failure_reason.as_deref(),
+            Some("adapter training proof reports learning_proven=false")
+        );
+    }
+
+    #[test]
+    fn lora_live_e2e_report_preserves_incompatible_gguf_failure_reason() {
+        let report = build_lora_live_e2e_proof_report(LoraLiveE2eProofReportInput {
+            trace_id: "trace-gguf-lora-incompatible".into(),
+            gguf_path: "A:/models/tiny.gguf".into(),
+            training_task_count: 50,
+            heldout_case_count: 6,
+            adapter_id: "codegen-v1".into(),
+            adapter_path: "A:/adapters/codegen-v1".into(),
+            adapter_registered: false,
+            baseline_output: "".into(),
+            challenger_output: "".into(),
+            benchmark_outputs: vec![],
+            decision_metadata: None,
+            train_loss: f64::NAN,
+            validation_loss: f64::NAN,
+            failure_reason: Some(
+                "mistral.rs rejected GGUF LoRA adapter: tensor shape mismatch".into(),
+            ),
+        });
+
+        assert!(
+            !report
+                .runtime_application_proof
+                .adapter_applied_in_mistralrs_request
+        );
+        assert_eq!(
+            report.runtime_application_proof.failure_reason.as_deref(),
+            Some("mistral.rs rejected GGUF LoRA adapter: tensor shape mismatch")
+        );
+        assert_eq!(
+            report.quality_proof.failure_reason.as_deref(),
+            Some("mistral.rs rejected GGUF LoRA adapter: tensor shape mismatch")
         );
     }
 
