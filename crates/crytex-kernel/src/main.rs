@@ -339,6 +339,11 @@ enum Commands {
         #[arg(long)]
         report_path: Option<PathBuf>,
     },
+    /// Prove orchestrator atomic decomposition, dependencies, criteria, and remediation gates
+    ProveOrchestratorQualityGate {
+        #[arg(long)]
+        report_path: Option<PathBuf>,
+    },
     /// Add or update a managed HuggingFace/local model entry
     AddModel {
         #[arg(short, long)]
@@ -755,6 +760,43 @@ struct KernelE2eProofGate {
     name: String,
     passed: bool,
     evidence: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct OrchestratorQualityTaskProof {
+    task_id: String,
+    title: String,
+    kind: String,
+    role: String,
+    title_chars: usize,
+    prompt_chars: usize,
+    acceptance_criteria_count: usize,
+    requires_input_artifact: bool,
+    requires_output_artifact: bool,
+    critic_feedback: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct OrchestratorQualityProofInput {
+    trace_id: String,
+    codegen_task_ids: Vec<String>,
+    remediation_task_ids: Vec<String>,
+    tasks: Vec<OrchestratorQualityTaskProof>,
+    serial_dependency_edges: usize,
+    retry_rejection_feedback: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct OrchestratorQualityProofReport {
+    proof_outcome: String,
+    trace_id: String,
+    codegen_task_ids: Vec<String>,
+    remediation_task_ids: Vec<String>,
+    serial_dependency_edges: usize,
+    retry_rejection_feedback: String,
+    tasks: Vec<OrchestratorQualityTaskProof>,
+    gates: Vec<KernelE2eProofGate>,
+    passed: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1861,6 +1903,104 @@ fn proof_gate(name: &str, passed: bool, evidence: &str) -> KernelE2eProofGate {
         name: name.to_string(),
         passed,
         evidence: evidence.to_string(),
+    }
+}
+
+impl OrchestratorQualityProofReport {
+    fn from_input(input: OrchestratorQualityProofInput) -> Self {
+        let codegen_count = input.codegen_task_ids.len();
+        let remediation_count = input.remediation_task_ids.len();
+        let bounded_tasks = input
+            .tasks
+            .iter()
+            .all(|task| task.title_chars <= 120 && task.prompt_chars <= 2_000);
+        let criteria_present = input
+            .tasks
+            .iter()
+            .all(|task| task.acceptance_criteria_count >= 2);
+        let output_artifacts_required =
+            input.tasks.iter().all(|task| task.requires_output_artifact);
+        let codegen_roles = ["architect", "coder", "qa", "security", "critic"]
+            .into_iter()
+            .all(|role| input.tasks.iter().any(|task| task.role == role));
+        let remediation_feedback_preserved = input
+            .tasks
+            .iter()
+            .filter(|task| input.remediation_task_ids.contains(&task.task_id))
+            .any(|task| task.critic_feedback.as_deref() == Some(&input.retry_rejection_feedback));
+        let remediation_requires_input = input
+            .tasks
+            .iter()
+            .filter(|task| input.remediation_task_ids.contains(&task.task_id))
+            .all(|task| task.requires_input_artifact);
+        let serial_edges_expected =
+            codegen_count.saturating_sub(1) + remediation_count.saturating_sub(1);
+        let gates = vec![
+            proof_gate(
+                "atomic_codegen_decomposition",
+                codegen_count == 5,
+                &format!("orchestrator created {codegen_count} codegen role tasks"),
+            ),
+            proof_gate(
+                "atomic_remediation_decomposition",
+                remediation_count == 4,
+                &format!("orchestrator created {remediation_count} remediation role tasks"),
+            ),
+            proof_gate(
+                "bounded_task_size",
+                bounded_tasks,
+                "every task title<=120 chars and prompt<=2000 chars",
+            ),
+            proof_gate(
+                "acceptance_criteria_present",
+                criteria_present,
+                "every task has role-specific acceptance criteria",
+            ),
+            proof_gate(
+                "role_coverage",
+                codegen_roles,
+                "architect/coder/qa/security/critic roles are present",
+            ),
+            proof_gate(
+                "serial_dependencies_present",
+                input.serial_dependency_edges >= serial_edges_expected,
+                &format!(
+                    "{} persisted serial edges, expected at least {serial_edges_expected}",
+                    input.serial_dependency_edges
+                ),
+            ),
+            proof_gate(
+                "output_artifact_required",
+                output_artifacts_required,
+                "every task declares requires_output_artifact=true",
+            ),
+            proof_gate(
+                "retry_feedback_preserved",
+                remediation_feedback_preserved,
+                &input.retry_rejection_feedback,
+            ),
+            proof_gate(
+                "remediation_requires_input_artifact",
+                remediation_requires_input,
+                "debug/remediation tasks require incoming rejected artifact/context",
+            ),
+        ];
+        let passed = gates.iter().all(|gate| gate.passed);
+        Self {
+            proof_outcome: if passed {
+                "ORCHESTRATOR_QUALITY_GATE_PASSED".into()
+            } else {
+                "ORCHESTRATOR_QUALITY_GATE_FAILED".into()
+            },
+            trace_id: input.trace_id,
+            codegen_task_ids: input.codegen_task_ids,
+            remediation_task_ids: input.remediation_task_ids,
+            serial_dependency_edges: input.serial_dependency_edges,
+            retry_rejection_feedback: input.retry_rejection_feedback,
+            tasks: input.tasks,
+            gates,
+            passed,
+        }
     }
 }
 
@@ -3006,6 +3146,163 @@ async fn run_kernel_e2e_proof_command(
         },
     )
     .await
+}
+
+async fn run_orchestrator_quality_gate_proof(
+    config: &CrytexConfig,
+) -> Result<OrchestratorQualityProofReport, String> {
+    let trace_id = format!("orchestrator-quality-{}", Ulid::new());
+    let proof_dir = config.paths.data_dir.join("proofs").join(&trace_id);
+    tokio::fs::create_dir_all(&proof_dir)
+        .await
+        .map_err(|error| format!("failed to create orchestrator proof dir: {error}"))?;
+    let db_path = proof_dir.join("orchestrator_quality.sqlite");
+    let storage = Arc::new(
+        Storage::new(&db_path.to_string_lossy())
+            .await
+            .map_err(|error| format!("failed to open orchestrator proof database: {error}"))?,
+    );
+    let persistence: Arc<dyn Persistence> = storage.clone();
+    let event_service = Arc::new(EventServiceImpl::new(
+        Arc::new(crytex_core::EventBus::new()),
+    ));
+    let audit_service: Arc<dyn crytex_core::services::AuditLogService> = Arc::new(
+        BulkAuditLogService::new(storage.clone(), proof_dir.join("logs")),
+    );
+    let project_service: Arc<dyn ProjectService> =
+        Arc::new(ProjectServiceImpl::new(storage.clone()));
+    let task_service: Arc<dyn crytex_core::services::TaskService> = Arc::new(TaskServiceImpl::new(
+        storage.clone(),
+        event_service,
+        audit_service,
+    ));
+    let project_root = proof_dir.join("workspace");
+    tokio::fs::create_dir_all(&project_root)
+        .await
+        .map_err(|error| format!("failed to create orchestrator proof workspace: {error}"))?;
+    let project = project_service
+        .create(CreateProjectRequest {
+            name: "Orchestrator Quality Gate Proof",
+            root_path: &project_root,
+        })
+        .await
+        .map_err(|error| format!("failed to create orchestrator proof project: {error}"))?;
+    let goal_prompt = "Build a deterministic Rust utility with implementation, tests, security review, and critic evidence. Keep each task atomic.";
+    let parent = task_service
+        .submit(CreateTaskRequest {
+            project_id: project.id.clone(),
+            parent_id: None,
+            title: goal_prompt.to_string(),
+            description: Some(goal_prompt.to_string()),
+            kind: "codegen".into(),
+            assigned_agent: Some("architect".into()),
+            priority: 10,
+            payload: serde_json::json!({
+                "prompt": goal_prompt,
+                "quality_gate": "atomic_decomposition"
+            }),
+            trace_id: Some(trace_id.clone()),
+        })
+        .await
+        .map_err(|error| format!("failed to submit orchestrator proof parent: {error}"))?;
+    let orchestrator = OrchestratorImpl::new(task_service.clone());
+    let codegen_tasks = orchestrator
+        .orchestrate(&parent)
+        .await
+        .map_err(|error| format!("failed to orchestrate codegen proof task: {error}"))?;
+    let rejection_feedback = "critic rejected: missing deterministic regression evidence";
+    let debug_parent = task_service
+        .submit(CreateTaskRequest {
+            project_id: project.id,
+            parent_id: Some(parent.id),
+            title: "Remediate critic rejection".into(),
+            description: Some("Create remediation chain from critic feedback".into()),
+            kind: "debug".into(),
+            assigned_agent: Some("coder".into()),
+            priority: 10,
+            payload: serde_json::json!({
+                "prompt": "repair rejected implementation",
+                "source": "reviewer_rejection",
+                "reviewer_task_id": "critic-review-proof",
+                "feedback": rejection_feedback
+            }),
+            trace_id: Some(trace_id.clone()),
+        })
+        .await
+        .map_err(|error| format!("failed to submit orchestrator debug parent: {error}"))?;
+    let remediation_tasks = orchestrator
+        .orchestrate(&debug_parent)
+        .await
+        .map_err(|error| format!("failed to orchestrate remediation proof task: {error}"))?;
+    let dependencies = persistence
+        .list_dependencies()
+        .await
+        .map_err(|error| format!("failed to list proof dependencies: {error}"))?;
+    let serial_dependency_edges = dependencies
+        .iter()
+        .filter(|dep| dep.dep_type == "serial")
+        .count();
+    let codegen_task_ids = codegen_tasks
+        .iter()
+        .map(|task| task.id.clone())
+        .collect::<Vec<_>>();
+    let remediation_task_ids = remediation_tasks
+        .iter()
+        .map(|task| task.id.clone())
+        .collect::<Vec<_>>();
+    let tasks = codegen_tasks
+        .iter()
+        .chain(remediation_tasks.iter())
+        .map(orchestrator_quality_task_proof)
+        .collect::<Vec<_>>();
+
+    Ok(OrchestratorQualityProofReport::from_input(
+        OrchestratorQualityProofInput {
+            trace_id,
+            codegen_task_ids,
+            remediation_task_ids,
+            tasks,
+            serial_dependency_edges,
+            retry_rejection_feedback: rejection_feedback.into(),
+        },
+    ))
+}
+
+fn orchestrator_quality_task_proof(task: &Task) -> OrchestratorQualityTaskProof {
+    let quality = &task.payload["orchestration_quality"];
+    let prompt_chars = task
+        .payload
+        .get("prompt")
+        .and_then(serde_json::Value::as_str)
+        .map(str::chars)
+        .map(Iterator::count)
+        .unwrap_or_default();
+    OrchestratorQualityTaskProof {
+        task_id: task.id.clone(),
+        title: task.title.clone(),
+        kind: task.kind.clone(),
+        role: task.assigned_agent.clone().unwrap_or_default(),
+        title_chars: task.title.chars().count(),
+        prompt_chars,
+        acceptance_criteria_count: quality
+            .get("acceptance_criteria")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len)
+            .unwrap_or_default(),
+        requires_input_artifact: quality
+            .pointer("/handoff_contract/requires_input_artifact")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        requires_output_artifact: quality
+            .pointer("/handoff_contract/requires_output_artifact")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        critic_feedback: task
+            .payload
+            .pointer("/critic_report/feedback")
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string),
+    }
 }
 
 fn create_kernel_live_inference(
@@ -5952,6 +6249,33 @@ async fn async_main() {
         return;
     }
 
+    if let Commands::ProveOrchestratorQualityGate { report_path } = &cli.command {
+        let report = run_orchestrator_quality_gate_proof(&config)
+            .await
+            .unwrap_or_else(|error| {
+                eprintln!("Orchestrator quality gate proof failed: {error}");
+                std::process::exit(1);
+            });
+        let payload = serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into());
+        if let Some(report_path) = report_path {
+            if let Some(parent) = report_path.parent()
+                && let Err(error) = tokio::fs::create_dir_all(parent).await
+            {
+                eprintln!("Failed to create orchestrator quality gate report directory: {error}");
+                std::process::exit(1);
+            }
+            if let Err(error) = tokio::fs::write(report_path, &payload).await {
+                eprintln!("Failed to write orchestrator quality gate report: {error}");
+                std::process::exit(1);
+            }
+        }
+        println!("{payload}");
+        if !report.passed {
+            std::process::exit(2);
+        }
+        return;
+    }
+
     let inference = create_inference_service(&config).expect("Failed to create inference service");
 
     if let Commands::ProbeModel {
@@ -6482,6 +6806,9 @@ async fn async_main() {
         }
         Commands::ProveAgentSwarmLoraRouting { .. } => unreachable!(
             "prove-agent-swarm-lora-routing is handled before full AppContext initialization"
+        ),
+        Commands::ProveOrchestratorQualityGate { .. } => unreachable!(
+            "prove-orchestrator-quality-gate is handled before full AppContext initialization"
         ),
         Commands::Submit {
             project,
@@ -7874,6 +8201,182 @@ mod tests {
                 .gates
                 .iter()
                 .any(|gate| gate.name == "prompt_evolution_proved" && !gate.passed)
+        );
+    }
+
+    #[test]
+    fn orchestrator_quality_gate_report_requires_atomic_tasks_dependencies_and_remediation() {
+        let tasks = vec![
+            OrchestratorQualityTaskProof {
+                task_id: "architect-1".into(),
+                title: "architecture: build utility".into(),
+                kind: "architecture".into(),
+                role: "architect".into(),
+                title_chars: 27,
+                prompt_chars: 120,
+                acceptance_criteria_count: 4,
+                requires_input_artifact: false,
+                requires_output_artifact: true,
+                critic_feedback: None,
+            },
+            OrchestratorQualityTaskProof {
+                task_id: "coder-1".into(),
+                title: "codegen: build utility".into(),
+                kind: "codegen".into(),
+                role: "coder".into(),
+                title_chars: 22,
+                prompt_chars: 120,
+                acceptance_criteria_count: 4,
+                requires_input_artifact: true,
+                requires_output_artifact: true,
+                critic_feedback: None,
+            },
+            OrchestratorQualityTaskProof {
+                task_id: "qa-1".into(),
+                title: "qa: build utility".into(),
+                kind: "qa".into(),
+                role: "qa".into(),
+                title_chars: 17,
+                prompt_chars: 120,
+                acceptance_criteria_count: 3,
+                requires_input_artifact: true,
+                requires_output_artifact: true,
+                critic_feedback: None,
+            },
+            OrchestratorQualityTaskProof {
+                task_id: "security-1".into(),
+                title: "security: build utility".into(),
+                kind: "security".into(),
+                role: "security".into(),
+                title_chars: 23,
+                prompt_chars: 120,
+                acceptance_criteria_count: 3,
+                requires_input_artifact: true,
+                requires_output_artifact: true,
+                critic_feedback: None,
+            },
+            OrchestratorQualityTaskProof {
+                task_id: "critic-1".into(),
+                title: "review: build utility".into(),
+                kind: "review".into(),
+                role: "critic".into(),
+                title_chars: 21,
+                prompt_chars: 120,
+                acceptance_criteria_count: 3,
+                requires_input_artifact: true,
+                requires_output_artifact: true,
+                critic_feedback: None,
+            },
+            OrchestratorQualityTaskProof {
+                task_id: "debug-1".into(),
+                title: "debug: remediate".into(),
+                kind: "debug".into(),
+                role: "coder".into(),
+                title_chars: 16,
+                prompt_chars: 80,
+                acceptance_criteria_count: 4,
+                requires_input_artifact: true,
+                requires_output_artifact: true,
+                critic_feedback: Some(
+                    "critic rejected: missing deterministic regression evidence".into(),
+                ),
+            },
+            OrchestratorQualityTaskProof {
+                task_id: "fix-1".into(),
+                title: "fix: remediate".into(),
+                kind: "codegen".into(),
+                role: "coder".into(),
+                title_chars: 14,
+                prompt_chars: 80,
+                acceptance_criteria_count: 4,
+                requires_input_artifact: true,
+                requires_output_artifact: true,
+                critic_feedback: Some(
+                    "critic rejected: missing deterministic regression evidence".into(),
+                ),
+            },
+            OrchestratorQualityTaskProof {
+                task_id: "debug-qa-1".into(),
+                title: "qa: remediate".into(),
+                kind: "qa".into(),
+                role: "qa".into(),
+                title_chars: 13,
+                prompt_chars: 80,
+                acceptance_criteria_count: 3,
+                requires_input_artifact: true,
+                requires_output_artifact: true,
+                critic_feedback: Some(
+                    "critic rejected: missing deterministic regression evidence".into(),
+                ),
+            },
+            OrchestratorQualityTaskProof {
+                task_id: "debug-critic-1".into(),
+                title: "critic: remediate".into(),
+                kind: "review".into(),
+                role: "critic".into(),
+                title_chars: 17,
+                prompt_chars: 80,
+                acceptance_criteria_count: 3,
+                requires_input_artifact: true,
+                requires_output_artifact: true,
+                critic_feedback: Some(
+                    "critic rejected: missing deterministic regression evidence".into(),
+                ),
+            },
+        ];
+        let report = OrchestratorQualityProofReport::from_input(OrchestratorQualityProofInput {
+            trace_id: "trace-orchestrator-quality".into(),
+            codegen_task_ids: vec![
+                "architect-1".into(),
+                "coder-1".into(),
+                "qa-1".into(),
+                "security-1".into(),
+                "critic-1".into(),
+            ],
+            remediation_task_ids: vec![
+                "debug-1".into(),
+                "fix-1".into(),
+                "debug-qa-1".into(),
+                "debug-critic-1".into(),
+            ],
+            tasks,
+            serial_dependency_edges: 7,
+            retry_rejection_feedback: "critic rejected: missing deterministic regression evidence"
+                .into(),
+        });
+
+        assert!(report.passed);
+        assert_eq!(report.proof_outcome, "ORCHESTRATOR_QUALITY_GATE_PASSED");
+        assert!(
+            report
+                .gates
+                .iter()
+                .any(|gate| gate.name == "serial_dependencies_present" && gate.passed)
+        );
+        assert!(
+            report
+                .gates
+                .iter()
+                .any(|gate| gate.name == "retry_feedback_preserved" && gate.passed)
+        );
+
+        let failed = OrchestratorQualityProofReport::from_input(OrchestratorQualityProofInput {
+            serial_dependency_edges: 0,
+            ..OrchestratorQualityProofInput {
+                trace_id: report.trace_id,
+                codegen_task_ids: report.codegen_task_ids,
+                remediation_task_ids: report.remediation_task_ids,
+                tasks: report.tasks,
+                serial_dependency_edges: report.serial_dependency_edges,
+                retry_rejection_feedback: report.retry_rejection_feedback,
+            }
+        });
+        assert!(!failed.passed);
+        assert!(
+            failed
+                .gates
+                .iter()
+                .any(|gate| gate.name == "serial_dependencies_present" && !gate.passed)
         );
     }
 

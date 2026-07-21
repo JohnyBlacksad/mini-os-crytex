@@ -15,6 +15,9 @@ use crate::services::{
     WorkflowNodeExecutor, WorkflowRepository,
 };
 
+const MAX_ATOMIC_TITLE_CHARS: usize = 120;
+const MAX_ATOMIC_PROMPT_CHARS: usize = 2_000;
+
 /// Errors returned by the orchestrator.
 #[derive(Debug, Error)]
 pub enum OrchestratorError {
@@ -202,6 +205,107 @@ impl OrchestratorImpl {
         self
     }
 
+    fn atomic_title(title: &str) -> String {
+        title
+            .chars()
+            .take(MAX_ATOMIC_TITLE_CHARS)
+            .collect::<String>()
+    }
+
+    fn atomic_prompt(prompt: Value) -> Value {
+        prompt.as_str().map_or(prompt.clone(), |text| {
+            Value::String(
+                text.chars()
+                    .take(MAX_ATOMIC_PROMPT_CHARS)
+                    .collect::<String>(),
+            )
+        })
+    }
+
+    fn acceptance_criteria(agent: &str, kind: &str) -> Vec<&'static str> {
+        match (agent, kind) {
+            ("architect", _) => vec![
+                "produce an atomic task plan",
+                "declare artifact handoff requirements",
+                "include acceptance criteria for downstream agents",
+            ],
+            ("coder", "debug") => vec![
+                "reproduce the critic or human rejection",
+                "identify the smallest failing behavior",
+                "produce a fix artifact linked to the rejected task",
+            ],
+            ("coder", _) => vec![
+                "change only files needed for this task",
+                "include implementation evidence",
+                "describe tests or validation performed",
+            ],
+            ("qa", _) => vec![
+                "validate the incoming artifact",
+                "record concrete test evidence",
+                "flag regressions with reproduction steps",
+            ],
+            ("security", _) => vec![
+                "review security-sensitive changes",
+                "record risk level and mitigation",
+                "block unsafe or unreviewed behavior",
+            ],
+            ("critic", _) => vec![
+                "return pass or reject decision",
+                "include blocking issues when rejecting",
+                "explain remediation required for each rejection",
+            ],
+            _ => vec![
+                "complete the assigned atomic scope",
+                "return a structured artifact",
+                "include validation evidence",
+            ],
+        }
+    }
+
+    fn enrich_stage_payload(
+        parent: &Task,
+        mut payload: Value,
+        node_id: &str,
+        agent: &str,
+        kind: &str,
+        prompt: Value,
+        position: usize,
+    ) -> Value {
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("prompt".to_string(), Self::atomic_prompt(prompt));
+            obj.insert(
+                "orchestration_quality".to_string(),
+                serde_json::json!({
+                    "quality_gate_version": 1,
+                    "atomic": true,
+                    "node_id": node_id,
+                    "role": agent,
+                    "kind": kind,
+                    "position": position,
+                    "max_title_chars": MAX_ATOMIC_TITLE_CHARS,
+                    "max_prompt_chars": MAX_ATOMIC_PROMPT_CHARS,
+                    "acceptance_criteria": Self::acceptance_criteria(agent, kind),
+                    "handoff_contract": {
+                        "requires_input_artifact": position > 0 || kind == "debug",
+                        "requires_output_artifact": true,
+                        "lineage_parent_task_id": parent.id
+                    }
+                }),
+            );
+            if kind == "debug" || parent.payload.get("reviewer_task_id").is_some() {
+                obj.insert(
+                    "critic_report".to_string(),
+                    serde_json::json!({
+                        "reviewer_task_id": parent.payload.get("reviewer_task_id").cloned(),
+                        "feedback": parent.payload.get("feedback").cloned()
+                            .or_else(|| parent.payload.pointer("/retry_feedback/0/comment").cloned())
+                    }),
+                );
+            }
+        }
+        payload
+    }
+
     async fn decompose_codegen(&self, parent: &Task) -> Result<Vec<Task>, OrchestratorError> {
         // Try LLM-driven decomposition first if all required services are present.
         if let (Some(agent), Some(inference), Some(tools)) =
@@ -285,18 +389,32 @@ impl OrchestratorImpl {
             let WorkflowNode::Agent { id, .. } = node else {
                 continue;
             };
+            let agent = node.agent_name().unwrap_or(id);
+            let kind = node.task_kind().unwrap_or(id);
             let node_result = result.node_results.get(id).cloned().unwrap_or(Value::Null);
             let task = self
                 .task_service
                 .submit(CreateTaskRequest {
                     project_id: parent.project_id.clone(),
                     parent_id: Some(parent.id.clone()),
-                    title: format!("{id}: {}", parent.title),
+                    title: Self::atomic_title(&format!("{id}: {}", parent.title)),
                     description: parent.description.clone(),
-                    kind: node.task_kind().unwrap_or(id).to_string(),
-                    assigned_agent: Some(node.agent_name().unwrap_or(id).to_string()),
+                    kind: kind.to_string(),
+                    assigned_agent: Some(agent.to_string()),
                     priority: parent.priority,
-                    payload: parent.payload.clone(),
+                    payload: Self::enrich_stage_payload(
+                        parent,
+                        parent.payload.clone(),
+                        id,
+                        agent,
+                        kind,
+                        parent
+                            .payload
+                            .get("prompt")
+                            .cloned()
+                            .unwrap_or(Value::String(parent.title.clone())),
+                        tasks.len(),
+                    ),
                     trace_id: Some(parent.trace_id.clone()),
                 })
                 .await?;
@@ -345,20 +463,27 @@ impl OrchestratorImpl {
             let WorkflowNode::Agent { id, .. } = node else {
                 continue;
             };
-            let mut stage_payload = parent.payload.clone();
-            if let Some(obj) = stage_payload.as_object_mut() {
-                obj.insert("prompt".to_string(), prompt.clone());
-            }
+            let agent = node.agent_name().unwrap_or(id);
+            let kind = node.task_kind().unwrap_or(id);
+            let stage_payload = Self::enrich_stage_payload(
+                parent,
+                parent.payload.clone(),
+                id,
+                agent,
+                kind,
+                prompt.clone(),
+                tasks.len(),
+            );
 
             let task = self
                 .task_service
                 .submit(CreateTaskRequest {
                     project_id: parent.project_id.clone(),
                     parent_id: Some(parent.id.clone()),
-                    title: format!("{id}: {}", parent.title),
+                    title: Self::atomic_title(&format!("{id}: {}", parent.title)),
                     description: parent.description.clone(),
-                    kind: node.task_kind().unwrap_or(id).to_string(),
-                    assigned_agent: Some(node.agent_name().unwrap_or(id).to_string()),
+                    kind: kind.to_string(),
+                    assigned_agent: Some(agent.to_string()),
                     priority: parent.priority,
                     payload: stage_payload,
                     trace_id: Some(parent.trace_id.clone()),
@@ -438,16 +563,24 @@ impl OrchestratorImpl {
 
             let mut stage_payload = parent.payload.clone();
             if let Some(obj) = stage_payload.as_object_mut() {
-                obj.insert("prompt".to_string(), subtask_prompt);
                 obj.insert("plan".to_string(), plan.clone());
             }
+            let stage_payload = Self::enrich_stage_payload(
+                parent,
+                stage_payload,
+                title,
+                agent,
+                kind,
+                subtask_prompt,
+                tasks.len(),
+            );
 
             let task = self
                 .task_service
                 .submit(CreateTaskRequest {
                     project_id: parent.project_id.clone(),
                     parent_id: Some(parent.id.clone()),
-                    title: format!("{}: {}", title, parent.title),
+                    title: Self::atomic_title(&format!("{}: {}", title, parent.title)),
                     description: description.or_else(|| parent.description.clone()),
                     kind: kind.to_string(),
                     assigned_agent: Some(agent.to_string()),
@@ -631,6 +764,56 @@ mod tests {
         assert_eq!(ready[0].kind, "review");
     }
 
+    #[tokio::test]
+    async fn codegen_quality_gate_adds_atomic_bounds_and_acceptance_criteria() {
+        let svc = task_service();
+        let orchestrator = OrchestratorImpl::new(svc);
+
+        let tasks = orchestrator.orchestrate(&codegen_task()).await.unwrap();
+
+        assert_eq!(tasks.len(), 5);
+        for task in &tasks {
+            assert!(task.title.chars().count() <= MAX_ATOMIC_TITLE_CHARS);
+            let quality = &task.payload["orchestration_quality"];
+            assert_eq!(quality["quality_gate_version"], 1);
+            assert_eq!(quality["atomic"], true);
+            assert_eq!(
+                quality["role"],
+                task.assigned_agent.as_deref().unwrap_or_default()
+            );
+            assert_eq!(quality["kind"], task.kind);
+            assert!(
+                quality["acceptance_criteria"]
+                    .as_array()
+                    .is_some_and(|items| {
+                        (2..=8).contains(&items.len())
+                            && items.iter().all(|item| item.as_str().is_some())
+                    })
+            );
+            assert_eq!(
+                quality["handoff_contract"]["requires_output_artifact"],
+                true
+            );
+            assert_eq!(
+                quality["handoff_contract"]["lineage_parent_task_id"],
+                "parent"
+            );
+            assert!(
+                task.payload["prompt"]
+                    .as_str()
+                    .is_some_and(|prompt| prompt.chars().count() <= MAX_ATOMIC_PROMPT_CHARS)
+            );
+        }
+        assert_eq!(
+            tasks[0].payload["orchestration_quality"]["handoff_contract"]["requires_input_artifact"],
+            false
+        );
+        assert_eq!(
+            tasks[1].payload["orchestration_quality"]["handoff_contract"]["requires_input_artifact"],
+            true
+        );
+    }
+
     #[test]
     fn debug_workflow_passes_artifact_between_remediation_agents() {
         let workflow = default_debug_workflow();
@@ -786,6 +969,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn planning_agent_subtasks_are_bounded_and_keep_acceptance_criteria() {
+        let svc = task_service();
+        let long_title = "Implement ".repeat(80);
+        let long_prompt = "write validated code ".repeat(300);
+        let plan = serde_json::json!({
+            "plan": {
+                "goal": "build bounded task graph",
+                "subtasks": [
+                    {
+                        "kind": "codegen",
+                        "agent": "coder",
+                        "title": long_title,
+                        "description": "bounded",
+                        "prompt": long_prompt
+                    }
+                ]
+            }
+        });
+        let orchestrator = OrchestratorImpl::new(svc)
+            .with_planning_agent(Arc::new(MockPlanningAgent { plan }))
+            .with_inference(Arc::new(MockInference))
+            .with_tools(Arc::new(MockToolService));
+
+        let tasks = orchestrator.orchestrate(&codegen_task()).await.unwrap();
+
+        assert_eq!(tasks.len(), 1);
+        assert!(tasks[0].title.chars().count() <= MAX_ATOMIC_TITLE_CHARS);
+        assert!(
+            tasks[0].payload["prompt"]
+                .as_str()
+                .is_some_and(|prompt| prompt.chars().count() <= MAX_ATOMIC_PROMPT_CHARS)
+        );
+        assert_eq!(
+            tasks[0].payload["orchestration_quality"]["acceptance_criteria"][0],
+            "change only files needed for this task"
+        );
+    }
+
+    #[tokio::test]
     async fn codegen_falls_back_to_default_when_planning_agent_returns_no_subtasks() {
         let svc = task_service();
         let plan = serde_json::json!({ "plan": { "subtasks": [] }, "summary": "empty" });
@@ -796,6 +1018,43 @@ mod tests {
 
         let tasks = orchestrator.orchestrate(&codegen_task()).await.unwrap();
         assert_eq!(tasks.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn debug_remediation_quality_gate_preserves_rejection_feedback() {
+        let svc = task_service();
+        let mut rejected = codegen_task();
+        rejected.id = "critic-review-1".into();
+        rejected.kind = "debug".into();
+        rejected.assigned_agent = Some("coder".into());
+        rejected.payload = serde_json::json!({
+            "prompt": "fix rejected implementation",
+            "source": "reviewer_rejection",
+            "reviewer_task_id": "critic-review-1",
+            "feedback": "missing deterministic regression evidence"
+        });
+        let orchestrator = OrchestratorImpl::new(svc.clone());
+
+        let tasks = orchestrator.orchestrate(&rejected).await.unwrap();
+
+        assert_eq!(tasks.len(), 4);
+        assert_eq!(tasks[0].kind, "debug");
+        assert_eq!(tasks[0].assigned_agent.as_deref(), Some("coder"));
+        assert_eq!(
+            tasks[0].payload["critic_report"]["feedback"],
+            "missing deterministic regression evidence"
+        );
+        assert_eq!(
+            tasks[0].payload["orchestration_quality"]["acceptance_criteria"][0],
+            "reproduce the critic or human rejection"
+        );
+        assert_eq!(
+            tasks[0].payload["orchestration_quality"]["handoff_contract"]["requires_input_artifact"],
+            true
+        );
+        let ready = svc.list_ready().await.unwrap();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].id, tasks[0].id);
     }
 
     #[derive(Default)]

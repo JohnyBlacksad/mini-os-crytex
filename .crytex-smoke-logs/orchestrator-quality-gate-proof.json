@@ -1,0 +1,177 @@
+{
+  "proof_outcome": "ORCHESTRATOR_QUALITY_GATE_PASSED",
+  "trace_id": "orchestrator-quality-01KY3DA05ERVZCGVV4J0YKY651",
+  "codegen_task_ids": [
+    "01KY3DA0AAXKT3FQQF366YX0K3",
+    "01KY3DA0AJKW7C2PF8Y3CN45VP",
+    "01KY3DA0ATKWZSQG44X74EWWH9",
+    "01KY3DA0B238QXFGQ1YBG07AKM",
+    "01KY3DA0B66QFFF6JYGGBNWXJA"
+  ],
+  "remediation_task_ids": [
+    "01KY3DA0C4AGCJAYW1DF12VJ82",
+    "01KY3DA0CBCKHAYW99VQ439FYG",
+    "01KY3DA0CFC7HTXZNZ0HAKND60",
+    "01KY3DA0CRBNFHA7DYGR74S3FJ"
+  ],
+  "serial_dependency_edges": 7,
+  "retry_rejection_feedback": "critic rejected: missing deterministic regression evidence",
+  "tasks": [
+    {
+      "task_id": "01KY3DA0AAXKT3FQQF366YX0K3",
+      "title": "architect: Build a deterministic Rust utility with implementation, tests, security review, and critic evidence. Keep eac",
+      "kind": "architecture",
+      "role": "architect",
+      "title_chars": 120,
+      "prompt_chars": 123,
+      "acceptance_criteria_count": 3,
+      "requires_input_artifact": false,
+      "requires_output_artifact": true,
+      "critic_feedback": null
+    },
+    {
+      "task_id": "01KY3DA0AJKW7C2PF8Y3CN45VP",
+      "title": "coder: Build a deterministic Rust utility with implementation, tests, security review, and critic evidence. Keep each ta",
+      "kind": "codegen",
+      "role": "coder",
+      "title_chars": 120,
+      "prompt_chars": 123,
+      "acceptance_criteria_count": 3,
+      "requires_input_artifact": true,
+      "requires_output_artifact": true,
+      "critic_feedback": null
+    },
+    {
+      "task_id": "01KY3DA0ATKWZSQG44X74EWWH9",
+      "title": "qa: Build a deterministic Rust utility with implementation, tests, security review, and critic evidence. Keep each task ",
+      "kind": "qa",
+      "role": "qa",
+      "title_chars": 120,
+      "prompt_chars": 123,
+      "acceptance_criteria_count": 3,
+      "requires_input_artifact": true,
+      "requires_output_artifact": true,
+      "critic_feedback": null
+    },
+    {
+      "task_id": "01KY3DA0B238QXFGQ1YBG07AKM",
+      "title": "security: Build a deterministic Rust utility with implementation, tests, security review, and critic evidence. Keep each",
+      "kind": "security",
+      "role": "security",
+      "title_chars": 120,
+      "prompt_chars": 123,
+      "acceptance_criteria_count": 3,
+      "requires_input_artifact": true,
+      "requires_output_artifact": true,
+      "critic_feedback": null
+    },
+    {
+      "task_id": "01KY3DA0B66QFFF6JYGGBNWXJA",
+      "title": "critic: Build a deterministic Rust utility with implementation, tests, security review, and critic evidence. Keep each t",
+      "kind": "review",
+      "role": "critic",
+      "title_chars": 120,
+      "prompt_chars": 123,
+      "acceptance_criteria_count": 3,
+      "requires_input_artifact": true,
+      "requires_output_artifact": true,
+      "critic_feedback": null
+    },
+    {
+      "task_id": "01KY3DA0C4AGCJAYW1DF12VJ82",
+      "title": "debug: Remediate critic rejection",
+      "kind": "debug",
+      "role": "coder",
+      "title_chars": 33,
+      "prompt_chars": 30,
+      "acceptance_criteria_count": 3,
+      "requires_input_artifact": true,
+      "requires_output_artifact": true,
+      "critic_feedback": "critic rejected: missing deterministic regression evidence"
+    },
+    {
+      "task_id": "01KY3DA0CBCKHAYW99VQ439FYG",
+      "title": "fix: Remediate critic rejection",
+      "kind": "codegen",
+      "role": "coder",
+      "title_chars": 31,
+      "prompt_chars": 30,
+      "acceptance_criteria_count": 3,
+      "requires_input_artifact": true,
+      "requires_output_artifact": true,
+      "critic_feedback": "critic rejected: missing deterministic regression evidence"
+    },
+    {
+      "task_id": "01KY3DA0CFC7HTXZNZ0HAKND60",
+      "title": "qa: Remediate critic rejection",
+      "kind": "qa",
+      "role": "qa",
+      "title_chars": 30,
+      "prompt_chars": 30,
+      "acceptance_criteria_count": 3,
+      "requires_input_artifact": true,
+      "requires_output_artifact": true,
+      "critic_feedback": "critic rejected: missing deterministic regression evidence"
+    },
+    {
+      "task_id": "01KY3DA0CRBNFHA7DYGR74S3FJ",
+      "title": "critic: Remediate critic rejection",
+      "kind": "review",
+      "role": "critic",
+      "title_chars": 34,
+      "prompt_chars": 30,
+      "acceptance_criteria_count": 3,
+      "requires_input_artifact": true,
+      "requires_output_artifact": true,
+      "critic_feedback": "critic rejected: missing deterministic regression evidence"
+    }
+  ],
+  "gates": [
+    {
+      "name": "atomic_codegen_decomposition",
+      "passed": true,
+      "evidence": "orchestrator created 5 codegen role tasks"
+    },
+    {
+      "name": "atomic_remediation_decomposition",
+      "passed": true,
+      "evidence": "orchestrator created 4 remediation role tasks"
+    },
+    {
+      "name": "bounded_task_size",
+      "passed": true,
+      "evidence": "every task title<=120 chars and prompt<=2000 chars"
+    },
+    {
+      "name": "acceptance_criteria_present",
+      "passed": true,
+      "evidence": "every task has role-specific acceptance criteria"
+    },
+    {
+      "name": "role_coverage",
+      "passed": true,
+      "evidence": "architect/coder/qa/security/critic roles are present"
+    },
+    {
+      "name": "serial_dependencies_present",
+      "passed": true,
+      "evidence": "7 persisted serial edges, expected at least 7"
+    },
+    {
+      "name": "output_artifact_required",
+      "passed": true,
+      "evidence": "every task declares requires_output_artifact=true"
+    },
+    {
+      "name": "retry_feedback_preserved",
+      "passed": true,
+      "evidence": "critic rejected: missing deterministic regression evidence"
+    },
+    {
+      "name": "remediation_requires_input_artifact",
+      "passed": true,
+      "evidence": "debug/remediation tasks require incoming rejected artifact/context"
+    }
+  ],
+  "passed": true
+}
