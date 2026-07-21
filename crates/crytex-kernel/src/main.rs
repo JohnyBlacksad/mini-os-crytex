@@ -51,8 +51,8 @@ use crytex_core::{
         MemoryRoleAdapterRegistry, ModelManager, ModelManagerImpl, ModelRuntimeMatrixProbe,
         ModelRuntimeMatrixRequest, ModelRuntimeProbe, ModelRuntimeProbeRequest, MutationOperator,
         Orchestrator, OrchestratorImpl, ProjectService, ProjectServiceImpl, ProjectWatcher,
-        PromptEvolutionService, Quantization, RecordRewardRequest, RewardService,
-        RoleAdapterRegistry, RuntimeFeatureSet, RuntimeMatrixEntryRequest,
+        PromptEvolutionService, Quantization, RecordRewardRequest, RerankPassage, RerankResult,
+        RewardService, RoleAdapterRegistry, RuntimeFeatureSet, RuntimeMatrixEntryRequest,
         RuntimeMatrixReportWriter, SchedulerImpl, SystemHardwareDetector, TaskHandler,
         TaskServiceImpl, TomlWorkflowRepository, VectorStore, WorkerError, WorkerPool,
         WorkflowDefinition, WorkflowEdge, WorkflowEngine, WorkflowNode, WorkflowRepository,
@@ -341,6 +341,11 @@ enum Commands {
     },
     /// Prove orchestrator atomic decomposition, dependencies, criteria, and remediation gates
     ProveOrchestratorQualityGate {
+        #[arg(long)]
+        report_path: Option<PathBuf>,
+    },
+    /// Prove mixed-project RAG indexing, hybrid retrieval, rerank, and context evidence
+    ProveRagFull {
         #[arg(long)]
         report_path: Option<PathBuf>,
     },
@@ -795,6 +800,55 @@ struct OrchestratorQualityProofReport {
     serial_dependency_edges: usize,
     retry_rejection_feedback: String,
     tasks: Vec<OrchestratorQualityTaskProof>,
+    gates: Vec<KernelE2eProofGate>,
+    passed: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RagFullChunkProof {
+    id: String,
+    relative_path: Option<String>,
+    source: Option<String>,
+    score: f32,
+    symbol_id: Option<String>,
+    retrieval_sources: Vec<String>,
+    selection_reason: String,
+    text_preview: String,
+}
+
+#[derive(Debug, Clone)]
+struct RagFullProofInput {
+    trace_id: String,
+    fixture_root: String,
+    indexed_files: usize,
+    indexed_chunks: usize,
+    file_types: Vec<String>,
+    markdown_overlap_found: bool,
+    ast_symbol_chunks: usize,
+    pdf_chunks: usize,
+    dense_hits: Vec<RagFullChunkProof>,
+    sparse_hits: Vec<RagFullChunkProof>,
+    retrieval_candidates: Vec<RagFullChunkProof>,
+    reranked_chunks: Vec<RagFullChunkProof>,
+    selected_chunks: Vec<RagFullChunkProof>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RagFullProofReport {
+    proof_outcome: String,
+    trace_id: String,
+    fixture_root: String,
+    indexed_files: usize,
+    indexed_chunks: usize,
+    file_types: Vec<String>,
+    markdown_overlap_found: bool,
+    ast_symbol_chunks: usize,
+    pdf_chunks: usize,
+    dense_hits: Vec<RagFullChunkProof>,
+    sparse_hits: Vec<RagFullChunkProof>,
+    retrieval_candidates: Vec<RagFullChunkProof>,
+    reranked_chunks: Vec<RagFullChunkProof>,
+    selected_chunks: Vec<RagFullChunkProof>,
     gates: Vec<KernelE2eProofGate>,
     passed: bool,
 }
@@ -2001,6 +2055,147 @@ impl OrchestratorQualityProofReport {
             gates,
             passed,
         }
+    }
+}
+
+impl RagFullProofReport {
+    fn from_input(input: RagFullProofInput) -> Self {
+        let has_mixed_fixture = ["rust", "typescript", "markdown", "pdf"]
+            .into_iter()
+            .all(|kind| input.file_types.iter().any(|item| item == kind));
+        let dense_present = !input.dense_hits.is_empty();
+        let sparse_present = !input.sparse_hits.is_empty();
+        let rerank_applied = !input.reranked_chunks.is_empty()
+            && input
+                .retrieval_candidates
+                .first()
+                .zip(input.reranked_chunks.first())
+                .is_some_and(|(before, after)| before.id != after.id);
+        let selected_reason_present = input
+            .selected_chunks
+            .iter()
+            .all(|chunk| !chunk.selection_reason.is_empty());
+        let selected_has_retrieval_sources = input.selected_chunks.iter().any(|chunk| {
+            chunk
+                .retrieval_sources
+                .iter()
+                .any(|source| source == "dense")
+        }) && input.selected_chunks.iter().any(|chunk| {
+            chunk
+                .retrieval_sources
+                .iter()
+                .any(|source| source == "sparse")
+        });
+        let gates = vec![
+            proof_gate(
+                "mixed_project_fixture",
+                has_mixed_fixture,
+                &format!("indexed file types: {}", input.file_types.join(",")),
+            ),
+            proof_gate(
+                "chunk_overlap_detected",
+                input.markdown_overlap_found,
+                "markdown chunks preserve overlapping repeated marker",
+            ),
+            proof_gate(
+                "ast_symbols_indexed",
+                input.ast_symbol_chunks > 0,
+                &format!(
+                    "{} code chunks include AST symbol_id",
+                    input.ast_symbol_chunks
+                ),
+            ),
+            proof_gate(
+                "pdf_indexed",
+                input.pdf_chunks > 0,
+                &format!("{} PDF chunks indexed", input.pdf_chunks),
+            ),
+            proof_gate(
+                "dense_search_returned_context",
+                dense_present,
+                &format!("{} dense hits", input.dense_hits.len()),
+            ),
+            proof_gate(
+                "sparse_search_returned_context",
+                sparse_present,
+                &format!("{} sparse hits", input.sparse_hits.len()),
+            ),
+            proof_gate(
+                "rerank_reordered_candidates",
+                rerank_applied,
+                "reranked first chunk differs from retrieval first chunk",
+            ),
+            proof_gate(
+                "selected_context_has_reason",
+                selected_reason_present,
+                "all selected chunks include selection_reason",
+            ),
+            proof_gate(
+                "selected_context_has_dense_and_sparse_evidence",
+                selected_has_retrieval_sources,
+                "selected context contains dense and sparse retrieval evidence",
+            ),
+        ];
+        let passed = gates.iter().all(|gate| gate.passed);
+        Self {
+            proof_outcome: if passed {
+                "RAG_FULL_PROOF_PASSED".into()
+            } else {
+                "RAG_FULL_PROOF_FAILED".into()
+            },
+            trace_id: input.trace_id,
+            fixture_root: input.fixture_root,
+            indexed_files: input.indexed_files,
+            indexed_chunks: input.indexed_chunks,
+            file_types: input.file_types,
+            markdown_overlap_found: input.markdown_overlap_found,
+            ast_symbol_chunks: input.ast_symbol_chunks,
+            pdf_chunks: input.pdf_chunks,
+            dense_hits: input.dense_hits,
+            sparse_hits: input.sparse_hits,
+            retrieval_candidates: input.retrieval_candidates,
+            reranked_chunks: input.reranked_chunks,
+            selected_chunks: input.selected_chunks,
+            gates,
+            passed,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct KeywordReranker {
+    keyword: String,
+}
+
+#[async_trait]
+impl crytex_core::services::Reranker for KeywordReranker {
+    async fn rerank(
+        &self,
+        _query: &str,
+        passages: &[RerankPassage],
+    ) -> Result<Vec<RerankResult>, crytex_core::services::RerankerError> {
+        let mut ranked = passages
+            .iter()
+            .enumerate()
+            .map(|(index, passage)| {
+                let contains_keyword = passage
+                    .text
+                    .to_lowercase()
+                    .contains(&self.keyword.to_lowercase());
+                RerankResult {
+                    id: passage.id.clone(),
+                    score: if contains_keyword {
+                        10.0 - index as f32
+                    } else {
+                        1.0 / (index as f32 + 1.0)
+                    },
+                    text: passage.text.clone(),
+                    payload: passage.payload.clone(),
+                }
+            })
+            .collect::<Vec<_>>();
+        ranked.sort_by(|left, right| right.score.total_cmp(&left.score));
+        Ok(ranked)
     }
 }
 
@@ -3303,6 +3498,319 @@ fn orchestrator_quality_task_proof(task: &Task) -> OrchestratorQualityTaskProof 
             .and_then(serde_json::Value::as_str)
             .map(ToString::to_string),
     }
+}
+
+async fn run_rag_full_proof(config: &CrytexConfig) -> Result<RagFullProofReport, String> {
+    let trace_id = format!("rag-full-{}", Ulid::new());
+    let proof_dir = config.paths.data_dir.join("proofs").join(&trace_id);
+    let fixture_root = proof_dir.join("mixed-project");
+    create_rag_full_fixture(&fixture_root)
+        .await
+        .map_err(|error| format!("failed to create RAG proof fixture: {error}"))?;
+
+    let embedder: Arc<dyn crytex_core::services::Embedder> =
+        Arc::new(crytex_core::services::MockEmbedder::new(32));
+    let sparse_embedder: Arc<dyn crytex_core::services::SparseEmbedder> = Arc::new(
+        crytex_storage::sparse_embedder::EdgeBm25SparseEmbedder::with_language(Some(
+            "english".into(),
+        ))
+        .map_err(|error| format!("failed to create BM25 sparse embedder: {error}"))?,
+    );
+    let vector_store: Arc<dyn VectorStore> = Arc::new(
+        crytex_storage::vector::EdgeVectorStore::new(proof_dir.join("qdrant-edge"))
+            .map_err(|error| format!("failed to open Qdrant Edge vector store: {error}"))?,
+    );
+    let indexer = crytex_core::indexer::ProjectIndexer::new(embedder.clone(), vector_store.clone())
+        .with_sparse_embedder(sparse_embedder.clone());
+    let project_id = format!("project-{trace_id}");
+    let stats = indexer
+        .index(&project_id, &fixture_root)
+        .await
+        .map_err(|error| format!("failed to index RAG proof fixture: {error}"))?;
+
+    let dense_hits = crytex_core::indexer::search_chunks(
+        vector_store.as_ref(),
+        "code_chunks",
+        embedder.as_ref(),
+        &project_id,
+        "RAG_SENTINEL_RETRIEVAL helper handles rerank target",
+        8,
+    )
+    .await
+    .map_err(|error| format!("dense RAG proof search failed: {error}"))?;
+    let sparse_hits = crytex_core::indexer::search_sparse_chunks(
+        vector_store.as_ref(),
+        "doc_chunks",
+        sparse_embedder.as_ref(),
+        &project_id,
+        "RAG_SENTINEL_RETRIEVAL rerank target pdf markdown",
+        8,
+    )
+    .await
+    .map_err(|error| format!("sparse RAG proof search failed: {error}"))?;
+
+    let assembler =
+        crytex_core::services::ContextAssembler::new(embedder.clone(), vector_store.clone())
+            .with_sparse_embedder(sparse_embedder)
+            .with_reranker(Arc::new(KeywordReranker {
+                keyword: "pdf rerank target".into(),
+            }));
+    let assembly = assembler
+        .assemble_with_evidence(crytex_core::services::ContextRequest {
+            system_prompt: "Use retrieved project context with evidence.".into(),
+            user_query:
+                "Find the RAG_SENTINEL_RETRIEVAL rerank target across Rust, TS, markdown, and PDF."
+                    .into(),
+            project_id: Some(project_id),
+            history: Vec::new(),
+            token_budget: 8_192,
+            top_k: 8,
+            summarize_threshold_ratio: 0.6,
+        })
+        .await
+        .map_err(|error| format!("failed to assemble RAG proof context: {error}"))?;
+
+    let all_code = vector_store
+        .search(
+            "code_chunks",
+            &[1.0; 32],
+            crytex_core::services::SearchOptions {
+                limit: 64,
+                filter: None,
+                score_threshold: None,
+            },
+        )
+        .await
+        .map_err(|error| format!("failed to inspect code chunks: {error}"))?;
+    let all_docs = vector_store
+        .search(
+            "doc_chunks",
+            &[1.0; 32],
+            crytex_core::services::SearchOptions {
+                limit: 64,
+                filter: None,
+                score_threshold: None,
+            },
+        )
+        .await
+        .map_err(|error| format!("failed to inspect doc chunks: {error}"))?;
+
+    Ok(RagFullProofReport::from_input(RagFullProofInput {
+        trace_id,
+        fixture_root: fixture_root.display().to_string(),
+        indexed_files: stats.files_indexed,
+        indexed_chunks: all_code.len() + all_docs.len(),
+        file_types: rag_file_types(&all_code, &all_docs),
+        markdown_overlap_found: markdown_overlap_found(&all_docs),
+        ast_symbol_chunks: all_code
+            .iter()
+            .filter(|chunk| {
+                chunk
+                    .payload
+                    .get("symbol_id")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|symbol| !symbol.is_empty())
+            })
+            .count(),
+        pdf_chunks: all_docs
+            .iter()
+            .filter(|chunk| chunk.payload["language"] == "pdf")
+            .count(),
+        dense_hits: dense_hits.iter().map(rag_search_result_proof).collect(),
+        sparse_hits: sparse_hits.iter().map(rag_search_result_proof).collect(),
+        retrieval_candidates: assembly
+            .rag
+            .retrieval_candidates
+            .iter()
+            .map(rag_evidence_proof)
+            .collect(),
+        reranked_chunks: assembly
+            .rag
+            .reranked_chunks
+            .iter()
+            .map(rag_evidence_proof)
+            .collect(),
+        selected_chunks: assembly.rag.chunks.iter().map(rag_evidence_proof).collect(),
+    }))
+}
+
+async fn create_rag_full_fixture(root: &Path) -> std::io::Result<()> {
+    tokio::fs::create_dir_all(root.join("src")).await?;
+    tokio::fs::create_dir_all(root.join("docs")).await?;
+    tokio::fs::write(
+        root.join("src/lib.rs"),
+        r#"pub fn rag_sentinel_retrieval(input: &str) -> String {
+    let normalized = input.trim().to_lowercase();
+    format!("RAG_SENTINEL_RETRIEVAL rust rerank target {normalized}")
+}
+
+pub fn call_rag_sentinel() -> String {
+    rag_sentinel_retrieval("context")
+}
+"#,
+    )
+    .await?;
+    tokio::fs::write(
+        root.join("src/tool.ts"),
+        r#"export function ragSentinelTool(input: string): string {
+  const normalized = input.trim().toLowerCase();
+  return `RAG_SENTINEL_RETRIEVAL typescript dense sparse ${normalized}`;
+}
+"#,
+    )
+    .await?;
+    tokio::fs::write(
+        root.join("docs/guide.md"),
+        format!(
+            "# RAG Guide\n\n{}\n\n{}\n",
+            "RAG_SENTINEL_RETRIEVAL markdown rerank target overlap marker ".repeat(90),
+            "overlap marker selected context reason dense sparse ".repeat(90)
+        ),
+    )
+    .await?;
+    tokio::fs::write(
+        root.join("docs/spec.pdf"),
+        minimal_pdf_with_text_for_proof(
+            "RAG_SENTINEL_RETRIEVAL pdf rerank target selected context reason.",
+        ),
+    )
+    .await?;
+    Ok(())
+}
+
+fn rag_file_types(
+    code: &[crytex_core::services::SearchResult],
+    docs: &[crytex_core::services::SearchResult],
+) -> Vec<String> {
+    let mut types = code
+        .iter()
+        .chain(docs.iter())
+        .filter_map(|chunk| {
+            chunk
+                .payload
+                .get("language")
+                .and_then(serde_json::Value::as_str)
+        })
+        .map(|language| match language {
+            "rust" => "rust",
+            "typescript" | "tsx" | "ts" => "typescript",
+            "markdown" | "md" => "markdown",
+            "pdf" => "pdf",
+            other => other,
+        })
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    types.sort();
+    types.dedup();
+    types
+}
+
+fn markdown_overlap_found(docs: &[crytex_core::services::SearchResult]) -> bool {
+    let markdown_chunks = docs
+        .iter()
+        .filter(|chunk| chunk.payload["relative_path"] == "docs/guide.md")
+        .collect::<Vec<_>>();
+    markdown_chunks.len() > 1
+        && markdown_chunks.windows(2).any(|pair| {
+            pair.iter().all(|chunk| {
+                chunk
+                    .payload
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|text| text.contains("overlap marker"))
+            })
+        })
+}
+
+fn rag_search_result_proof(result: &crytex_core::services::SearchResult) -> RagFullChunkProof {
+    let text = result
+        .payload
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    RagFullChunkProof {
+        id: result.id.clone(),
+        relative_path: result
+            .payload
+            .get("relative_path")
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string),
+        source: result
+            .payload
+            .get("source")
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string),
+        score: result.score,
+        symbol_id: result
+            .payload
+            .get("symbol_id")
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string),
+        retrieval_sources: result
+            .payload
+            .get("retrieval_evidence")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|item| item.get("source").and_then(serde_json::Value::as_str))
+            .map(ToString::to_string)
+            .collect(),
+        selection_reason: if result.payload.get("retrieval_evidence").is_some() {
+            format!(
+                "selected by hybrid retrieval evidence score {:.4}",
+                result.score
+            )
+        } else {
+            format!("selected by direct retrieval score {:.4}", result.score)
+        },
+        text_preview: text.chars().take(240).collect(),
+    }
+}
+
+fn rag_evidence_proof(evidence: &crytex_core::services::RagChunkEvidence) -> RagFullChunkProof {
+    RagFullChunkProof {
+        id: evidence.id.clone(),
+        relative_path: evidence.relative_path.clone(),
+        source: evidence.source.clone(),
+        score: evidence.score,
+        symbol_id: evidence.symbol_id.clone(),
+        retrieval_sources: evidence.retrieval_sources.clone(),
+        selection_reason: evidence.selection_reason.clone(),
+        text_preview: evidence.text_preview.clone(),
+    }
+}
+
+fn minimal_pdf_with_text_for_proof(text: &str) -> Vec<u8> {
+    let escaped = text
+        .replace('\\', "\\\\")
+        .replace('(', "\\(")
+        .replace(')', "\\)");
+    let objects = [
+        "1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n".to_string(),
+        "2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n".to_string(),
+        "3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >> endobj\n".to_string(),
+        format!(
+            "4 0 obj << /Length {} >> stream\nBT /F1 12 Tf 72 720 Td ({}) Tj ET\nendstream endobj\n",
+            escaped.len() + 36,
+            escaped
+        ),
+        "5 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj\n".to_string(),
+    ];
+    let mut pdf = String::from("%PDF-1.4\n");
+    let mut offsets = Vec::new();
+    for object in objects {
+        offsets.push(pdf.len());
+        pdf.push_str(&object);
+    }
+    let xref_offset = pdf.len();
+    pdf.push_str("xref\n0 6\n0000000000 65535 f \n");
+    for offset in offsets {
+        pdf.push_str(&format!("{offset:010} 00000 n \n"));
+    }
+    pdf.push_str(&format!(
+        "trailer << /Size 6 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n"
+    ));
+    pdf.into_bytes()
 }
 
 fn create_kernel_live_inference(
@@ -6276,6 +6784,31 @@ async fn async_main() {
         return;
     }
 
+    if let Commands::ProveRagFull { report_path } = &cli.command {
+        let report = run_rag_full_proof(&config).await.unwrap_or_else(|error| {
+            eprintln!("RAG full proof failed: {error}");
+            std::process::exit(1);
+        });
+        let payload = serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into());
+        if let Some(report_path) = report_path {
+            if let Some(parent) = report_path.parent()
+                && let Err(error) = tokio::fs::create_dir_all(parent).await
+            {
+                eprintln!("Failed to create RAG full proof report directory: {error}");
+                std::process::exit(1);
+            }
+            if let Err(error) = tokio::fs::write(report_path, &payload).await {
+                eprintln!("Failed to write RAG full proof report: {error}");
+                std::process::exit(1);
+            }
+        }
+        println!("{payload}");
+        if !report.passed {
+            std::process::exit(2);
+        }
+        return;
+    }
+
     let inference = create_inference_service(&config).expect("Failed to create inference service");
 
     if let Commands::ProbeModel {
@@ -6810,6 +7343,9 @@ async fn async_main() {
         Commands::ProveOrchestratorQualityGate { .. } => unreachable!(
             "prove-orchestrator-quality-gate is handled before full AppContext initialization"
         ),
+        Commands::ProveRagFull { .. } => {
+            unreachable!("prove-rag-full is handled before full AppContext initialization")
+        }
         Commands::Submit {
             project,
             prompt,
@@ -8377,6 +8913,95 @@ mod tests {
                 .gates
                 .iter()
                 .any(|gate| gate.name == "serial_dependencies_present" && !gate.passed)
+        );
+    }
+
+    #[test]
+    fn rag_full_proof_report_requires_mixed_fixture_hybrid_rerank_and_reasons() {
+        let dense_chunk = RagFullChunkProof {
+            id: "dense-rust".into(),
+            relative_path: Some("src/lib.rs".into()),
+            source: Some("src/lib.rs".into()),
+            score: 0.71,
+            symbol_id: Some("rust:src/lib.rs:rag_sentinel_retrieval".into()),
+            retrieval_sources: vec!["dense".into()],
+            selection_reason: "selected after dense retrieval evidence".into(),
+            text_preview: "RAG_SENTINEL_RETRIEVAL rust".into(),
+        };
+        let sparse_chunk = RagFullChunkProof {
+            id: "sparse-doc".into(),
+            relative_path: Some("docs/guide.md".into()),
+            source: Some("docs/guide.md".into()),
+            score: 8.0,
+            symbol_id: None,
+            retrieval_sources: vec!["sparse".into()],
+            selection_reason: "selected after sparse retrieval evidence".into(),
+            text_preview: "RAG_SENTINEL_RETRIEVAL markdown rerank target".into(),
+        };
+        let report = RagFullProofReport::from_input(RagFullProofInput {
+            trace_id: "trace-rag-full".into(),
+            fixture_root: "A:/tmp/rag-full".into(),
+            indexed_files: 4,
+            indexed_chunks: 8,
+            file_types: vec![
+                "rust".into(),
+                "typescript".into(),
+                "markdown".into(),
+                "pdf".into(),
+            ],
+            markdown_overlap_found: true,
+            ast_symbol_chunks: 1,
+            pdf_chunks: 1,
+            dense_hits: vec![dense_chunk.clone()],
+            sparse_hits: vec![sparse_chunk.clone()],
+            retrieval_candidates: vec![dense_chunk.clone(), sparse_chunk.clone()],
+            reranked_chunks: vec![sparse_chunk.clone(), dense_chunk.clone()],
+            selected_chunks: vec![dense_chunk, sparse_chunk],
+        });
+
+        assert!(report.passed);
+        assert_eq!(report.proof_outcome, "RAG_FULL_PROOF_PASSED");
+        assert!(
+            report
+                .gates
+                .iter()
+                .any(|gate| gate.name == "mixed_project_fixture" && gate.passed)
+        );
+        assert!(
+            report
+                .gates
+                .iter()
+                .any(|gate| gate.name == "rerank_reordered_candidates" && gate.passed)
+        );
+        assert!(report.gates.iter().any(|gate| gate.name
+            == "selected_context_has_dense_and_sparse_evidence"
+            && gate.passed));
+
+        let failed = RagFullProofReport::from_input(RagFullProofInput {
+            sparse_hits: Vec::new(),
+            ..RagFullProofInput {
+                trace_id: report.trace_id,
+                fixture_root: report.fixture_root,
+                indexed_files: report.indexed_files,
+                indexed_chunks: report.indexed_chunks,
+                file_types: report.file_types,
+                markdown_overlap_found: report.markdown_overlap_found,
+                ast_symbol_chunks: report.ast_symbol_chunks,
+                pdf_chunks: report.pdf_chunks,
+                dense_hits: report.dense_hits,
+                sparse_hits: report.sparse_hits,
+                retrieval_candidates: report.retrieval_candidates,
+                reranked_chunks: report.reranked_chunks,
+                selected_chunks: report.selected_chunks,
+            }
+        });
+
+        assert!(!failed.passed);
+        assert!(
+            failed
+                .gates
+                .iter()
+                .any(|gate| gate.name == "sparse_search_returned_context" && !gate.passed)
         );
     }
 

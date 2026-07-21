@@ -1,0 +1,483 @@
+{
+  "proof_outcome": "RAG_FULL_PROOF_PASSED",
+  "trace_id": "rag-full-01KY3F4DZW4AF0NMJH8C82Z2P6",
+  "fixture_root": "C:\\Users\\screa\\AppData\\Roaming\\crytex\\proofs\\rag-full-01KY3F4DZW4AF0NMJH8C82Z2P6\\mixed-project",
+  "indexed_files": 4,
+  "indexed_chunks": 14,
+  "file_types": [
+    "markdown",
+    "pdf",
+    "rust",
+    "typescript"
+  ],
+  "markdown_overlap_found": true,
+  "ast_symbol_chunks": 3,
+  "pdf_chunks": 1,
+  "dense_hits": [
+    {
+      "id": "src/lib.rs-1",
+      "relative_path": "src/lib.rs",
+      "source": "src/lib.rs",
+      "score": 0.9214449,
+      "symbol_id": "rust:Function:src/lib.rs:6:8:call_rag_sentinel",
+      "retrieval_sources": [],
+      "selection_reason": "selected by direct retrieval score 0.9214",
+      "text_preview": "// File: src/lib.rs\n// Symbol: fn call_rag_sentinel\n// Signature: pub fn call_rag_sentinel() -> String {\n// Related: fn rag_sentinel_retrieval, file src/lib.rs\n\npub fn call_rag_sentinel() -> String {\n    rag_sentinel_retrieval(\"context\")\n}"
+    },
+    {
+      "id": "src/lib.rs-0",
+      "relative_path": "src/lib.rs",
+      "source": "src/lib.rs",
+      "score": 0.9214449,
+      "symbol_id": "rust:Function:src/lib.rs:1:4:rag_sentinel_retrieval",
+      "retrieval_sources": [],
+      "selection_reason": "selected by direct retrieval score 0.9214",
+      "text_preview": "// File: src/lib.rs\n// Symbol: fn rag_sentinel_retrieval\n// Signature: pub fn rag_sentinel_retrieval(input: &str) -> String {\n// Related: fn call_rag_sentinel, file src/lib.rs\n\npub fn rag_sentinel_retrieval(input: &str) -> String {\n    let "
+    },
+    {
+      "id": "src/tool.ts-0",
+      "relative_path": "src/tool.ts",
+      "source": "src/tool.ts",
+      "score": 0.904322,
+      "symbol_id": "typescript:File:src/tool.ts:1:4:src/tool.ts",
+      "retrieval_sources": [],
+      "selection_reason": "selected by direct retrieval score 0.9043",
+      "text_preview": "// File: src/tool.ts\n// Symbol: file src/tool.ts\n\nfunction ragSentinelTool(input: string): string {\n  const normalized = input.trim().toLowerCase();\n  return `RAG_SENTINEL_RETRIEVAL typescript dense sparse ${normalized}`;\n}"
+    }
+  ],
+  "sparse_hits": [
+    {
+      "id": "docs/spec.pdf-0",
+      "relative_path": "docs/spec.pdf",
+      "source": "docs/spec.pdf",
+      "score": 6.39563,
+      "symbol_id": null,
+      "retrieval_sources": [],
+      "selection_reason": "selected by direct retrieval score 6.3956",
+      "text_preview": "%PDF-1.4\n1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >> endobj"
+    },
+    {
+      "id": "docs/guide.md-2",
+      "relative_path": "docs/guide.md",
+      "source": "docs/guide.md",
+      "score": 6.249337,
+      "symbol_id": null,
+      "retrieval_sources": [],
+      "selection_reason": "selected by direct retrieval score 6.2493",
+      "text_preview": "er RAG_SENTINEL_RETRIEVAL markdown rerank target overlap marker RAG_SENTINEL_RETRIEVAL markdown rerank target overlap marker RAG_SENTINEL_RETRIEVAL markdown rerank target overlap marker RAG_SENTINEL_RETRIEVAL markdown rerank target overlap "
+    },
+    {
+      "id": "docs/guide.md-3",
+      "relative_path": "docs/guide.md",
+      "source": "docs/guide.md",
+      "score": 6.249337,
+      "symbol_id": null,
+      "retrieval_sources": [],
+      "selection_reason": "selected by direct retrieval score 6.2493",
+      "text_preview": "RAG_SENTINEL_RETRIEVAL markdown rerank target overlap marker RAG_SENTINEL_RETRIEVAL markdown rerank target overlap marker RAG_SENTINEL_RETRIEVAL markdown rerank target overlap marker RAG_SENTINEL_RETRIEVAL markdown rerank target overlap mar"
+    },
+    {
+      "id": "docs/guide.md-0",
+      "relative_path": "docs/guide.md",
+      "source": "docs/guide.md",
+      "score": 6.2482705,
+      "symbol_id": null,
+      "retrieval_sources": [],
+      "selection_reason": "selected by direct retrieval score 6.2483",
+      "text_preview": "RAG GuideRAG_SENTINEL_RETRIEVAL markdown rerank target overlap marker RAG_SENTINEL_RETRIEVAL markdown rerank target overlap marker RAG_SENTINEL_RETRIEVAL markdown rerank target overlap marker RAG_SENTINEL_RETRIEVAL markdown rerank target ov"
+    },
+    {
+      "id": "docs/guide.md-4",
+      "relative_path": "docs/guide.md",
+      "source": "docs/guide.md",
+      "score": 6.2482705,
+      "symbol_id": null,
+      "retrieval_sources": [],
+      "selection_reason": "selected by direct retrieval score 6.2483",
+      "text_preview": "_SENTINEL_RETRIEVAL markdown rerank target overlap marker RAG_SENTINEL_RETRIEVAL markdown rerank target overlap marker RAG_SENTINEL_RETRIEVAL markdown rerank target overlap marker RAG_SENTINEL_RETRIEVAL markdown rerank target overlap marker"
+    },
+    {
+      "id": "docs/guide.md-1",
+      "relative_path": "docs/guide.md",
+      "source": "docs/guide.md",
+      "score": 6.247201,
+      "symbol_id": null,
+      "retrieval_sources": [],
+      "selection_reason": "selected by direct retrieval score 6.2472",
+      "text_preview": "arker RAG_SENTINEL_RETRIEVAL markdown rerank target overlap marker RAG_SENTINEL_RETRIEVAL markdown rerank target overlap marker RAG_SENTINEL_RETRIEVAL markdown rerank target overlap marker RAG_SENTINEL_RETRIEVAL markdown rerank target overl"
+    },
+    {
+      "id": "docs/guide.md-5",
+      "relative_path": "docs/guide.md",
+      "source": "docs/guide.md",
+      "score": 5.497233,
+      "symbol_id": null,
+      "retrieval_sources": [],
+      "selection_reason": "selected by direct retrieval score 5.4972",
+      "text_preview": "NTINEL_RETRIEVAL markdown rerank target overlap marker RAG_SENTINEL_RETRIEVAL markdown rerank target overlap marker RAG_SENTINEL_RETRIEVAL markdown rerank target overlap marker RAG_SENTINEL_RETRIEVAL markdown rerank target overlap marker RA"
+    }
+  ],
+  "retrieval_candidates": [
+    {
+      "id": "src/tool.ts-0",
+      "relative_path": "src/tool.ts",
+      "source": "src/tool.ts",
+      "score": 0.032522473,
+      "symbol_id": "typescript:File:src/tool.ts:1:4:src/tool.ts",
+      "retrieval_sources": [
+        "dense",
+        "sparse"
+      ],
+      "selection_reason": "selected after dense+sparse retrieval evidence with fused/rerank score 0.0325",
+      "text_preview": "// File: src/tool.ts\n// Symbol: file src/tool.ts\n\nfunction ragSentinelTool(input: string): string {\n  const normalized = input.trim().toLowerCase();\n  return `RAG_SENTINEL_RETRIEVAL typescript dense sparse ${normalized}`;\n}"
+    },
+    {
+      "id": "src/lib.rs-0",
+      "relative_path": "src/lib.rs",
+      "source": "src/lib.rs",
+      "score": 0.032266457,
+      "symbol_id": "rust:Function:src/lib.rs:1:4:rag_sentinel_retrieval",
+      "retrieval_sources": [
+        "dense",
+        "sparse"
+      ],
+      "selection_reason": "selected after dense+sparse retrieval evidence with fused/rerank score 0.0323",
+      "text_preview": "// File: src/lib.rs\n// Symbol: fn rag_sentinel_retrieval\n// Signature: pub fn rag_sentinel_retrieval(input: &str) -> String {\n// Related: fn call_rag_sentinel, file src/lib.rs\n\npub fn rag_sentinel_retrieval(input: &str) -> String {\n    let "
+    },
+    {
+      "id": "docs/guide.md-0",
+      "relative_path": "docs/guide.md",
+      "source": "docs/guide.md",
+      "score": 0.03201844,
+      "symbol_id": null,
+      "retrieval_sources": [
+        "dense",
+        "sparse"
+      ],
+      "selection_reason": "selected after dense+sparse retrieval evidence with fused/rerank score 0.0320",
+      "text_preview": "RAG GuideRAG_SENTINEL_RETRIEVAL markdown rerank target overlap marker RAG_SENTINEL_RETRIEVAL markdown rerank target overlap marker RAG_SENTINEL_RETRIEVAL markdown rerank target overlap marker RAG_SENTINEL_RETRIEVAL markdown rerank target ov"
+    },
+    {
+      "id": "src/lib.rs-1",
+      "relative_path": "src/lib.rs",
+      "source": "src/lib.rs",
+      "score": 0.032002047,
+      "symbol_id": "rust:Function:src/lib.rs:6:8:call_rag_sentinel",
+      "retrieval_sources": [
+        "dense",
+        "sparse"
+      ],
+      "selection_reason": "selected after dense+sparse retrieval evidence with fused/rerank score 0.0320",
+      "text_preview": "// File: src/lib.rs\n// Symbol: fn call_rag_sentinel\n// Signature: pub fn call_rag_sentinel() -> String {\n// Related: fn rag_sentinel_retrieval, file src/lib.rs\n\npub fn call_rag_sentinel() -> String {\n    rag_sentinel_retrieval(\"context\")\n}"
+    },
+    {
+      "id": "docs/guide.md-2",
+      "relative_path": "docs/guide.md",
+      "source": "docs/guide.md",
+      "score": 0.031054405,
+      "symbol_id": null,
+      "retrieval_sources": [
+        "dense",
+        "sparse"
+      ],
+      "selection_reason": "selected after dense+sparse retrieval evidence with fused/rerank score 0.0311",
+      "text_preview": "er RAG_SENTINEL_RETRIEVAL markdown rerank target overlap marker RAG_SENTINEL_RETRIEVAL markdown rerank target overlap marker RAG_SENTINEL_RETRIEVAL markdown rerank target overlap marker RAG_SENTINEL_RETRIEVAL markdown rerank target overlap "
+    },
+    {
+      "id": "docs/guide.md-3",
+      "relative_path": "docs/guide.md",
+      "source": "docs/guide.md",
+      "score": 0.03102453,
+      "symbol_id": null,
+      "retrieval_sources": [
+        "dense",
+        "sparse"
+      ],
+      "selection_reason": "selected after dense+sparse retrieval evidence with fused/rerank score 0.0310",
+      "text_preview": "RAG_SENTINEL_RETRIEVAL markdown rerank target overlap marker RAG_SENTINEL_RETRIEVAL markdown rerank target overlap marker RAG_SENTINEL_RETRIEVAL markdown rerank target overlap marker RAG_SENTINEL_RETRIEVAL markdown rerank target overlap mar"
+    },
+    {
+      "id": "docs/guide.md-5",
+      "relative_path": "docs/guide.md",
+      "source": "docs/guide.md",
+      "score": 0.029631255,
+      "symbol_id": null,
+      "retrieval_sources": [
+        "dense",
+        "sparse"
+      ],
+      "selection_reason": "selected after dense+sparse retrieval evidence with fused/rerank score 0.0296",
+      "text_preview": "NTINEL_RETRIEVAL markdown rerank target overlap marker RAG_SENTINEL_RETRIEVAL markdown rerank target overlap marker RAG_SENTINEL_RETRIEVAL markdown rerank target overlap marker RAG_SENTINEL_RETRIEVAL markdown rerank target overlap marker RA"
+    },
+    {
+      "id": "docs/spec.pdf-0",
+      "relative_path": "docs/spec.pdf",
+      "source": "docs/spec.pdf",
+      "score": 0.016393442,
+      "symbol_id": null,
+      "retrieval_sources": [
+        "sparse"
+      ],
+      "selection_reason": "selected after sparse retrieval evidence with fused/rerank score 0.0164",
+      "text_preview": "%PDF-1.4\n1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >> endobj"
+    }
+  ],
+  "reranked_chunks": [
+    {
+      "id": "docs/spec.pdf-0",
+      "relative_path": "docs/spec.pdf",
+      "source": "docs/spec.pdf",
+      "score": 3.0,
+      "symbol_id": null,
+      "retrieval_sources": [
+        "sparse"
+      ],
+      "selection_reason": "selected after sparse retrieval evidence with fused/rerank score 3.0000",
+      "text_preview": "%PDF-1.4\n1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >> endobj"
+    },
+    {
+      "id": "src/tool.ts-0",
+      "relative_path": "src/tool.ts",
+      "source": "src/tool.ts",
+      "score": 1.0,
+      "symbol_id": "typescript:File:src/tool.ts:1:4:src/tool.ts",
+      "retrieval_sources": [
+        "dense",
+        "sparse"
+      ],
+      "selection_reason": "selected after dense+sparse retrieval evidence with fused/rerank score 1.0000",
+      "text_preview": "// File: src/tool.ts\n// Symbol: file src/tool.ts\n\nfunction ragSentinelTool(input: string): string {\n  const normalized = input.trim().toLowerCase();\n  return `RAG_SENTINEL_RETRIEVAL typescript dense sparse ${normalized}`;\n}"
+    },
+    {
+      "id": "src/lib.rs-0",
+      "relative_path": "src/lib.rs",
+      "source": "src/lib.rs",
+      "score": 0.5,
+      "symbol_id": "rust:Function:src/lib.rs:1:4:rag_sentinel_retrieval",
+      "retrieval_sources": [
+        "dense",
+        "sparse"
+      ],
+      "selection_reason": "selected after dense+sparse retrieval evidence with fused/rerank score 0.5000",
+      "text_preview": "// File: src/lib.rs\n// Symbol: fn rag_sentinel_retrieval\n// Signature: pub fn rag_sentinel_retrieval(input: &str) -> String {\n// Related: fn call_rag_sentinel, file src/lib.rs\n\npub fn rag_sentinel_retrieval(input: &str) -> String {\n    let "
+    },
+    {
+      "id": "docs/guide.md-0",
+      "relative_path": "docs/guide.md",
+      "source": "docs/guide.md",
+      "score": 0.33333334,
+      "symbol_id": null,
+      "retrieval_sources": [
+        "dense",
+        "sparse"
+      ],
+      "selection_reason": "selected after dense+sparse retrieval evidence with fused/rerank score 0.3333",
+      "text_preview": "RAG GuideRAG_SENTINEL_RETRIEVAL markdown rerank target overlap marker RAG_SENTINEL_RETRIEVAL markdown rerank target overlap marker RAG_SENTINEL_RETRIEVAL markdown rerank target overlap marker RAG_SENTINEL_RETRIEVAL markdown rerank target ov"
+    },
+    {
+      "id": "src/lib.rs-1",
+      "relative_path": "src/lib.rs",
+      "source": "src/lib.rs",
+      "score": 0.25,
+      "symbol_id": "rust:Function:src/lib.rs:6:8:call_rag_sentinel",
+      "retrieval_sources": [
+        "dense",
+        "sparse"
+      ],
+      "selection_reason": "selected after dense+sparse retrieval evidence with fused/rerank score 0.2500",
+      "text_preview": "// File: src/lib.rs\n// Symbol: fn call_rag_sentinel\n// Signature: pub fn call_rag_sentinel() -> String {\n// Related: fn rag_sentinel_retrieval, file src/lib.rs\n\npub fn call_rag_sentinel() -> String {\n    rag_sentinel_retrieval(\"context\")\n}"
+    },
+    {
+      "id": "docs/guide.md-2",
+      "relative_path": "docs/guide.md",
+      "source": "docs/guide.md",
+      "score": 0.2,
+      "symbol_id": null,
+      "retrieval_sources": [
+        "dense",
+        "sparse"
+      ],
+      "selection_reason": "selected after dense+sparse retrieval evidence with fused/rerank score 0.2000",
+      "text_preview": "er RAG_SENTINEL_RETRIEVAL markdown rerank target overlap marker RAG_SENTINEL_RETRIEVAL markdown rerank target overlap marker RAG_SENTINEL_RETRIEVAL markdown rerank target overlap marker RAG_SENTINEL_RETRIEVAL markdown rerank target overlap "
+    },
+    {
+      "id": "docs/guide.md-3",
+      "relative_path": "docs/guide.md",
+      "source": "docs/guide.md",
+      "score": 0.16666667,
+      "symbol_id": null,
+      "retrieval_sources": [
+        "dense",
+        "sparse"
+      ],
+      "selection_reason": "selected after dense+sparse retrieval evidence with fused/rerank score 0.1667",
+      "text_preview": "RAG_SENTINEL_RETRIEVAL markdown rerank target overlap marker RAG_SENTINEL_RETRIEVAL markdown rerank target overlap marker RAG_SENTINEL_RETRIEVAL markdown rerank target overlap marker RAG_SENTINEL_RETRIEVAL markdown rerank target overlap mar"
+    },
+    {
+      "id": "docs/guide.md-5",
+      "relative_path": "docs/guide.md",
+      "source": "docs/guide.md",
+      "score": 0.14285715,
+      "symbol_id": null,
+      "retrieval_sources": [
+        "dense",
+        "sparse"
+      ],
+      "selection_reason": "selected after dense+sparse retrieval evidence with fused/rerank score 0.1429",
+      "text_preview": "NTINEL_RETRIEVAL markdown rerank target overlap marker RAG_SENTINEL_RETRIEVAL markdown rerank target overlap marker RAG_SENTINEL_RETRIEVAL markdown rerank target overlap marker RAG_SENTINEL_RETRIEVAL markdown rerank target overlap marker RA"
+    }
+  ],
+  "selected_chunks": [
+    {
+      "id": "docs/spec.pdf-0",
+      "relative_path": "docs/spec.pdf",
+      "source": "docs/spec.pdf",
+      "score": 3.0,
+      "symbol_id": null,
+      "retrieval_sources": [
+        "sparse"
+      ],
+      "selection_reason": "selected after sparse retrieval evidence with fused/rerank score 3.0000",
+      "text_preview": "%PDF-1.4\n1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >> endobj"
+    },
+    {
+      "id": "src/tool.ts-0",
+      "relative_path": "src/tool.ts",
+      "source": "src/tool.ts",
+      "score": 1.0,
+      "symbol_id": "typescript:File:src/tool.ts:1:4:src/tool.ts",
+      "retrieval_sources": [
+        "dense",
+        "sparse"
+      ],
+      "selection_reason": "selected after dense+sparse retrieval evidence with fused/rerank score 1.0000",
+      "text_preview": "// File: src/tool.ts\n// Symbol: file src/tool.ts\n\nfunction ragSentinelTool(input: string): string {\n  const normalized = input.trim().toLowerCase();\n  return `RAG_SENTINEL_RETRIEVAL typescript dense sparse ${normalized}`;\n}"
+    },
+    {
+      "id": "src/lib.rs-0",
+      "relative_path": "src/lib.rs",
+      "source": "src/lib.rs",
+      "score": 0.5,
+      "symbol_id": "rust:Function:src/lib.rs:1:4:rag_sentinel_retrieval",
+      "retrieval_sources": [
+        "dense",
+        "sparse"
+      ],
+      "selection_reason": "selected after dense+sparse retrieval evidence with fused/rerank score 0.5000",
+      "text_preview": "// File: src/lib.rs\n// Symbol: fn rag_sentinel_retrieval\n// Signature: pub fn rag_sentinel_retrieval(input: &str) -> String {\n// Related: fn call_rag_sentinel, file src/lib.rs\n\npub fn rag_sentinel_retrieval(input: &str) -> String {\n    let "
+    },
+    {
+      "id": "docs/guide.md-0",
+      "relative_path": "docs/guide.md",
+      "source": "docs/guide.md",
+      "score": 0.33333334,
+      "symbol_id": null,
+      "retrieval_sources": [
+        "dense",
+        "sparse"
+      ],
+      "selection_reason": "selected after dense+sparse retrieval evidence with fused/rerank score 0.3333",
+      "text_preview": "RAG GuideRAG_SENTINEL_RETRIEVAL markdown rerank target overlap marker RAG_SENTINEL_RETRIEVAL markdown rerank target overlap marker RAG_SENTINEL_RETRIEVAL markdown rerank target overlap marker RAG_SENTINEL_RETRIEVAL markdown rerank target ov"
+    },
+    {
+      "id": "src/lib.rs-1",
+      "relative_path": "src/lib.rs",
+      "source": "src/lib.rs",
+      "score": 0.25,
+      "symbol_id": "rust:Function:src/lib.rs:6:8:call_rag_sentinel",
+      "retrieval_sources": [
+        "dense",
+        "sparse"
+      ],
+      "selection_reason": "selected after dense+sparse retrieval evidence with fused/rerank score 0.2500",
+      "text_preview": "// File: src/lib.rs\n// Symbol: fn call_rag_sentinel\n// Signature: pub fn call_rag_sentinel() -> String {\n// Related: fn rag_sentinel_retrieval, file src/lib.rs\n\npub fn call_rag_sentinel() -> String {\n    rag_sentinel_retrieval(\"context\")\n}"
+    },
+    {
+      "id": "docs/guide.md-2",
+      "relative_path": "docs/guide.md",
+      "source": "docs/guide.md",
+      "score": 0.2,
+      "symbol_id": null,
+      "retrieval_sources": [
+        "dense",
+        "sparse"
+      ],
+      "selection_reason": "selected after dense+sparse retrieval evidence with fused/rerank score 0.2000",
+      "text_preview": "er RAG_SENTINEL_RETRIEVAL markdown rerank target overlap marker RAG_SENTINEL_RETRIEVAL markdown rerank target overlap marker RAG_SENTINEL_RETRIEVAL markdown rerank target overlap marker RAG_SENTINEL_RETRIEVAL markdown rerank target overlap "
+    },
+    {
+      "id": "docs/guide.md-3",
+      "relative_path": "docs/guide.md",
+      "source": "docs/guide.md",
+      "score": 0.16666667,
+      "symbol_id": null,
+      "retrieval_sources": [
+        "dense",
+        "sparse"
+      ],
+      "selection_reason": "selected after dense+sparse retrieval evidence with fused/rerank score 0.1667",
+      "text_preview": "RAG_SENTINEL_RETRIEVAL markdown rerank target overlap marker RAG_SENTINEL_RETRIEVAL markdown rerank target overlap marker RAG_SENTINEL_RETRIEVAL markdown rerank target overlap marker RAG_SENTINEL_RETRIEVAL markdown rerank target overlap mar"
+    },
+    {
+      "id": "docs/guide.md-5",
+      "relative_path": "docs/guide.md",
+      "source": "docs/guide.md",
+      "score": 0.14285715,
+      "symbol_id": null,
+      "retrieval_sources": [
+        "dense",
+        "sparse"
+      ],
+      "selection_reason": "selected after dense+sparse retrieval evidence with fused/rerank score 0.1429",
+      "text_preview": "NTINEL_RETRIEVAL markdown rerank target overlap marker RAG_SENTINEL_RETRIEVAL markdown rerank target overlap marker RAG_SENTINEL_RETRIEVAL markdown rerank target overlap marker RAG_SENTINEL_RETRIEVAL markdown rerank target overlap marker RA"
+    }
+  ],
+  "gates": [
+    {
+      "name": "mixed_project_fixture",
+      "passed": true,
+      "evidence": "indexed file types: markdown,pdf,rust,typescript"
+    },
+    {
+      "name": "chunk_overlap_detected",
+      "passed": true,
+      "evidence": "markdown chunks preserve overlapping repeated marker"
+    },
+    {
+      "name": "ast_symbols_indexed",
+      "passed": true,
+      "evidence": "3 code chunks include AST symbol_id"
+    },
+    {
+      "name": "pdf_indexed",
+      "passed": true,
+      "evidence": "1 PDF chunks indexed"
+    },
+    {
+      "name": "dense_search_returned_context",
+      "passed": true,
+      "evidence": "3 dense hits"
+    },
+    {
+      "name": "sparse_search_returned_context",
+      "passed": true,
+      "evidence": "7 sparse hits"
+    },
+    {
+      "name": "rerank_reordered_candidates",
+      "passed": true,
+      "evidence": "reranked first chunk differs from retrieval first chunk"
+    },
+    {
+      "name": "selected_context_has_reason",
+      "passed": true,
+      "evidence": "all selected chunks include selection_reason"
+    },
+    {
+      "name": "selected_context_has_dense_and_sparse_evidence",
+      "passed": true,
+      "evidence": "selected context contains dense and sparse retrieval evidence"
+    }
+  ],
+  "passed": true
+}
