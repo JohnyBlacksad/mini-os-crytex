@@ -157,6 +157,121 @@ pub async fn prove_tiny_lora_learning(
     Ok(best_report.expect("at least one LoRA proof attempt must run"))
 }
 
+pub async fn prove_real_model_lora_learning(
+    model_dir: &Path,
+    output_dir: &Path,
+    model_source: impl Into<String>,
+) -> Result<CandleLoraLearningProofReport, LoraTrainingError> {
+    let model_source = model_source.into();
+    if !model_dir.join("config.json").is_file() {
+        return Err(LoraTrainingError::Backend(format!(
+            "real model proof requires config.json in {}",
+            model_dir.display()
+        )));
+    }
+    if safetensor_files(model_dir)?.is_empty() {
+        return Err(LoraTrainingError::Backend(format!(
+            "real model proof requires at least one .safetensors file in {}",
+            model_dir.display()
+        )));
+    }
+    let mut best_report: Option<CandleLoraLearningProofReport> = None;
+    for attempt in 0..3 {
+        let attempt_dir = output_dir.join(format!("attempt-{attempt}"));
+        let mut report =
+            prove_real_model_lora_learning_once(model_dir, &attempt_dir, model_source.clone())
+                .await?;
+        report.selected_attempt = attempt;
+        report.attempts_run = attempt + 1;
+        if report.passed {
+            return Ok(report);
+        }
+        best_report = Some(match best_report.take() {
+            Some(best)
+                if best.answer_quality.loss_improvement
+                    >= report.answer_quality.loss_improvement =>
+            {
+                best
+            }
+            _ => report,
+        });
+    }
+    Ok(best_report.expect("at least one real model LoRA proof attempt must run"))
+}
+
+async fn prove_real_model_lora_learning_once(
+    model_dir: &Path,
+    output_dir: &Path,
+    model_source: String,
+) -> Result<CandleLoraLearningProofReport, LoraTrainingError> {
+    tokio::fs::create_dir_all(output_dir).await?;
+    let adapter_dir = output_dir.join("adapters");
+    let _ = tokio::fs::remove_dir_all(&adapter_dir).await;
+    tokio::fs::create_dir_all(&adapter_dir).await?;
+
+    let mut cfg = ModelConfig::from_pretrained_dir(model_dir)
+        .map_err(|error| LoraTrainingError::Backend(error.to_string()))?
+        .with_lora(4, 8, vec!["lm_head".into()]);
+    cfg.max_seq_len = cfg.max_seq_len.min(160);
+    let tokenizer_path = model_dir.join("tokenizer.json");
+    let tokenizer = tokenizer::build_tokenizer(
+        cfg.vocab_size,
+        tokenizer_path.is_file().then_some(tokenizer_path.as_path()),
+    )
+    .map_err(|error| LoraTrainingError::Backend(error.to_string()))?;
+    let prompt = "Implement a distillation marker function:";
+    let prompt_tokens = tokenizer
+        .encode(prompt)
+        .map_err(|error| LoraTrainingError::Backend(error.to_string()))?;
+    let quality_case = lora_learning_quality_case();
+
+    let baseline_output = generate_from_base(model_dir, &cfg, &*tokenizer, &prompt_tokens, None)?;
+    let trainer = CandleLoraTrainer::new();
+    let result = trainer
+        .train(
+            lora_learning_proof_examples(),
+            LoraTrainingConfig {
+                rank: 4,
+                alpha: 8,
+                epochs: 40,
+                learning_rate: 0.05,
+                validation_ratio: 0.25,
+                max_seq_len: 160,
+                base_model_path: Some(model_dir.to_path_buf()),
+                tokenizer_path: tokenizer_path.is_file().then_some(tokenizer_path),
+                target_modules: vec!["lm_head".into()],
+            },
+            &adapter_dir,
+        )
+        .await?;
+    let adapter_file = result.adapter_path.join("adapter_model.safetensors");
+    let adapted_output = generate_from_base(
+        model_dir,
+        &cfg,
+        &*tokenizer,
+        &prompt_tokens,
+        Some(&adapter_file),
+    )?;
+    let answer_quality = score_answer_quality_from_base(
+        model_dir,
+        &cfg,
+        &*tokenizer,
+        &quality_case,
+        Some(&adapter_file),
+    )?;
+    let training_proof = read_adapter_training_proof_sync(&result.adapter_path)?;
+    Ok(build_lora_learning_report(LoraLearningReportInput {
+        outcome_prefix: "REAL_MODEL_LORA_LEARNING_PROOF",
+        model_source,
+        model_path: model_dir.display().to_string(),
+        result,
+        baseline_output,
+        adapted_output,
+        answer_quality,
+        training_proof,
+    }))
+}
+
 async fn prove_tiny_lora_learning_once(
     output_dir: &Path,
 ) -> Result<CandleLoraLearningProofReport, LoraTrainingError> {
@@ -213,6 +328,40 @@ async fn prove_tiny_lora_learning_once(
         Some(&result.adapter_path.join("adapter_model.safetensors")),
     )?;
     let training_proof = read_adapter_training_proof_sync(&result.adapter_path)?;
+    Ok(build_lora_learning_report(LoraLearningReportInput {
+        outcome_prefix: "CANDLE_LORA_LEARNING_PROOF",
+        model_source: "embedded-tiny-candle".into(),
+        model_path: base_dir.display().to_string(),
+        result,
+        baseline_output,
+        adapted_output,
+        answer_quality,
+        training_proof,
+    }))
+}
+
+struct LoraLearningReportInput {
+    outcome_prefix: &'static str,
+    model_source: String,
+    model_path: String,
+    result: LoraTrainingResult,
+    baseline_output: String,
+    adapted_output: String,
+    answer_quality: CandleLoraAnswerQualityProof,
+    training_proof: serde_json::Value,
+}
+
+fn build_lora_learning_report(input: LoraLearningReportInput) -> CandleLoraLearningProofReport {
+    let LoraLearningReportInput {
+        outcome_prefix,
+        model_source,
+        model_path,
+        result,
+        baseline_output,
+        adapted_output,
+        answer_quality,
+        training_proof,
+    } = input;
     let learning_proven = training_proof
         .get("learning_proven")
         .and_then(serde_json::Value::as_bool)
@@ -282,12 +431,14 @@ async fn prove_tiny_lora_learning_once(
         ),
     ];
     let passed = gates.iter().all(|gate| gate.passed);
-    Ok(CandleLoraLearningProofReport {
+    CandleLoraLearningProofReport {
         proof_outcome: if passed {
-            "CANDLE_LORA_LEARNING_PROOF_PASSED".into()
+            format!("{outcome_prefix}_PASSED")
         } else {
-            "CANDLE_LORA_LEARNING_PROOF_FAILED".into()
+            format!("{outcome_prefix}_FAILED")
         },
+        model_source,
+        model_path,
         selected_attempt: 0,
         attempts_run: 1,
         adapter_id: result.adapter_id,
@@ -300,7 +451,7 @@ async fn prove_tiny_lora_learning_once(
         learning_proven,
         gates,
         passed,
-    })
+    }
 }
 
 fn candle_proof_gate(name: &str, passed: bool, evidence: &str) -> CandleLoraLearningProofGate {
@@ -314,6 +465,8 @@ fn candle_proof_gate(name: &str, passed: bool, evidence: &str) -> CandleLoraLear
 #[derive(Debug, Clone, Serialize)]
 pub struct CandleLoraLearningProofReport {
     pub proof_outcome: String,
+    pub model_source: String,
+    pub model_path: String,
     pub selected_attempt: usize,
     pub attempts_run: usize,
     pub adapter_id: String,
@@ -646,7 +799,7 @@ fn random_tiny_base_tensors(
     let mut tensors: HashMap<String, Tensor> = HashMap::new();
     tensors.insert(
         "model.embed_tokens.weight".into(),
-        Tensor::randn(0.0f32, 0.02f32, (v, h), device)?,
+        deterministic_tiny_weight("model.embed_tokens.weight", &[v, h], 0.02, device)?,
     );
     tensors.insert(
         "model.norm.weight".into(),
@@ -654,7 +807,7 @@ fn random_tiny_base_tensors(
     );
     tensors.insert(
         "lm_head.weight".into(),
-        Tensor::randn(0.0f32, 0.02f32, (v, h), device)?,
+        deterministic_tiny_weight("lm_head.weight", &[v, h], 0.02, device)?,
     );
     for layer in 0..cfg.num_layers {
         let p = format!("model.layers.{layer}");
@@ -668,34 +821,77 @@ fn random_tiny_base_tensors(
         );
         tensors.insert(
             format!("{p}.self_attn.q_proj.weight"),
-            Tensor::randn(0.0f32, 0.02f32, (h, h), device)?,
+            deterministic_tiny_weight(
+                &format!("{p}.self_attn.q_proj.weight"),
+                &[h, h],
+                0.02,
+                device,
+            )?,
         );
         tensors.insert(
             format!("{p}.self_attn.k_proj.weight"),
-            Tensor::randn(0.0f32, 0.02f32, (kv_h, h), device)?,
+            deterministic_tiny_weight(
+                &format!("{p}.self_attn.k_proj.weight"),
+                &[kv_h, h],
+                0.02,
+                device,
+            )?,
         );
         tensors.insert(
             format!("{p}.self_attn.v_proj.weight"),
-            Tensor::randn(0.0f32, 0.02f32, (kv_h, h), device)?,
+            deterministic_tiny_weight(
+                &format!("{p}.self_attn.v_proj.weight"),
+                &[kv_h, h],
+                0.02,
+                device,
+            )?,
         );
         tensors.insert(
             format!("{p}.self_attn.o_proj.weight"),
-            Tensor::randn(0.0f32, 0.02f32, (h, h), device)?,
+            deterministic_tiny_weight(
+                &format!("{p}.self_attn.o_proj.weight"),
+                &[h, h],
+                0.02,
+                device,
+            )?,
         );
         tensors.insert(
             format!("{p}.mlp.gate_proj.weight"),
-            Tensor::randn(0.0f32, 0.02f32, (i, h), device)?,
+            deterministic_tiny_weight(&format!("{p}.mlp.gate_proj.weight"), &[i, h], 0.02, device)?,
         );
         tensors.insert(
             format!("{p}.mlp.up_proj.weight"),
-            Tensor::randn(0.0f32, 0.02f32, (i, h), device)?,
+            deterministic_tiny_weight(&format!("{p}.mlp.up_proj.weight"), &[i, h], 0.02, device)?,
         );
         tensors.insert(
             format!("{p}.mlp.down_proj.weight"),
-            Tensor::randn(0.0f32, 0.02f32, (h, i), device)?,
+            deterministic_tiny_weight(&format!("{p}.mlp.down_proj.weight"), &[h, i], 0.02, device)?,
         );
     }
     Ok(tensors)
+}
+
+fn deterministic_tiny_weight(
+    name: &str,
+    shape: &[usize],
+    scale: f32,
+    device: &Device,
+) -> Result<Tensor, candle_core::Error> {
+    let len = shape.iter().product::<usize>();
+    let seed = name.bytes().fold(0x811c9dc5u32, |hash, byte| {
+        hash.wrapping_mul(16777619) ^ u32::from(byte)
+    });
+    let values = (0..len)
+        .map(|index| {
+            let mixed = seed
+                .wrapping_add(index as u32)
+                .wrapping_mul(747796405)
+                .wrapping_add(2891336453);
+            let centered = (mixed % 2001) as f32 / 1000.0 - 1.0;
+            centered * scale
+        })
+        .collect::<Vec<_>>();
+    Tensor::from_vec(values, shape, device)
 }
 
 fn write_tiny_base_model(
@@ -731,9 +927,10 @@ fn generate_from_base(
 ) -> Result<String, LoraTrainingError> {
     let device = Device::Cpu;
     let files = safetensor_files(base_dir)?;
+    let load_cfg = inference_cfg_for_adapter(cfg, adapter_path.is_some());
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files, cfg.dtype, &device) }
         .map_err(|error| LoraTrainingError::Backend(error.to_string()))?;
-    let mut model = LoraCausalLM::load(vb, cfg)
+    let mut model = LoraCausalLM::load(vb, &load_cfg)
         .map_err(|error| LoraTrainingError::Backend(error.to_string()))?;
     if let Some(adapter_path) = adapter_path {
         model
@@ -757,28 +954,32 @@ fn score_answer_quality_from_base(
 ) -> Result<CandleLoraAnswerQualityProof, LoraTrainingError> {
     let device = Device::Cpu;
     let files = safetensor_files(base_dir)?;
+    let baseline_cfg = inference_cfg_for_adapter(cfg, false);
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files, cfg.dtype, &device) }
         .map_err(|error| LoraTrainingError::Backend(error.to_string()))?;
-    let baseline_model = LoraCausalLM::load(vb, cfg)
+    let baseline_model = LoraCausalLM::load(vb, &baseline_cfg)
         .map_err(|error| LoraTrainingError::Backend(error.to_string()))?;
     let baseline_expected_loss =
-        example_loss(&baseline_model, tokenizer, ex, &device, cfg)?.unwrap_or(f64::INFINITY);
+        example_loss(&baseline_model, tokenizer, ex, &device, &baseline_cfg)?
+            .unwrap_or(f64::INFINITY);
     let baseline_candidates =
-        score_answer_candidates(&baseline_model, tokenizer, ex, &device, cfg)?;
+        score_answer_candidates(&baseline_model, tokenizer, ex, &device, &baseline_cfg)?;
 
     let files = safetensor_files(base_dir)?;
+    let adapted_cfg = inference_cfg_for_adapter(cfg, adapter_path.is_some());
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files, cfg.dtype, &device) }
         .map_err(|error| LoraTrainingError::Backend(error.to_string()))?;
-    let mut adapted_model = LoraCausalLM::load(vb, cfg)
+    let mut adapted_model = LoraCausalLM::load(vb, &adapted_cfg)
         .map_err(|error| LoraTrainingError::Backend(error.to_string()))?;
     if let Some(adapter_path) = adapter_path {
         adapted_model
             .load_adapter(adapter_path)
             .map_err(|error| LoraTrainingError::Backend(error.to_string()))?;
     }
-    let adapted_expected_loss =
-        example_loss(&adapted_model, tokenizer, ex, &device, cfg)?.unwrap_or(f64::INFINITY);
-    let adapted_candidates = score_answer_candidates(&adapted_model, tokenizer, ex, &device, cfg)?;
+    let adapted_expected_loss = example_loss(&adapted_model, tokenizer, ex, &device, &adapted_cfg)?
+        .unwrap_or(f64::INFINITY);
+    let adapted_candidates =
+        score_answer_candidates(&adapted_model, tokenizer, ex, &device, &adapted_cfg)?;
     let loss_improvement = baseline_expected_loss - adapted_expected_loss;
     let loss_improvement_ratio =
         if baseline_expected_loss.is_finite() && baseline_expected_loss > 0.0 {
@@ -806,6 +1007,15 @@ fn score_answer_quality_from_base(
             && adapted_expected_loss < baseline_expected_loss
             && adapted_quality_score > baseline_quality_score,
     })
+}
+
+fn inference_cfg_for_adapter(cfg: &ModelConfig, adapter_enabled: bool) -> ModelConfig {
+    let mut load_cfg = cfg.clone();
+    if !adapter_enabled {
+        load_cfg.target_modules.clear();
+        load_cfg.alpha = 0;
+    }
+    load_cfg
 }
 
 fn score_answer_candidates(

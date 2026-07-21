@@ -206,13 +206,14 @@ impl LoraLinear {
         let device = base.device();
         let dtype = base.dtype();
         let (out_features, in_features) = base.dims2()?;
+        let rank = rank.max(1);
         let lora_a_t =
             Tensor::randn(0.0f32, 0.02f32, (rank, in_features), device)?.to_dtype(dtype)?;
         let lora_b_t =
             Tensor::randn(0.0f32, 0.02f32, (out_features, rank), device)?.to_dtype(dtype)?;
         let lora_a = Var::from_tensor(&lora_a_t)?;
         let lora_b = Var::from_tensor(&lora_b_t)?;
-        let scale = alpha as f64 / rank.max(1) as f64;
+        let scale = alpha as f64 / rank as f64;
         let scale_tensor = Tensor::new(scale as f32, device)?.to_dtype(dtype)?;
         Ok(Self {
             base,
@@ -520,12 +521,14 @@ impl LoraCausalLM {
         let mut blocks = Vec::with_capacity(cfg.num_layers);
         let h = cfg.hidden_size;
         let kv_h = cfg.kv_hidden_size();
+        let q_lora_alpha = target_lora_alpha(cfg, &["q_proj", "attn_q"]);
+        let v_lora_alpha = target_lora_alpha(cfg, &["v_proj", "attn_v"]);
         for i in 0..cfg.num_layers {
             let block_vb = vb.pp(format!("model.layers.{i}"));
             let q_base = block_vb.pp("self_attn.q_proj").get((h, h), "weight")?;
             let v_base = block_vb.pp("self_attn.v_proj").get((kv_h, h), "weight")?;
-            let q_proj = LoraLinear::from_base(q_base, cfg.rank, cfg.alpha)?;
-            let v_proj = LoraLinear::from_base(v_base, cfg.rank, cfg.alpha)?;
+            let q_proj = LoraLinear::from_base(q_base, cfg.rank, q_lora_alpha)?;
+            let v_proj = LoraLinear::from_base(v_base, cfg.rank, v_lora_alpha)?;
             lora_layers.push((format!("model.layers.{i}.self_attn.q_proj"), q_proj));
             lora_layers.push((format!("model.layers.{i}.self_attn.v_proj"), v_proj));
 
@@ -681,6 +684,18 @@ impl LoraCausalLM {
             tensors.extend(head.detached_named_tensors("lm_head"));
         }
         tensors
+    }
+}
+
+fn target_lora_alpha(cfg: &ModelConfig, aliases: &[&str]) -> usize {
+    if cfg
+        .target_modules
+        .iter()
+        .any(|module| aliases.iter().any(|alias| module == alias))
+    {
+        cfg.alpha
+    } else {
+        0
     }
 }
 

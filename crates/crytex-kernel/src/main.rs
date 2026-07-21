@@ -254,6 +254,17 @@ enum Commands {
         #[arg(long)]
         report_path: Option<PathBuf>,
     },
+    /// Prove LoRA quality improvement on an external HuggingFace-style safetensors model directory
+    ProveLoraRealModel {
+        #[arg(long)]
+        model_dir: PathBuf,
+        #[arg(long, default_value = "external-hf-safetensors")]
+        model_source: String,
+        #[arg(long)]
+        output_dir: Option<PathBuf>,
+        #[arg(long)]
+        report_path: Option<PathBuf>,
+    },
     /// Add or update a managed HuggingFace/local model entry
     AddModel {
         #[arg(short, long)]
@@ -3901,6 +3912,50 @@ async fn async_main() {
         return;
     }
 
+    if let Commands::ProveLoraRealModel {
+        model_dir,
+        model_source,
+        output_dir,
+        report_path,
+    } = &cli.command
+    {
+        let output_dir = output_dir.clone().unwrap_or_else(|| {
+            config
+                .paths
+                .data_dir
+                .join("proofs")
+                .join(format!("lora-real-model-{}", Ulid::new()))
+        });
+        let report = crytex_inference_candle::prove_real_model_lora_learning(
+            model_dir,
+            &output_dir,
+            model_source.clone(),
+        )
+        .await
+        .unwrap_or_else(|error| {
+            eprintln!("Real model LoRA learning proof failed: {error}");
+            std::process::exit(1);
+        });
+        let payload = serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into());
+        if let Some(report_path) = report_path {
+            if let Some(parent) = report_path.parent()
+                && let Err(error) = tokio::fs::create_dir_all(parent).await
+            {
+                eprintln!("Failed to create real model LoRA report directory: {error}");
+                std::process::exit(1);
+            }
+            if let Err(error) = tokio::fs::write(report_path, &payload).await {
+                eprintln!("Failed to write real model LoRA report: {error}");
+                std::process::exit(1);
+            }
+        }
+        println!("{payload}");
+        if !report.passed {
+            std::process::exit(2);
+        }
+        return;
+    }
+
     let inference = create_inference_service(&config).expect("Failed to create inference service");
 
     if let Commands::ProbeModel {
@@ -4420,6 +4475,9 @@ async fn async_main() {
         Commands::ProveLoraCandleLearning { .. } => unreachable!(
             "prove-lora-candle-learning is handled before full AppContext initialization"
         ),
+        Commands::ProveLoraRealModel { .. } => {
+            unreachable!("prove-lora-real-model is handled before full AppContext initialization")
+        }
         Commands::Submit {
             project,
             prompt,
