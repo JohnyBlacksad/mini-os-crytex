@@ -345,11 +345,51 @@ pub struct AgentArtifactEnvelope {
     pub content: Value,
 }
 
+/// Canonical source-of-truth metadata for a backend run diagnostic export.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunDiagnosticsSourceOfTruth {
+    pub canonical_report: String,
+    pub scope: Vec<String>,
+    pub trace_complete: bool,
+    pub task_complete: bool,
+    pub event_complete: bool,
+    pub artifact_complete: bool,
+    pub decision_complete: bool,
+    pub human_review_complete: bool,
+}
+
+/// Counted decision/evidence coverage for a backend run diagnostic export.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunDiagnosticsDecisionSummary {
+    pub model_decisions: usize,
+    pub rerank_decisions: usize,
+    pub context_compression: usize,
+    pub prompt_decisions: usize,
+    pub lora_decisions: usize,
+    pub benchmark_results: usize,
+    pub ab_test_results: usize,
+    pub artifact_lineage: usize,
+    pub artifact_handoff_rejections: usize,
+    pub remediation_events: usize,
+    pub human_reward_recorded: bool,
+}
+
+/// One source-of-truth coverage gate for a backend diagnostic domain.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunDiagnosticsCoverageGate {
+    pub name: String,
+    pub passed: bool,
+    pub evidence: String,
+}
+
 /// Structured run evidence for Observe and manual diagnostics.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RunDiagnosticsReport {
     pub project_id: String,
     pub run_id: String,
+    pub source_of_truth: RunDiagnosticsSourceOfTruth,
+    pub decision_summary: RunDiagnosticsDecisionSummary,
+    pub coverage_gates: Vec<RunDiagnosticsCoverageGate>,
     pub trace_ids: Vec<String>,
     pub runtime: RuntimeStatus,
     pub tasks: Vec<RunDiagnosticTask>,
@@ -1215,10 +1255,36 @@ pub fn build_run_diagnostics(
     let human_reward_recorded = events.iter().any(|event| {
         event.action == "human_review_approved" && event.metadata["reward"].is_number()
     });
+    let decision_summary = diagnostic_decision_summary(DiagnosticDecisionSummaryInput {
+        model_decisions: &model_decisions,
+        rerank_decisions: &rerank_decisions,
+        context_compression: &context_compression,
+        prompt_decisions: &prompt_decisions,
+        lora_decisions: &lora_decisions,
+        benchmark_results: &benchmark_results,
+        ab_test_results: &ab_test_results,
+        artifact_lineage: &artifact_lineage,
+        artifact_handoff_rejections: &artifact_handoff_rejections,
+        remediation_events: &remediation_events,
+        human_reward_recorded,
+    });
+    let coverage_gates = diagnostic_coverage_gates(DiagnosticCoverageInput {
+        trace_ids: &trace_ids,
+        tasks: &tasks,
+        events: &events,
+        review_task_ids: &review_task_ids,
+        critic_feedback: &critic_feedback,
+        rag_context_sent_to_model,
+        decision_summary: &decision_summary,
+    });
+    let source_of_truth = diagnostic_source_of_truth(&coverage_gates);
 
     Ok(RunDiagnosticsReport {
         project_id: request.project_id,
         run_id: request.run_id,
+        source_of_truth,
+        decision_summary,
+        coverage_gates,
         trace_ids,
         runtime,
         tasks,
@@ -1240,6 +1306,192 @@ pub fn build_run_diagnostics(
         rag_context_sent_to_model,
         human_reward_recorded,
     })
+}
+
+struct DiagnosticDecisionSummaryInput<'a> {
+    model_decisions: &'a [RunDiagnosticModelDecision],
+    rerank_decisions: &'a [RunDiagnosticRerankDecision],
+    context_compression: &'a [RunDiagnosticContextCompression],
+    prompt_decisions: &'a [RunDiagnosticPromptDecision],
+    lora_decisions: &'a [RunDiagnosticLoraDecision],
+    benchmark_results: &'a [RunDiagnosticBenchmarkResult],
+    ab_test_results: &'a [RunDiagnosticAbTestResult],
+    artifact_lineage: &'a [AgentArtifactEnvelope],
+    artifact_handoff_rejections: &'a [RunDiagnosticArtifactHandoffRejection],
+    remediation_events: &'a [RunDiagnosticEvent],
+    human_reward_recorded: bool,
+}
+
+fn diagnostic_decision_summary(
+    input: DiagnosticDecisionSummaryInput<'_>,
+) -> RunDiagnosticsDecisionSummary {
+    RunDiagnosticsDecisionSummary {
+        model_decisions: input.model_decisions.len(),
+        rerank_decisions: input.rerank_decisions.len(),
+        context_compression: input.context_compression.len(),
+        prompt_decisions: input.prompt_decisions.len(),
+        lora_decisions: input.lora_decisions.len(),
+        benchmark_results: input.benchmark_results.len(),
+        ab_test_results: input.ab_test_results.len(),
+        artifact_lineage: input.artifact_lineage.len(),
+        artifact_handoff_rejections: input.artifact_handoff_rejections.len(),
+        remediation_events: input.remediation_events.len(),
+        human_reward_recorded: input.human_reward_recorded,
+    }
+}
+
+struct DiagnosticCoverageInput<'a> {
+    trace_ids: &'a [String],
+    tasks: &'a [RunDiagnosticTask],
+    events: &'a [RunDiagnosticEvent],
+    review_task_ids: &'a [String],
+    critic_feedback: &'a [String],
+    rag_context_sent_to_model: bool,
+    decision_summary: &'a RunDiagnosticsDecisionSummary,
+}
+
+fn diagnostic_coverage_gates(
+    input: DiagnosticCoverageInput<'_>,
+) -> Vec<RunDiagnosticsCoverageGate> {
+    vec![
+        diagnostic_coverage_gate(
+            "trace_ids",
+            !input.trace_ids.is_empty()
+                && input
+                    .tasks
+                    .iter()
+                    .all(|task| input.trace_ids.contains(&task.trace_id)),
+            format!(
+                "trace_ids={}, tasks={}",
+                input.trace_ids.len(),
+                input.tasks.len()
+            ),
+        ),
+        diagnostic_coverage_gate(
+            "runtime_model_decisions",
+            input.decision_summary.model_decisions > 0,
+            format!("model_decisions={}", input.decision_summary.model_decisions),
+        ),
+        diagnostic_coverage_gate(
+            "tasks_and_events",
+            !input.tasks.is_empty() && !input.events.is_empty(),
+            format!("tasks={}, events={}", input.tasks.len(), input.events.len()),
+        ),
+        diagnostic_coverage_gate(
+            "artifact_lineage",
+            input.decision_summary.artifact_lineage > 0,
+            format!("artifacts={}", input.decision_summary.artifact_lineage),
+        ),
+        diagnostic_coverage_gate(
+            "rag_rerank",
+            input.rag_context_sent_to_model && input.decision_summary.rerank_decisions > 0,
+            format!(
+                "rag_context_sent={}, rerank_decisions={}",
+                input.rag_context_sent_to_model, input.decision_summary.rerank_decisions
+            ),
+        ),
+        diagnostic_coverage_gate(
+            "context_compression",
+            input.decision_summary.context_compression > 0,
+            format!(
+                "context_compression={}",
+                input.decision_summary.context_compression
+            ),
+        ),
+        diagnostic_coverage_gate(
+            "prompt_decisions",
+            input.decision_summary.prompt_decisions > 0,
+            format!(
+                "prompt_decisions={}",
+                input.decision_summary.prompt_decisions
+            ),
+        ),
+        diagnostic_coverage_gate(
+            "lora_decisions",
+            input.decision_summary.lora_decisions > 0,
+            format!("lora_decisions={}", input.decision_summary.lora_decisions),
+        ),
+        diagnostic_coverage_gate(
+            "benchmarks_and_ab_tests",
+            input.decision_summary.benchmark_results > 0
+                && input.decision_summary.ab_test_results > 0,
+            format!(
+                "benchmarks={}, ab_tests={}",
+                input.decision_summary.benchmark_results, input.decision_summary.ab_test_results
+            ),
+        ),
+        diagnostic_coverage_gate(
+            "review_and_human_reward",
+            !input.review_task_ids.is_empty()
+                && !input.critic_feedback.is_empty()
+                && input.decision_summary.human_reward_recorded,
+            format!(
+                "review_tasks={}, critic_feedback={}, human_reward={}",
+                input.review_task_ids.len(),
+                input.critic_feedback.len(),
+                input.decision_summary.human_reward_recorded
+            ),
+        ),
+        diagnostic_coverage_gate(
+            "remediation",
+            input.decision_summary.remediation_events > 0,
+            format!(
+                "remediation_events={}",
+                input.decision_summary.remediation_events
+            ),
+        ),
+    ]
+}
+
+fn diagnostic_coverage_gate(
+    name: impl Into<String>,
+    passed: bool,
+    evidence: impl Into<String>,
+) -> RunDiagnosticsCoverageGate {
+    RunDiagnosticsCoverageGate {
+        name: name.into(),
+        passed,
+        evidence: evidence.into(),
+    }
+}
+
+fn diagnostic_source_of_truth(gates: &[RunDiagnosticsCoverageGate]) -> RunDiagnosticsSourceOfTruth {
+    let gate_passed = |name: &str| {
+        gates
+            .iter()
+            .find(|gate| gate.name == name)
+            .is_some_and(|gate| gate.passed)
+    };
+    RunDiagnosticsSourceOfTruth {
+        canonical_report: "RunDiagnosticsReport".into(),
+        scope: vec![
+            "runtime_model".into(),
+            "tasks_events".into(),
+            "artifact_lineage".into(),
+            "rag_rerank".into(),
+            "context_compression".into(),
+            "prompt_evolution".into(),
+            "lora_evolution".into(),
+            "benchmark_ab_tests".into(),
+            "human_review_reward".into(),
+            "remediation".into(),
+        ],
+        trace_complete: gate_passed("trace_ids"),
+        task_complete: gate_passed("tasks_and_events"),
+        event_complete: gate_passed("tasks_and_events"),
+        artifact_complete: gate_passed("artifact_lineage"),
+        decision_complete: [
+            "runtime_model_decisions",
+            "rag_rerank",
+            "context_compression",
+            "prompt_decisions",
+            "lora_decisions",
+            "benchmarks_and_ab_tests",
+        ]
+        .iter()
+        .all(|name| gate_passed(name)),
+        human_review_complete: gate_passed("review_and_human_reward"),
+    }
 }
 
 fn diagnostic_event_row(log: &crytex_core::models::AgentLog) -> RunDiagnosticEvent {
@@ -6257,6 +6509,18 @@ mod tests {
         );
         task.prompt_version_id = Some("prompt-coder-v2".into());
         task.lora_adapter_id = Some("coder-lora-v1".into());
+        task.payload["upstream_artifacts"] = json!([
+            {
+                "schema_version": 1,
+                "artifact_id": "artifact-architect-plan",
+                "source_task_id": "task-architect",
+                "source_agent": "architect",
+                "artifact_kind": "architect_plan",
+                "content": {
+                    "summary": "Implement retry adapter with idempotency evidence"
+                }
+            }
+        ]);
         let state = ProjectState {
             project: dummy_project("p1"),
             kanban: KanbanState {
@@ -6274,7 +6538,7 @@ mod tests {
                         "backend_id": "ollama",
                         "model": "qwen3.5:9b",
                         "lora_adapter_id": "coder-lora-v1",
-                        "messages": [{"role": "user", "content": "selected project context"}]
+                        "messages": [{"role": "user", "content": "RAG_CONTEXT selected project context"}]
                     }),
                 ),
                 diagnostic_log(
@@ -6352,6 +6616,35 @@ mod tests {
                         }
                     }),
                 ),
+                diagnostic_log(
+                    "critic_rejected",
+                    Some("task-coder"),
+                    json!({
+                        "run_id": "run-1",
+                        "trace_id": "trace-1",
+                        "feedback": "missing retry idempotency test"
+                    }),
+                ),
+                diagnostic_log(
+                    "remediation_task_created",
+                    Some("task-coder"),
+                    json!({
+                        "run_id": "run-1",
+                        "trace_id": "trace-1",
+                        "reason": "critic rejected missing test evidence",
+                        "review_task_ids": ["task-coder"]
+                    }),
+                ),
+                diagnostic_log(
+                    "human_review_approved",
+                    Some("task-coder"),
+                    json!({
+                        "run_id": "run-1",
+                        "trace_id": "trace-1",
+                        "human_score": 1.0,
+                        "reward": 1.0
+                    }),
+                ),
             ],
             latest_snapshot: None,
             metrics: MetricsSnapshot::default(),
@@ -6394,6 +6687,53 @@ mod tests {
         );
         assert_eq!(report.benchmark_results.len(), 2);
         assert_eq!(report.ab_test_results.len(), 2);
+        assert_eq!(
+            report.source_of_truth.canonical_report,
+            "RunDiagnosticsReport"
+        );
+        assert!(report.source_of_truth.trace_complete);
+        assert!(report.source_of_truth.task_complete);
+        assert!(report.source_of_truth.event_complete);
+        assert!(report.source_of_truth.artifact_complete);
+        assert!(report.source_of_truth.decision_complete);
+        assert!(report.source_of_truth.human_review_complete);
+        assert_eq!(report.decision_summary.model_decisions, 1);
+        assert_eq!(report.decision_summary.rerank_decisions, 1);
+        assert_eq!(report.decision_summary.context_compression, 1);
+        assert_eq!(report.decision_summary.prompt_decisions, 1);
+        assert_eq!(report.decision_summary.lora_decisions, 1);
+        assert_eq!(report.decision_summary.artifact_lineage, 1);
+        assert_eq!(report.decision_summary.remediation_events, 1);
+        assert!(report.decision_summary.human_reward_recorded);
+        for gate in [
+            "trace_ids",
+            "runtime_model_decisions",
+            "tasks_and_events",
+            "artifact_lineage",
+            "rag_rerank",
+            "context_compression",
+            "prompt_decisions",
+            "lora_decisions",
+            "benchmarks_and_ab_tests",
+            "review_and_human_reward",
+            "remediation",
+        ] {
+            assert!(
+                report
+                    .coverage_gates
+                    .iter()
+                    .any(|coverage| coverage.name == gate && coverage.passed),
+                "missing passed coverage gate {gate}"
+            );
+        }
+
+        let artifact_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join(".crytex-smoke-logs")
+            .join("diagnostics-unification-proof.json");
+        std::fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
+        std::fs::write(artifact_path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
     }
 
     #[tokio::test]

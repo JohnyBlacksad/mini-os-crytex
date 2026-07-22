@@ -310,6 +310,7 @@ impl CrytexAppState {
             .with_threshold(50)
             .with_min_human_score(1.0)
             .with_validation_reward_threshold(0.4)
+            .with_validation_loss_threshold(8.0)
             .with_experience_repo(storage.clone())
             .with_training_job_repo(storage.clone())
             .with_vector_index(embedder.clone(), vector_store.clone());

@@ -1,0 +1,681 @@
+{
+  "project_id": "p1",
+  "run_id": "run-1",
+  "source_of_truth": {
+    "canonical_report": "RunDiagnosticsReport",
+    "scope": [
+      "runtime_model",
+      "tasks_events",
+      "artifact_lineage",
+      "rag_rerank",
+      "context_compression",
+      "prompt_evolution",
+      "lora_evolution",
+      "benchmark_ab_tests",
+      "human_review_reward",
+      "remediation"
+    ],
+    "trace_complete": true,
+    "task_complete": true,
+    "event_complete": true,
+    "artifact_complete": true,
+    "decision_complete": true,
+    "human_review_complete": true
+  },
+  "decision_summary": {
+    "model_decisions": 1,
+    "rerank_decisions": 1,
+    "context_compression": 1,
+    "prompt_decisions": 1,
+    "lora_decisions": 1,
+    "benchmark_results": 2,
+    "ab_test_results": 2,
+    "artifact_lineage": 1,
+    "artifact_handoff_rejections": 0,
+    "remediation_events": 1,
+    "human_reward_recorded": true
+  },
+  "coverage_gates": [
+    {
+      "name": "trace_ids",
+      "passed": true,
+      "evidence": "trace_ids=1, tasks=1"
+    },
+    {
+      "name": "runtime_model_decisions",
+      "passed": true,
+      "evidence": "model_decisions=1"
+    },
+    {
+      "name": "tasks_and_events",
+      "passed": true,
+      "evidence": "tasks=1, events=8"
+    },
+    {
+      "name": "artifact_lineage",
+      "passed": true,
+      "evidence": "artifacts=1"
+    },
+    {
+      "name": "rag_rerank",
+      "passed": true,
+      "evidence": "rag_context_sent=true, rerank_decisions=1"
+    },
+    {
+      "name": "context_compression",
+      "passed": true,
+      "evidence": "context_compression=1"
+    },
+    {
+      "name": "prompt_decisions",
+      "passed": true,
+      "evidence": "prompt_decisions=1"
+    },
+    {
+      "name": "lora_decisions",
+      "passed": true,
+      "evidence": "lora_decisions=1"
+    },
+    {
+      "name": "benchmarks_and_ab_tests",
+      "passed": true,
+      "evidence": "benchmarks=2, ab_tests=2"
+    },
+    {
+      "name": "review_and_human_reward",
+      "passed": true,
+      "evidence": "review_tasks=1, critic_feedback=1, human_reward=true"
+    },
+    {
+      "name": "remediation",
+      "passed": true,
+      "evidence": "remediation_events=1"
+    }
+  ],
+  "trace_ids": [
+    "trace-1"
+  ],
+  "runtime": {
+    "tauri_runtime": true,
+    "executor_mode": "ollama_agent",
+    "planning_mode": "deterministic",
+    "active_backend": "ollama",
+    "active_model": "qwen3.5:9b",
+    "ollama_url": "http://127.0.0.1:11434",
+    "real_agent_execution": true,
+    "ready_to_run": true,
+    "missing_requirements": [],
+    "backend_capabilities": [],
+    "cuda_toolchain": null,
+    "compatibility_notes": [],
+    "model_compatibility": null
+  },
+  "tasks": [
+    {
+      "id": "task-coder",
+      "parent_id": null,
+      "title": "coder task",
+      "kind": "codegen",
+      "agent": "coder",
+      "status": "Completed",
+      "trace_id": "trace-1",
+      "result_source": "agent_service",
+      "review_decision": null,
+      "critic_feedback": null,
+      "critic_score": null,
+      "human_score": null,
+      "prompt_version_id": "prompt-coder-v2",
+      "lora_adapter_id": "coder-lora-v1"
+    }
+  ],
+  "events": [
+    {
+      "action": "llm_request",
+      "task_id": "task-coder",
+      "level": "info",
+      "timestamp": 0,
+      "metadata": {
+        "run_id": "run-1",
+        "trace_id": "trace-1",
+        "backend_id": "ollama",
+        "model": "qwen3.5:9b",
+        "lora_adapter_id": "coder-lora-v1",
+        "messages": [
+          {
+            "role": "user",
+            "content": "RAG_CONTEXT selected project context"
+          }
+        ]
+      }
+    },
+    {
+      "action": "rag_context_assembled",
+      "task_id": "task-coder",
+      "level": "info",
+      "timestamp": 0,
+      "metadata": {
+        "run_id": "run-1",
+        "trace_id": "trace-1",
+        "query": "payment retry adapter",
+        "rerank_applied": true,
+        "retrieval_candidates": [
+          {
+            "id": "doc-low",
+            "score": 0.41,
+            "relative_path": "docs/low.md",
+            "selection_reason": "dense candidate"
+          },
+          {
+            "id": "doc-high",
+            "score": 0.72,
+            "relative_path": "docs/high.md",
+            "selection_reason": "dense candidate"
+          }
+        ],
+        "reranked_chunks": [
+          {
+            "id": "doc-high",
+            "score": 0.93,
+            "relative_path": "docs/high.md",
+            "selection_reason": "reranker promoted exact task evidence"
+          },
+          {
+            "id": "doc-low",
+            "score": 0.44,
+            "relative_path": "docs/low.md",
+            "selection_reason": "reranker kept supporting context"
+          }
+        ],
+        "chunks": [
+          {
+            "id": "doc-high",
+            "score": 0.93,
+            "relative_path": "docs/high.md",
+            "text_preview": "retry adapter preserves idempotency",
+            "selection_reason": "reranker promoted exact task evidence"
+          }
+        ]
+      }
+    },
+    {
+      "action": "context_compression_applied",
+      "task_id": "task-coder",
+      "level": "info",
+      "timestamp": 0,
+      "metadata": {
+        "run_id": "run-1",
+        "trace_id": "trace-1",
+        "input_tokens": 1200,
+        "output_tokens": 420,
+        "compression_ratio": 0.35,
+        "preserved_facts": [
+          "retry adapter preserves idempotency",
+          "human approval required"
+        ]
+      }
+    },
+    {
+      "action": "prompt_evolution_promoted",
+      "task_id": "task-coder",
+      "level": "info",
+      "timestamp": 0,
+      "metadata": {
+        "run_id": "run-1",
+        "trace_id": "trace-1",
+        "agent": "coder",
+        "baseline_prompt_version_id": "prompt-coder-v1",
+        "challenger_prompt_version_id": "prompt-coder-v2",
+        "prompt_benchmark_gate": {
+          "accepted": true,
+          "reason": "challenger improves held-out pass rate",
+          "baseline_run_id": "prompt-a",
+          "challenger_run_id": "prompt-b",
+          "winner": "Challenger",
+          "mc_nemar_p_value": 0.03125,
+          "baseline_pass_rate": 0.5,
+          "challenger_pass_rate": 1.0,
+          "held_out": true
+        }
+      }
+    },
+    {
+      "action": "lora_evolution_promoted",
+      "task_id": "task-coder",
+      "level": "info",
+      "timestamp": 0,
+      "metadata": {
+        "run_id": "run-1",
+        "trace_id": "trace-1",
+        "adapter_id": "coder-lora-v1",
+        "benchmark_gate": {
+          "accepted": true,
+          "reason": "adapter improves held-out code repair",
+          "baseline_run_id": "lora-a",
+          "challenger_run_id": "lora-b",
+          "winner": "Challenger",
+          "mc_nemar_p_value": 0.03125,
+          "baseline_pass_rate": 0.25,
+          "challenger_pass_rate": 0.75,
+          "held_out": true
+        }
+      }
+    },
+    {
+      "action": "critic_rejected",
+      "task_id": "task-coder",
+      "level": "info",
+      "timestamp": 0,
+      "metadata": {
+        "run_id": "run-1",
+        "trace_id": "trace-1",
+        "feedback": "missing retry idempotency test"
+      }
+    },
+    {
+      "action": "remediation_task_created",
+      "task_id": "task-coder",
+      "level": "info",
+      "timestamp": 0,
+      "metadata": {
+        "run_id": "run-1",
+        "trace_id": "trace-1",
+        "reason": "critic rejected missing test evidence",
+        "review_task_ids": [
+          "task-coder"
+        ]
+      }
+    },
+    {
+      "action": "human_review_approved",
+      "task_id": "task-coder",
+      "level": "info",
+      "timestamp": 0,
+      "metadata": {
+        "run_id": "run-1",
+        "trace_id": "trace-1",
+        "human_score": 1.0,
+        "reward": 1.0
+      }
+    }
+  ],
+  "review_task_ids": [
+    "task-coder"
+  ],
+  "critic_feedback": [
+    "missing retry idempotency test"
+  ],
+  "artifact_lineage": [
+    {
+      "schema_version": 1,
+      "artifact_id": "artifact-architect-plan",
+      "source_task_id": "task-architect",
+      "source_agent": "architect",
+      "artifact_kind": "architect_plan",
+      "content": {
+        "summary": "Implement retry adapter with idempotency evidence"
+      }
+    }
+  ],
+  "artifact_handoff_rejections": [],
+  "remediation_events": [
+    {
+      "action": "remediation_task_created",
+      "task_id": "task-coder",
+      "level": "info",
+      "timestamp": 0,
+      "metadata": {
+        "run_id": "run-1",
+        "trace_id": "trace-1",
+        "reason": "critic rejected missing test evidence",
+        "review_task_ids": [
+          "task-coder"
+        ]
+      }
+    }
+  ],
+  "model_decisions": [
+    {
+      "task_id": "task-coder",
+      "backend_id": "ollama",
+      "model": "qwen3.5:9b",
+      "reason": "llm_request selected backend/model for generation",
+      "source": "llm_request",
+      "metadata": {
+        "run_id": "run-1",
+        "trace_id": "trace-1",
+        "backend_id": "ollama",
+        "model": "qwen3.5:9b",
+        "lora_adapter_id": "coder-lora-v1",
+        "messages": [
+          {
+            "role": "user",
+            "content": "RAG_CONTEXT selected project context"
+          }
+        ]
+      }
+    }
+  ],
+  "rerank_decisions": [
+    {
+      "task_id": "task-coder",
+      "query": "payment retry adapter",
+      "rerank_applied": true,
+      "before": [
+        {
+          "id": "doc-low",
+          "score": 0.41,
+          "relative_path": "docs/low.md",
+          "selection_reason": "dense candidate"
+        },
+        {
+          "id": "doc-high",
+          "score": 0.72,
+          "relative_path": "docs/high.md",
+          "selection_reason": "dense candidate"
+        }
+      ],
+      "after": [
+        {
+          "id": "doc-high",
+          "score": 0.93,
+          "relative_path": "docs/high.md",
+          "selection_reason": "reranker promoted exact task evidence"
+        },
+        {
+          "id": "doc-low",
+          "score": 0.44,
+          "relative_path": "docs/low.md",
+          "selection_reason": "reranker kept supporting context"
+        }
+      ],
+      "selected": [
+        {
+          "id": "doc-high",
+          "score": 0.93,
+          "relative_path": "docs/high.md",
+          "text_preview": "retry adapter preserves idempotency",
+          "selection_reason": "reranker promoted exact task evidence"
+        }
+      ],
+      "reason": "RAG context selected after retrieval and rerank evidence",
+      "metadata": {
+        "run_id": "run-1",
+        "trace_id": "trace-1",
+        "query": "payment retry adapter",
+        "rerank_applied": true,
+        "retrieval_candidates": [
+          {
+            "id": "doc-low",
+            "score": 0.41,
+            "relative_path": "docs/low.md",
+            "selection_reason": "dense candidate"
+          },
+          {
+            "id": "doc-high",
+            "score": 0.72,
+            "relative_path": "docs/high.md",
+            "selection_reason": "dense candidate"
+          }
+        ],
+        "reranked_chunks": [
+          {
+            "id": "doc-high",
+            "score": 0.93,
+            "relative_path": "docs/high.md",
+            "selection_reason": "reranker promoted exact task evidence"
+          },
+          {
+            "id": "doc-low",
+            "score": 0.44,
+            "relative_path": "docs/low.md",
+            "selection_reason": "reranker kept supporting context"
+          }
+        ],
+        "chunks": [
+          {
+            "id": "doc-high",
+            "score": 0.93,
+            "relative_path": "docs/high.md",
+            "text_preview": "retry adapter preserves idempotency",
+            "selection_reason": "reranker promoted exact task evidence"
+          }
+        ]
+      }
+    }
+  ],
+  "context_compression": [
+    {
+      "task_id": "task-coder",
+      "input_tokens": 1200,
+      "output_tokens": 420,
+      "compression_ratio": 0.35,
+      "preserved_facts": [
+        "retry adapter preserves idempotency",
+        "human approval required"
+      ],
+      "reason": "context compression preserved selected facts within token budget",
+      "metadata": {
+        "run_id": "run-1",
+        "trace_id": "trace-1",
+        "input_tokens": 1200,
+        "output_tokens": 420,
+        "compression_ratio": 0.35,
+        "preserved_facts": [
+          "retry adapter preserves idempotency",
+          "human approval required"
+        ]
+      }
+    }
+  ],
+  "prompt_decisions": [
+    {
+      "task_id": "task-coder",
+      "agent": "coder",
+      "prompt_version_id": "prompt-coder-v2",
+      "reason": "task was created with active prompt version for its agent",
+      "benchmark": {
+        "run_id": "run-1",
+        "trace_id": "trace-1",
+        "agent": "coder",
+        "baseline_prompt_version_id": "prompt-coder-v1",
+        "challenger_prompt_version_id": "prompt-coder-v2",
+        "prompt_benchmark_gate": {
+          "accepted": true,
+          "reason": "challenger improves held-out pass rate",
+          "baseline_run_id": "prompt-a",
+          "challenger_run_id": "prompt-b",
+          "winner": "Challenger",
+          "mc_nemar_p_value": 0.03125,
+          "baseline_pass_rate": 0.5,
+          "challenger_pass_rate": 1.0,
+          "held_out": true
+        }
+      }
+    }
+  ],
+  "lora_decisions": [
+    {
+      "task_id": "task-coder",
+      "agent": "coder",
+      "adapter_id": "coder-lora-v1",
+      "reason": "task was routed to a role/kind LoRA adapter",
+      "benchmark": {
+        "run_id": "run-1",
+        "trace_id": "trace-1",
+        "adapter_id": "coder-lora-v1",
+        "benchmark_gate": {
+          "accepted": true,
+          "reason": "adapter improves held-out code repair",
+          "baseline_run_id": "lora-a",
+          "challenger_run_id": "lora-b",
+          "winner": "Challenger",
+          "mc_nemar_p_value": 0.03125,
+          "baseline_pass_rate": 0.25,
+          "challenger_pass_rate": 0.75,
+          "held_out": true
+        }
+      }
+    }
+  ],
+  "benchmark_results": [
+    {
+      "task_id": "task-coder",
+      "kind": "prompt",
+      "accepted": true,
+      "winner": "Challenger",
+      "baseline_run_id": "prompt-a",
+      "challenger_run_id": "prompt-b",
+      "baseline_pass_rate": 0.5,
+      "challenger_pass_rate": 1.0,
+      "mc_nemar_p_value": 0.03125,
+      "reason": "challenger improves held-out pass rate",
+      "held_out": true,
+      "metadata": {
+        "accepted": true,
+        "reason": "challenger improves held-out pass rate",
+        "baseline_run_id": "prompt-a",
+        "challenger_run_id": "prompt-b",
+        "winner": "Challenger",
+        "mc_nemar_p_value": 0.03125,
+        "baseline_pass_rate": 0.5,
+        "challenger_pass_rate": 1.0,
+        "held_out": true
+      }
+    },
+    {
+      "task_id": "task-coder",
+      "kind": "lora",
+      "accepted": true,
+      "winner": "Challenger",
+      "baseline_run_id": "lora-a",
+      "challenger_run_id": "lora-b",
+      "baseline_pass_rate": 0.25,
+      "challenger_pass_rate": 0.75,
+      "mc_nemar_p_value": 0.03125,
+      "reason": "adapter improves held-out code repair",
+      "held_out": true,
+      "metadata": {
+        "accepted": true,
+        "reason": "adapter improves held-out code repair",
+        "baseline_run_id": "lora-a",
+        "challenger_run_id": "lora-b",
+        "winner": "Challenger",
+        "mc_nemar_p_value": 0.03125,
+        "baseline_pass_rate": 0.25,
+        "challenger_pass_rate": 0.75,
+        "held_out": true
+      }
+    }
+  ],
+  "ab_test_results": [
+    {
+      "task_id": "task-coder",
+      "kind": "prompt",
+      "baseline_run_id": "prompt-a",
+      "challenger_run_id": "prompt-b",
+      "winner": "Challenger",
+      "delta_pass_rate": 0.5,
+      "accepted": true,
+      "reason": "challenger improves held-out pass rate",
+      "metadata": {
+        "accepted": true,
+        "reason": "challenger improves held-out pass rate",
+        "baseline_run_id": "prompt-a",
+        "challenger_run_id": "prompt-b",
+        "winner": "Challenger",
+        "mc_nemar_p_value": 0.03125,
+        "baseline_pass_rate": 0.5,
+        "challenger_pass_rate": 1.0,
+        "held_out": true
+      }
+    },
+    {
+      "task_id": "task-coder",
+      "kind": "lora",
+      "baseline_run_id": "lora-a",
+      "challenger_run_id": "lora-b",
+      "winner": "Challenger",
+      "delta_pass_rate": 0.5,
+      "accepted": true,
+      "reason": "adapter improves held-out code repair",
+      "metadata": {
+        "accepted": true,
+        "reason": "adapter improves held-out code repair",
+        "baseline_run_id": "lora-a",
+        "challenger_run_id": "lora-b",
+        "winner": "Challenger",
+        "mc_nemar_p_value": 0.03125,
+        "baseline_pass_rate": 0.25,
+        "challenger_pass_rate": 0.75,
+        "held_out": true
+      }
+    }
+  ],
+  "lora_evolution": [
+    {
+      "task_id": "task-coder",
+      "training_job_id": null,
+      "adapter_id": "coder-lora-v1",
+      "accepted": true,
+      "reason": "adapter improves held-out code repair",
+      "baseline_run_id": "lora-a",
+      "challenger_run_id": "lora-b",
+      "winner": "Challenger",
+      "mc_nemar_p_value": 0.03125,
+      "baseline_pass_rate": 0.25,
+      "challenger_pass_rate": 0.75,
+      "metadata": {
+        "run_id": "run-1",
+        "trace_id": "trace-1",
+        "adapter_id": "coder-lora-v1",
+        "benchmark_gate": {
+          "accepted": true,
+          "reason": "adapter improves held-out code repair",
+          "baseline_run_id": "lora-a",
+          "challenger_run_id": "lora-b",
+          "winner": "Challenger",
+          "mc_nemar_p_value": 0.03125,
+          "baseline_pass_rate": 0.25,
+          "challenger_pass_rate": 0.75,
+          "held_out": true
+        }
+      }
+    }
+  ],
+  "prompt_evolution": [
+    {
+      "task_id": "task-coder",
+      "agent": "coder",
+      "baseline_prompt_version_id": "prompt-coder-v1",
+      "challenger_prompt_version_id": "prompt-coder-v2",
+      "accepted": true,
+      "reason": "challenger improves held-out pass rate",
+      "baseline_run_id": "prompt-a",
+      "challenger_run_id": "prompt-b",
+      "winner": "Challenger",
+      "mc_nemar_p_value": 0.03125,
+      "baseline_pass_rate": 0.5,
+      "challenger_pass_rate": 1.0,
+      "metadata": {
+        "run_id": "run-1",
+        "trace_id": "trace-1",
+        "agent": "coder",
+        "baseline_prompt_version_id": "prompt-coder-v1",
+        "challenger_prompt_version_id": "prompt-coder-v2",
+        "prompt_benchmark_gate": {
+          "accepted": true,
+          "reason": "challenger improves held-out pass rate",
+          "baseline_run_id": "prompt-a",
+          "challenger_run_id": "prompt-b",
+          "winner": "Challenger",
+          "mc_nemar_p_value": 0.03125,
+          "baseline_pass_rate": 0.5,
+          "challenger_pass_rate": 1.0,
+          "held_out": true
+        }
+      }
+    }
+  ],
+  "rag_context_sent_to_model": true,
+  "human_reward_recorded": true
+}

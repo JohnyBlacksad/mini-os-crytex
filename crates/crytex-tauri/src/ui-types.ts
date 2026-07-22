@@ -384,6 +384,8 @@ export type RunDiagnosticTask = {
   critic_feedback: string | null;
   critic_score: number | null;
   human_score: number | null;
+  prompt_version_id: string | null;
+  lora_adapter_id: string | null;
 };
 
 export type RunDiagnosticEvent = {
@@ -425,6 +427,79 @@ export type RunDiagnosticPromptEvolution = {
   metadata: unknown;
 };
 
+export type RunDiagnosticModelDecision = {
+  task_id: string | null;
+  backend_id: string | null;
+  model: string | null;
+  reason: string;
+  source: string;
+  metadata: unknown;
+};
+
+export type RunDiagnosticRerankDecision = {
+  task_id: string | null;
+  query: string | null;
+  rerank_applied: boolean;
+  before: unknown[];
+  after: unknown[];
+  selected: unknown[];
+  reason: string;
+  metadata: unknown;
+};
+
+export type RunDiagnosticContextCompression = {
+  task_id: string | null;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  compression_ratio: number | null;
+  preserved_facts: string[];
+  reason: string;
+  metadata: unknown;
+};
+
+export type RunDiagnosticPromptDecision = {
+  task_id: string;
+  agent: string | null;
+  prompt_version_id: string | null;
+  reason: string;
+  benchmark: unknown | null;
+};
+
+export type RunDiagnosticLoraDecision = {
+  task_id: string;
+  agent: string | null;
+  adapter_id: string | null;
+  reason: string;
+  benchmark: unknown | null;
+};
+
+export type RunDiagnosticBenchmarkResult = {
+  task_id: string | null;
+  kind: string;
+  accepted: boolean | null;
+  winner: string | null;
+  baseline_run_id: string | null;
+  challenger_run_id: string | null;
+  baseline_pass_rate: number | null;
+  challenger_pass_rate: number | null;
+  mc_nemar_p_value: number | null;
+  reason: string | null;
+  held_out: boolean | null;
+  metadata: unknown;
+};
+
+export type RunDiagnosticAbTestResult = {
+  task_id: string | null;
+  kind: string;
+  baseline_run_id: string | null;
+  challenger_run_id: string | null;
+  winner: string | null;
+  delta_pass_rate: number | null;
+  accepted: boolean | null;
+  reason: string | null;
+  metadata: unknown;
+};
+
 export type AgentArtifactEnvelope = {
   schema_version: number;
   artifact_id: string;
@@ -445,9 +520,43 @@ export type RunDiagnosticArtifactHandoffRejection = {
   metadata: unknown;
 };
 
+export type RunDiagnosticsSourceOfTruth = {
+  canonical_report: string;
+  scope: string[];
+  trace_complete: boolean;
+  task_complete: boolean;
+  event_complete: boolean;
+  artifact_complete: boolean;
+  decision_complete: boolean;
+  human_review_complete: boolean;
+};
+
+export type RunDiagnosticsDecisionSummary = {
+  model_decisions: number;
+  rerank_decisions: number;
+  context_compression: number;
+  prompt_decisions: number;
+  lora_decisions: number;
+  benchmark_results: number;
+  ab_test_results: number;
+  artifact_lineage: number;
+  artifact_handoff_rejections: number;
+  remediation_events: number;
+  human_reward_recorded: boolean;
+};
+
+export type RunDiagnosticsCoverageGate = {
+  name: string;
+  passed: boolean;
+  evidence: string;
+};
+
 export type RunDiagnosticsReport = {
   project_id: string;
   run_id: string;
+  source_of_truth: RunDiagnosticsSourceOfTruth;
+  decision_summary: RunDiagnosticsDecisionSummary;
+  coverage_gates: RunDiagnosticsCoverageGate[];
   trace_ids: string[];
   runtime: RuntimeStatus;
   tasks: RunDiagnosticTask[];
@@ -457,6 +566,13 @@ export type RunDiagnosticsReport = {
   artifact_lineage: AgentArtifactEnvelope[];
   artifact_handoff_rejections: RunDiagnosticArtifactHandoffRejection[];
   remediation_events: RunDiagnosticEvent[];
+  model_decisions: RunDiagnosticModelDecision[];
+  rerank_decisions: RunDiagnosticRerankDecision[];
+  context_compression: RunDiagnosticContextCompression[];
+  prompt_decisions: RunDiagnosticPromptDecision[];
+  lora_decisions: RunDiagnosticLoraDecision[];
+  benchmark_results: RunDiagnosticBenchmarkResult[];
+  ab_test_results: RunDiagnosticAbTestResult[];
   lora_evolution: RunDiagnosticLoraEvolution[];
   prompt_evolution: RunDiagnosticPromptEvolution[];
   rag_context_sent_to_model: boolean;
