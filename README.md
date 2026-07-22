@@ -63,7 +63,7 @@ crytex plan approve
 crytex run start
 crytex kanban watch
 crytex diag export --run latest --out reports\latest-run.json
-crytex backend-acceptance --full --json --report-path reports\backend-acceptance.json
+crytex backend-acceptance --full --json --deterministic --report-path reports\backend-acceptance.json
 ```
 
 For the current development binary, replace `crytex` with:
@@ -107,6 +107,8 @@ Important crates:
 
 See [docs/CLI.md](docs/CLI.md) for the full command reference, output rules,
 exit codes, and examples.
+See [docs/BACKEND_ACCEPTANCE.md](docs/BACKEND_ACCEPTANCE.md) for the canonical
+backend acceptance harness, runtime modes, JSON artifact, and test profiles.
 
 Every production command follows these rules:
 

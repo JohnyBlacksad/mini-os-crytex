@@ -317,7 +317,9 @@ boundaries when those modules are enabled.
 Run the canonical backend product acceptance suite.
 
 ```powershell
-crytex backend-acceptance --full --json --report-path reports\backend-acceptance.json
+crytex backend-acceptance --full --json --deterministic --report-path reports\backend-acceptance.json
+crytex backend-acceptance --full --json --runtime ollama --live-model qwen3.5:9b --live-url http://localhost:11434
+crytex backend-acceptance --full --json --runtime mistral --live-model A:\models\model.gguf
 ```
 
 Acceptance proves the whole backend path:
@@ -327,6 +329,10 @@ doctor -> project -> index -> RAG/rerank -> goal -> plan -> Kanban
 -> run -> critic -> remediation -> review -> reward
 -> Prompt Evolution evidence -> LoRA dataset evidence -> diagnostics
 ```
+
+The command emits one JSON proof artifact with ordered stages, nested kernel
+proof, diagnostics path, benchmark evidence, prompt evolution evidence, and LoRA
+evolution evidence.
 
 ## `prove`
 

@@ -18,6 +18,7 @@ pub fn is_proof_command(command: &Commands) -> bool {
             | Commands::ProveAgentSwarmLoraRouting { .. }
             | Commands::ProveOrchestratorQualityGate { .. }
             | Commands::ProveRagFull { .. }
+            | Commands::BackendAcceptance { .. }
     )
 }
 
@@ -30,8 +31,21 @@ mod tests {
     fn classifier_separates_proof_from_everyday_commands() {
         let proof = Commands::ProveRagFull { report_path: None };
         let everyday = Commands::ListProjects;
+        let acceptance = Commands::BackendAcceptance {
+            full: true,
+            json: true,
+            deterministic: true,
+            runtime: crate::crytex_cli_commands::AcceptanceRuntimeMode::Deterministic,
+            path: None,
+            name: "Backend Acceptance".into(),
+            goal: "prove backend".into(),
+            live_model: "qwen3.5:9b".into(),
+            live_url: "http://localhost:11434".into(),
+            report_path: None,
+        };
 
         assert!(is_proof_command(&proof));
+        assert!(is_proof_command(&acceptance));
         assert!(!is_proof_command(&everyday));
     }
 

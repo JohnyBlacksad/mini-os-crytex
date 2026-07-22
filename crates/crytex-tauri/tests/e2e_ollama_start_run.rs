@@ -28,6 +28,7 @@ use tokio::sync::broadcast;
 
 const DEFAULT_OLLAMA_URL: &str = "http://127.0.0.1:11434";
 const DEFAULT_E2E_MODEL: &str = "qwen3.5:9b";
+static OLLAMA_E2E_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn drain_events(rx: &mut broadcast::Receiver<Event>) -> Vec<Event> {
     let mut events = Vec::new();
@@ -44,6 +45,7 @@ fn drain_events(rx: &mut broadcast::Receiver<Event>) -> Vec<Event> {
 
 #[tokio::test]
 async fn real_runtime_smoke_reports_production_agent_chain() {
+    let _lock = OLLAMA_E2E_LOCK.lock().await;
     let expected_model =
         std::env::var("CRYTEX_E2E_OLLAMA_MODEL").unwrap_or_else(|_| DEFAULT_E2E_MODEL.to_string());
     let report = run_real_runtime_smoke_report().await;
@@ -310,6 +312,7 @@ async fn run_real_runtime_smoke_report() -> RealRuntimeSmokeReport {
 
 #[tokio::test]
 async fn start_run_executes_ready_task_with_real_ollama_model() {
+    let _lock = OLLAMA_E2E_LOCK.lock().await;
     let ollama_url =
         std::env::var("CRYTEX_E2E_OLLAMA_URL").unwrap_or_else(|_| DEFAULT_OLLAMA_URL.to_string());
     let model =
@@ -401,6 +404,7 @@ async fn start_run_executes_ready_task_with_real_ollama_model() {
 
 #[tokio::test]
 async fn goal_plan_approval_starts_first_generated_task_with_real_ollama_model() {
+    let _lock = OLLAMA_E2E_LOCK.lock().await;
     let ollama_url =
         std::env::var("CRYTEX_E2E_OLLAMA_URL").unwrap_or_else(|_| DEFAULT_OLLAMA_URL.to_string());
     let model =
@@ -566,6 +570,7 @@ async fn goal_plan_approval_starts_first_generated_task_with_real_ollama_model()
 #[tokio::test]
 async fn agent_executor_uses_real_ollama_tool_loop_to_read_requirements_write_report_and_audit_trace()
  {
+    let _lock = OLLAMA_E2E_LOCK.lock().await;
     let ollama_url =
         std::env::var("CRYTEX_E2E_OLLAMA_URL").unwrap_or_else(|_| DEFAULT_OLLAMA_URL.to_string());
     let model =
@@ -715,6 +720,7 @@ After receiving the fs_write observation, respond only with a final JSON object 
 
 #[tokio::test]
 async fn real_ollama_agent_run_receives_indexed_rag_context() {
+    let _lock = OLLAMA_E2E_LOCK.lock().await;
     let ollama_url =
         std::env::var("CRYTEX_E2E_OLLAMA_URL").unwrap_or_else(|_| DEFAULT_OLLAMA_URL.to_string());
     let model =
@@ -872,6 +878,7 @@ async fn real_ollama_agent_run_receives_indexed_rag_context() {
 
 #[tokio::test]
 async fn critic_rejection_from_real_ollama_creates_remediation_chain() {
+    let _lock = OLLAMA_E2E_LOCK.lock().await;
     let state = ollama_critic_state().await;
     let project_root = state.temp_dir.path().join("project-critic-remediation");
     std::fs::create_dir_all(&project_root).expect("project root should be created");
@@ -1103,6 +1110,7 @@ Otherwise return:
 
 #[tokio::test]
 async fn full_happy_path_real_ollama_writes_remediates_and_records_human_reward() {
+    let _lock = OLLAMA_E2E_LOCK.lock().await;
     let ollama_url =
         std::env::var("CRYTEX_E2E_OLLAMA_URL").unwrap_or_else(|_| DEFAULT_OLLAMA_URL.to_string());
     let model =
@@ -1251,6 +1259,7 @@ async fn full_happy_path_real_ollama_writes_remediates_and_records_human_reward(
 
 #[tokio::test]
 async fn production_ollama_agent_executor_runs_goal_chain_with_rag_trace_and_human_reward() {
+    let _lock = OLLAMA_E2E_LOCK.lock().await;
     let ollama_url =
         std::env::var("CRYTEX_E2E_OLLAMA_URL").unwrap_or_else(|_| DEFAULT_OLLAMA_URL.to_string());
     let model =

@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -102,8 +102,7 @@ pub enum Commands {
     #[command(
         alias = "prove-business-e2e",
         alias = "business-test",
-        alias = "canonical-backend-acceptance",
-        alias = "backend-acceptance"
+        alias = "canonical-backend-acceptance"
     )]
     ProveKernelE2e {
         #[arg(short, long)]
@@ -124,6 +123,29 @@ pub enum Commands {
         live_url: String,
         #[arg(long)]
         deterministic: bool,
+        #[arg(long)]
+        report_path: Option<PathBuf>,
+    },
+    /// Run the canonical backend acceptance harness and emit one JSON proof artifact
+    BackendAcceptance {
+        #[arg(long)]
+        full: bool,
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        deterministic: bool,
+        #[arg(long, value_enum, default_value_t = AcceptanceRuntimeMode::Deterministic)]
+        runtime: AcceptanceRuntimeMode,
+        #[arg(long)]
+        path: Option<PathBuf>,
+        #[arg(long, default_value = "Backend Acceptance")]
+        name: String,
+        #[arg(long, default_value = "Prove Crytex backend CLI acceptance path")]
+        goal: String,
+        #[arg(long, default_value = "qwen3.5:9b")]
+        live_model: String,
+        #[arg(long, default_value = "http://localhost:11434")]
+        live_url: String,
         #[arg(long)]
         report_path: Option<PathBuf>,
     },
@@ -509,4 +531,75 @@ pub enum ABTestCommands {
         #[arg(long, default_value = "0.05")]
         alpha: f64,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum AcceptanceRuntimeMode {
+    Deterministic,
+    Ollama,
+    Mistral,
+}
+
+impl AcceptanceRuntimeMode {
+    pub fn backend_id(self) -> &'static str {
+        match self {
+            Self::Deterministic => "deterministic",
+            Self::Ollama => "ollama",
+            Self::Mistral => "mistral",
+        }
+    }
+
+    pub fn is_deterministic(self, explicit_deterministic: bool) -> bool {
+        explicit_deterministic || self == Self::Deterministic
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn backend_acceptance_command_parses_full_json_deterministic_contract() {
+        let cli = Cli::parse_from([
+            "crytex-kernel",
+            "backend-acceptance",
+            "--full",
+            "--json",
+            "--deterministic",
+        ]);
+
+        let Commands::BackendAcceptance {
+            full,
+            json,
+            deterministic,
+            runtime,
+            ..
+        } = cli.command
+        else {
+            panic!("expected backend acceptance command");
+        };
+
+        assert!(full);
+        assert!(json);
+        assert!(deterministic);
+        assert_eq!(runtime, AcceptanceRuntimeMode::Deterministic);
+    }
+
+    #[test]
+    fn backend_acceptance_help_documents_runtime_profiles() {
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("backend-acceptance")
+            .expect("backend-acceptance command exists")
+            .render_long_help()
+            .to_string();
+
+        assert!(help.contains("--full"));
+        assert!(help.contains("--json"));
+        assert!(help.contains("--runtime"));
+        assert!(help.contains("deterministic"));
+        assert!(help.contains("ollama"));
+        assert!(help.contains("mistral"));
+    }
 }

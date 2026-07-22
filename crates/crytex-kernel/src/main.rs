@@ -27,7 +27,9 @@ use crytex_bench::{
     DefaultBenchmarkHarness, ExactMatchScorer, JsonSchemaScorer, LlmJudgeScorer, SandboxTestScorer,
     Score, Scorer,
 };
-use crytex_cli_commands::{ABTestCommands, BenchCommands, Cli, Commands, LoraCommands};
+use crytex_cli_commands::{
+    ABTestCommands, AcceptanceRuntimeMode, BenchCommands, Cli, Commands, LoraCommands,
+};
 use crytex_compress::{
     DiskCcrStore,
     compressors::{
@@ -38,6 +40,7 @@ use crytex_compress::{
     pipeline::CompressionPipeline,
     tokenizer::TokenizerEstimator,
 };
+use crytex_core::capabilities::{CapabilityAuditReport, CapabilityStatus};
 use crytex_core::persistence::ExperienceRepository;
 use crytex_core::services::{SandboxService, ToolService};
 use crytex_core::{
@@ -449,6 +452,29 @@ struct KernelE2eProofReport {
     lora_adapter_id: String,
     lora_promoted: bool,
     gates: Vec<KernelE2eProofGate>,
+    passed: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct BackendAcceptanceStageReport {
+    name: String,
+    status: String,
+    evidence: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct BackendAcceptanceReport {
+    proof_type: String,
+    profile: String,
+    runtime_mode: String,
+    deterministic: bool,
+    full: bool,
+    trace_id: String,
+    project_root: String,
+    doctor_status: String,
+    stages: Vec<BackendAcceptanceStageReport>,
+    proof_artifact_path: Option<String>,
+    kernel_proof: KernelE2eProofReport,
     passed: bool,
 }
 
@@ -1809,6 +1835,84 @@ impl KernelE2eProofReport {
     }
 }
 
+fn build_backend_acceptance_report(
+    config: &CrytexConfig,
+    runtime_mode: AcceptanceRuntimeMode,
+    deterministic: bool,
+    full: bool,
+    proof_artifact_path: Option<PathBuf>,
+    kernel_proof: KernelE2eProofReport,
+) -> BackendAcceptanceReport {
+    let doctor = CapabilityAuditReport::from_config(config);
+    let doctor_ready = doctor.modules.iter().all(|module| {
+        matches!(
+            module.status,
+            CapabilityStatus::Ready | CapabilityStatus::Degraded
+        )
+    });
+    let mut stages = vec![BackendAcceptanceStageReport {
+        name: "doctor".into(),
+        status: if doctor_ready { "passed" } else { "failed" }.into(),
+        evidence: doctor
+            .modules
+            .iter()
+            .map(|module| format!("{:?}:{:?}", module.module, module.status))
+            .collect::<Vec<_>>()
+            .join(","),
+    }];
+    stages.extend(backend_acceptance_stages_from_kernel(&kernel_proof));
+    let passed = doctor_ready && kernel_proof.passed && full;
+    BackendAcceptanceReport {
+        proof_type: "backend_acceptance".into(),
+        profile: "full".into(),
+        runtime_mode: runtime_mode.backend_id().into(),
+        deterministic,
+        full,
+        trace_id: kernel_proof.trace_id.clone(),
+        project_root: kernel_proof.project_root.clone(),
+        doctor_status: if doctor_ready { "passed" } else { "failed" }.into(),
+        stages,
+        proof_artifact_path: proof_artifact_path.map(|path| path.display().to_string()),
+        kernel_proof,
+        passed,
+    }
+}
+
+fn backend_acceptance_stages_from_kernel(
+    proof: &KernelE2eProofReport,
+) -> Vec<BackendAcceptanceStageReport> {
+    [
+        ("project open", "project_created"),
+        ("index", "project_indexed"),
+        ("RAG rerank", "project_indexed"),
+        ("goal", "goal_plan_approved"),
+        ("plan", "orchestrator_decomposed_goal"),
+        ("kanban", "goal_plan_approved"),
+        ("run", "agent_chain_executed"),
+        ("critic", "human_rejection_recorded"),
+        ("remediation", "critic_rejection_remediated"),
+        ("reward", "human_approval_recorded"),
+        ("evolution evidence", "prompt_evolution_proved"),
+        ("evolution evidence", "lora_evolution_proved"),
+        ("diag export", "diagnostics_artifact_written"),
+    ]
+    .into_iter()
+    .map(|(stage_name, gate_name)| {
+        let gate = proof
+            .gates
+            .iter()
+            .find(|gate| gate.name == gate_name)
+            .cloned()
+            .unwrap_or_else(|| proof_gate(gate_name, false, "missing kernel proof gate"));
+        BackendAcceptanceStageReport {
+            name: stage_name.into(),
+            status: if gate.passed { "passed" } else { "failed" }.into(),
+            evidence: gate.evidence,
+        }
+    })
+    .collect()
+}
+
 fn business_steps_from_gates(gates: &[KernelE2eProofGate]) -> Vec<KernelBusinessProofStep> {
     gates
         .iter()
@@ -2681,6 +2785,18 @@ struct KernelE2eProofCommandRequest {
     deterministic: bool,
 }
 
+struct BackendAcceptanceCommandRequest {
+    full: bool,
+    runtime: AcceptanceRuntimeMode,
+    deterministic: bool,
+    path: Option<PathBuf>,
+    name: String,
+    goal: String,
+    live_model: String,
+    live_url: String,
+    report_path: Option<PathBuf>,
+}
+
 #[async_trait]
 impl BenchmarkRunner for KernelProofBenchmarkRunner {
     async fn run(
@@ -3232,6 +3348,63 @@ async fn run_kernel_e2e_proof_command(
     .await
 }
 
+async fn run_backend_acceptance_command(
+    config: &CrytexConfig,
+    request: BackendAcceptanceCommandRequest,
+) -> Result<BackendAcceptanceReport, String> {
+    let BackendAcceptanceCommandRequest {
+        full,
+        runtime,
+        deterministic,
+        path,
+        name,
+        goal,
+        live_model,
+        live_url,
+        report_path,
+    } = request;
+    if !full {
+        return Err(
+            "backend-acceptance requires --full for the production acceptance contract".into(),
+        );
+    }
+    let deterministic = runtime.is_deterministic(deterministic);
+    let project_path = path.unwrap_or_else(|| {
+        config
+            .paths
+            .data_dir
+            .join("proofs")
+            .join(format!("backend-acceptance-{}", Ulid::new()))
+            .join("project")
+    });
+    let live_backend = match runtime {
+        AcceptanceRuntimeMode::Deterministic => "ollama".to_string(),
+        AcceptanceRuntimeMode::Ollama => "ollama".to_string(),
+        AcceptanceRuntimeMode::Mistral => "mistral".to_string(),
+    };
+    let kernel_proof = run_kernel_e2e_proof_command(
+        config,
+        KernelE2eProofCommandRequest {
+            path: project_path,
+            name,
+            goal,
+            live_backend,
+            live_model,
+            live_url,
+            deterministic,
+        },
+    )
+    .await?;
+    Ok(build_backend_acceptance_report(
+        config,
+        runtime,
+        deterministic,
+        full,
+        report_path,
+        kernel_proof,
+    ))
+}
+
 async fn run_orchestrator_quality_gate_proof(
     config: &CrytexConfig,
 ) -> Result<OrchestratorQualityProofReport, String> {
@@ -3709,9 +3882,12 @@ fn create_kernel_live_inference(
 ) -> Result<Arc<dyn crytex_core::services::InferenceService>, String> {
     let backend_config = match backend_id {
         "ollama" => BackendConfig::ollama(backend_id, model, url),
+        "mistral" | "mistralrs" | "mistral.rs" => {
+            BackendConfig::mistral_rs(backend_id, model, Some(4096), None)
+        }
         other => {
             return Err(format!(
-                "kernel live E2E currently supports ollama only, got {other}"
+                "kernel live E2E supports ollama or mistral, got {other}"
             ));
         }
     };
@@ -6596,6 +6772,68 @@ async fn async_main() {
         return;
     }
 
+    if let Commands::BackendAcceptance {
+        full,
+        json,
+        deterministic,
+        runtime,
+        path,
+        name,
+        goal,
+        live_model,
+        live_url,
+        report_path,
+    } = &cli.command
+    {
+        let report = run_backend_acceptance_command(
+            &config,
+            BackendAcceptanceCommandRequest {
+                full: *full,
+                runtime: *runtime,
+                deterministic: *deterministic,
+                path: path.clone(),
+                name: name.clone(),
+                goal: goal.clone(),
+                live_model: live_model.clone(),
+                live_url: live_url.clone(),
+                report_path: report_path.clone(),
+            },
+        )
+        .await
+        .unwrap_or_else(|error| {
+            eprintln!("Backend acceptance failed: {error}");
+            std::process::exit(1);
+        });
+        let payload = serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into());
+        if let Some(report_path) = report_path {
+            if let Some(parent) = report_path.parent()
+                && let Err(error) = tokio::fs::create_dir_all(parent).await
+            {
+                eprintln!("Failed to create backend acceptance report directory: {error}");
+                std::process::exit(1);
+            }
+            if let Err(error) = tokio::fs::write(report_path, &payload).await {
+                eprintln!("Failed to write backend acceptance report: {error}");
+                std::process::exit(1);
+            }
+        }
+        if *json {
+            println!("{payload}");
+        } else {
+            eprintln!(
+                "Backend acceptance {}: {} stages, trace {}",
+                if report.passed { "passed" } else { "failed" },
+                report.stages.len(),
+                report.trace_id
+            );
+            println!("{payload}");
+        }
+        if !report.passed {
+            std::process::exit(2);
+        }
+        return;
+    }
+
     if let Commands::ProveLoraLiveE2e {
         gguf_path,
         context_size,
@@ -7511,6 +7749,9 @@ async fn async_main() {
         }
         Commands::ProveKernelE2e { .. } => {
             unreachable!("prove-kernel-e2e is handled before full AppContext initialization")
+        }
+        Commands::BackendAcceptance { .. } => {
+            unreachable!("backend-acceptance is handled before full AppContext initialization")
         }
         Commands::ProveLoraLiveE2e { .. } => {
             unreachable!("prove-lora-live-e2e is handled before full AppContext initialization")
@@ -8758,6 +8999,88 @@ mod tests {
         assert_eq!(entry.quantization.as_deref(), Some("Q2_K"));
         assert_eq!(entry.backend.as_deref(), Some("mistralrs"));
         assert_eq!(entry.params_b, Some(1.1));
+    }
+
+    #[test]
+    fn backend_acceptance_report_contains_required_full_stage_chain() {
+        let kernel = KernelE2eProofReport::from_input(KernelE2eProofInput {
+            acceptance_scope: "canonical_backend_acceptance_runner".into(),
+            trace_id: "trace-acceptance".into(),
+            project_id: "project-1".into(),
+            project_root: "A:/tmp/project".into(),
+            runtime_kind: "deterministic".into(),
+            live_backend: None,
+            live_model: None,
+            live_generation_evidence: Vec::new(),
+            goal_task_id: "goal-1".into(),
+            orchestrated_task_ids: vec![
+                "architect".into(),
+                "coder".into(),
+                "qa".into(),
+                "security".into(),
+                "critic".into(),
+            ],
+            task_ids: vec![
+                "goal-1".into(),
+                "architect".into(),
+                "coder".into(),
+                "qa".into(),
+                "security".into(),
+                "critic".into(),
+                "remediation".into(),
+            ],
+            critic_rejection_task_id: "critic".into(),
+            human_rejected_task_id: "critic".into(),
+            remediation_task_id: "remediation".into(),
+            human_approved_task_id: "remediation".into(),
+            indexed_files: 2,
+            indexed_chunks: 3,
+            diagnostics_event_count: 1,
+            diagnostics_artifact_path: "A:/tmp/project/project_state_diagnostics.json".into(),
+            diagnostics_task_count: 7,
+            benchmark_baseline_run_id: "baseline".into(),
+            benchmark_challenger_run_id: "challenger".into(),
+            benchmark_winner: "Challenger".into(),
+            prompt_baseline_version_id: "prompt-a".into(),
+            prompt_challenger_version_id: "prompt-b".into(),
+            prompt_promoted: true,
+            lora_adapter_id: "adapter-1".into(),
+            lora_promoted: true,
+        });
+
+        let report = build_backend_acceptance_report(
+            &CrytexConfig::default(),
+            AcceptanceRuntimeMode::Deterministic,
+            true,
+            true,
+            Some(PathBuf::from("acceptance.json")),
+            kernel,
+        );
+
+        assert!(report.passed);
+        assert_eq!(report.proof_type, "backend_acceptance");
+        assert_eq!(report.profile, "full");
+        assert_eq!(report.runtime_mode, "deterministic");
+        for stage in [
+            "doctor",
+            "project open",
+            "index",
+            "RAG rerank",
+            "goal",
+            "plan",
+            "kanban",
+            "run",
+            "critic",
+            "remediation",
+            "reward",
+            "evolution evidence",
+            "diag export",
+        ] {
+            assert!(
+                report.stages.iter().any(|item| item.name == stage),
+                "missing backend acceptance stage {stage}"
+            );
+        }
     }
 
     #[tokio::test]

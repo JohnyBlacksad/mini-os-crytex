@@ -40,3 +40,33 @@ mistralrs-quant = { path = "patches/mistralrs-quant" }
 
 [profile.test.package.crytex-bench]
 debug = false
+
+[profile.fast]
+inherits = "test"
+debug = false
+incremental = true
+
+[profile.integration]
+inherits = "test"
+debug = 1
+incremental = true
+
+[profile.runtime]
+inherits = "test"
+debug = 1
+incremental = true
+
+[profile.network]
+inherits = "test"
+debug = 1
+incremental = true
+
+[profile.cuda]
+inherits = "test"
+debug = 1
+incremental = true
+
+[profile.full]
+inherits = "test"
+debug = 1
+incremental = true
