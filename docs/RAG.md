@@ -57,3 +57,45 @@ gates.
 `RagPipeline::recover_rebuild` distinguishes active and staging manifests.
 Interrupted staging manifests are discarded without touching the active index;
 completed staging manifests can be promoted atomically.
+
+## Operational CLI, Diagnostics, And Troubleshooting
+
+Production CLI users operate RAG as the backend project brain:
+
+```powershell
+crytex index run --project my-app
+crytex index status --project my-app --json
+crytex index rebuild --project my-app
+crytex rag search "where is retry policy documented?" --rerank --explain --json
+crytex rag prove --fixture fixtures\mixed-docs-code --json
+```
+
+When running from the workspace before packaging, use `cargo run -p
+crytex-kernel --` before the command. The development `rag search` command can
+write diagnostics with `--diagnostics-path reports\rag-search.json`.
+
+Diagnostics must answer three backend questions:
+
+- which project files were parsed and chunked;
+- which dense, sparse, fused, and reranked candidates were considered;
+- why the final selected chunks fit the token budget and role goal.
+
+Every selected chunk carries source path, chunk id, content type, graph metadata
+when available, token estimate, and reason. This makes failures attributable:
+bad context goes to RAG/indexing, malformed output goes to Prompt Evolution,
+and repeated role skill errors go to LoRA.
+
+Troubleshooting:
+
+- Missing PDF, DOCX, XLSX, CSV, JSON, YAML, TOML, log, Markdown, HTML, or code
+  content usually means the parser capability report is degraded.
+- Weak rerank results should be debugged by comparing dense, sparse, fused, and
+  reranked candidate lists in the JSON diagnostics.
+- Prompt-injection findings mean project documents are untrusted data; run
+  `crytex security prove --malicious-rag-fixture` to verify blocking behavior.
+- Interrupted index rebuilds are handled by staging manifests and atomic swap;
+  run `crytex diag storage-recovery --json` to prove recovery policy.
+
+This document intentionally treats RAG as backend infrastructure, not UI search:
+agents consume evidence ids, critics inspect evidence ids, and evolution policy
+decides whether quality should improve by changing retrieval, prompts, or LoRA.

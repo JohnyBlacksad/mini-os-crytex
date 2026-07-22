@@ -696,6 +696,64 @@ mod tests {
         }
     }
 
+    #[test]
+    fn p15_documentation_set_explains_backend_and_role_examples() {
+        let documents = [
+            ("README.md", include_str!("../../../README.md")),
+            ("docs/CLI.md", include_str!("../../../docs/CLI.md")),
+            (
+                "docs/ARCHITECTURE_BACKEND.md",
+                include_str!("../../../docs/ARCHITECTURE_BACKEND.md"),
+            ),
+            ("docs/RAG.md", include_str!("../../../docs/RAG.md")),
+            (
+                "docs/LORA_EVOLUTION.md",
+                include_str!("../../../docs/LORA_EVOLUTION.md"),
+            ),
+            (
+                "docs/PROMPT_EVOLUTION.md",
+                include_str!("../../../docs/PROMPT_EVOLUTION.md"),
+            ),
+            (
+                "docs/TOKEN_ECONOMY.md",
+                include_str!("../../../docs/TOKEN_ECONOMY.md"),
+            ),
+            (
+                "docs/MODULES_AND_SOLID.md",
+                include_str!("../../../docs/MODULES_AND_SOLID.md"),
+            ),
+        ];
+
+        for (path, contents) in documents {
+            for required in ["Crytex", "CLI", "backend", "diagnostics", "troubleshooting"] {
+                assert!(
+                    contents.to_lowercase().contains(&required.to_lowercase()),
+                    "{path} should explain `{required}`"
+                );
+            }
+            assert!(
+                contents.len() > 1_800,
+                "{path} should be substantial enough for new users"
+            );
+        }
+
+        let examples = [
+            include_str!("../../../examples/python-coder.md"),
+            include_str!("../../../examples/qa.md"),
+            include_str!("../../../examples/critic.md"),
+            include_str!("../../../examples/orchestrator.md"),
+            include_str!("../../../examples/analyst.md"),
+        ];
+        for example in examples {
+            for required in ["crytex", "role", "goal", "expected artifact"] {
+                assert!(
+                    example.to_lowercase().contains(required),
+                    "role example should document `{required}`"
+                );
+            }
+        }
+    }
+
     fn render_product_help() -> String {
         match product_help() {
             Ok(help) => help,

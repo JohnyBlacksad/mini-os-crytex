@@ -636,3 +636,52 @@ Every subsystem must obey these CLI-facing rules:
 
 The CLI must never depend on a concrete low-level implementation when a trait
 boundary exists.
+
+## Troubleshooting
+
+Use `crytex doctor --strict --json` first. It aggregates backend capability
+reports for storage, RAG, inference, sandbox, token economy, Prompt Evolution,
+LoRA Evolution, CUDA, and model runtime state.
+
+Ollama:
+
+```powershell
+crytex models list --backend ollama --json
+crytex models prove --id qwen --backend ollama --report-path reports\ollama-proof.json
+```
+
+Verify the daemon URL, model name, and timeout. Ollama can support generation,
+chat, embeddings, model listing, and download, but Crytex treats runtime LoRA as
+unsupported for this backend unless the model is baked outside Crytex.
+
+CUDA:
+
+```powershell
+crytex diag probe-runtime-matrix --json --report-path reports\runtime-model-matrix.json
+```
+
+Missing `nvidia-smi`, `nvcc`, MSVC `cl.exe`, driver/runtime mismatch, or
+insufficient VRAM must show as typed `partial` or `unsupported` capability.
+CPU fallback is acceptable only when the command did not require GPU.
+
+ONNX:
+
+Use ONNX for embeddings and rerank. Generation, runtime LoRA, and local training
+are unsupported unless a future backend reports capability truth differently.
+
+Windows locks:
+
+```powershell
+crytex diag storage-recovery --json --report-path reports\storage-recovery.json
+```
+
+Mutating commands such as `run`, `index rebuild`, `lora train`, `models
+download`, and `storage import` are exclusive. Read-only commands such as
+`kanban show`, `kanban history`, `diag export`, and `models list` may run as
+shared readers. Stale locks must be reported as recoverable diagnostics.
+
+Model download:
+
+Partial downloads are resumable and must not be registered as complete until
+size/checksum validation succeeds. If a command exits `4`, rerun the same CLI
+command after the lock or network condition clears.

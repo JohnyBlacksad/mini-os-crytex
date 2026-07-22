@@ -96,3 +96,32 @@ or cloud credentials. It verifies:
 - token savings and compression ratio are measured.
 
 Failure exits with code `2`. Command/config errors exit with code `1`.
+
+## Operational CLI, Diagnostics, And Troubleshooting
+
+Production CLI contract:
+
+```powershell
+crytex token-economy plan --backend ollama --model qwen3.5:9b --prompt-tokens 2000 --completion-tokens 512 --json
+crytex token-economy shared-context stats --project my-app --json
+crytex prove token-economy --report-path reports\token-economy-p4.json
+```
+
+Diagnostics record prompt tokens, completion tokens, saved tokens, compression
+ratio, model headroom, selected RAG chunk count, CCR artifact ids, cache hits,
+and required-fact preservation score. Token saving is accepted only when the
+required facts benchmark still passes.
+
+Troubleshooting:
+
+- If prompts exceed the model context window, inspect the token budget planner
+  output and reserve completion headroom before selecting RAG context.
+- If repeated agents receive the same large context, use shared context and CCR
+  ids instead of duplicating full text.
+- If a compressed diff, log, report, or tool output loses required facts, reject
+  that compressor strategy and expand the preservation fixture.
+- If a remote backend charges unexpectedly high tokens, compare saved tokens and
+  cache-alignment metrics in diagnostics.
+
+The backend rule is simple: compression is an optimization, never permission to
+drop evidence that a role needs to satisfy its artifact contract.

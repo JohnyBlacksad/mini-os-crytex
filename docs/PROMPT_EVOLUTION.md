@@ -100,3 +100,42 @@ closed against direct dependency on a concrete model runtime or storage engine.
 - diagnostics contain prompt decisions;
 - rollback restores the previous baseline;
 - schema/format failures route to Prompt Evolution before LoRA.
+
+## Operational CLI, Diagnostics, And Troubleshooting
+
+Production CLI contract:
+
+```powershell
+crytex prompts status --agent coder-python --json
+crytex prompts propose --agent coder-python --operator inject-example --json
+crytex prompts benchmark --agent coder-python --challenger <version-id> --regression-suite fixtures\prompt-regression.jsonl --json
+crytex prompts promote --agent coder-python --version <version-id> --json
+crytex prompts rollback --agent coder-python --to <version-id> --json
+```
+
+Development binary:
+
+```powershell
+cargo run -p crytex-kernel -- prompts status --agent coder-python --json
+cargo run -p crytex-kernel -- prompts propose --agent coder-python --operator inject-example --json
+cargo run -p crytex-kernel -- prompts benchmark --agent coder-python --challenger <version-id> --regression-suite fixtures\prompt-regression.jsonl --json
+cargo run -p crytex-kernel -- prove-prompt-evolution --report-path reports\prompt-evolution-p7-proof.json
+```
+
+Diagnostics must record active prompt version, challenger id, mutation operator,
+benchmark scores, regression result, decision kind, rejection reason, and
+rollback target. Every task stores `prompt_version_id`, so later backend
+analysis can connect a success or failure to a concrete prompt.
+
+Troubleshooting:
+
+- Schema and format failures route to Prompt Evolution before LoRA because the
+  role contract is probably underspecified.
+- A challenger that improves one task but fails regression stays inactive.
+- Prompt oscillation should be debugged through `prompt_decision` diagnostics
+  and stricter benchmark gates.
+- Repeated role skill failure with valid schema should route to LoRA training,
+  not endless prompt wording changes.
+
+Prompt Evolution is a benchmarked state machine. Mutation proposes a challenger;
+benchmark gates decide promotion; rollback is explicit and auditable.

@@ -90,6 +90,11 @@ CLI
 
 See [docs/MODULARITY.md](docs/MODULARITY.md) for the module map, trait
 boundaries, capability statuses, disabled-module behavior, and SOLID audit.
+See [docs/ARCHITECTURE_BACKEND.md](docs/ARCHITECTURE_BACKEND.md) for the full
+backend architecture, command flow, persistence, recovery, diagnostics, and
+runtime boundaries.
+See [docs/MODULES_AND_SOLID.md](docs/MODULES_AND_SOLID.md) for the SOLID module
+contract used by backend services and CLI extensions.
 
 Important crates:
 
@@ -127,6 +132,19 @@ diagnostics, and schema/format failure routing.
 See [docs/LORA_DATASET.md](docs/LORA_DATASET.md) for positive/negative LoRA
 dataset rows, chosen/rejected remediation pairs, role scoping, balancing,
 leakage detection, and low-information filtering.
+See [docs/LORA_EVOLUTION.md](docs/LORA_EVOLUTION.md) for the end-to-end LoRA
+loop: objective selection, training, quality gates, promotion, rollback,
+recovery, and diagnostics.
+
+## Examples
+
+Role-oriented CLI walkthroughs live in [examples](examples):
+
+- [Python coder](examples/python-coder.md)
+- [QA](examples/qa.md)
+- [Critic](examples/critic.md)
+- [Orchestrator](examples/orchestrator.md)
+- [Analyst](examples/analyst.md)
 
 Every production command follows these rules:
 
