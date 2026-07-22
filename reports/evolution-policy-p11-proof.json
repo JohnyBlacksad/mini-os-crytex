@@ -1,0 +1,263 @@
+{
+  "passed": true,
+  "decisions": [
+    {
+      "role": "coder-python",
+      "action": "rag_fix",
+      "reason": "failure is attributed to retrieved/project context, so LoRA training is blocked",
+      "task_id": "task-rag-context",
+      "trace_id": "trace-rag-context",
+      "diagnostics": {
+        "kind": "autonomous_evolution_decision",
+        "role": "coder-python",
+        "failure_kind": "bad_context",
+        "action": "rag_fix",
+        "reason": "failure is attributed to retrieved/project context, so LoRA training is blocked",
+        "repeated_count": 1,
+        "source_evidence": {
+          "rag_selected_context_relevance": 0.18,
+          "missing_evidence_ids": [
+            "python-docs-exception-handling"
+          ],
+          "why_not_lora": "model answered from wrong context"
+        }
+      }
+    },
+    {
+      "role": "qa",
+      "action": "prompt_evolution",
+      "reason": "schema/format failure is routed to prompt evolution before LoRA",
+      "task_id": "task-schema",
+      "trace_id": "trace-schema",
+      "diagnostics": {
+        "kind": "autonomous_evolution_decision",
+        "role": "qa",
+        "failure_kind": "schema",
+        "action": "prompt_evolution",
+        "reason": "schema/format failure is routed to prompt evolution before LoRA",
+        "repeated_count": 1,
+        "source_evidence": {
+          "schema_errors": [
+            "missing field blocking_issues"
+          ],
+          "prompt_version_id": "qa-prompt-v1"
+        }
+      }
+    },
+    {
+      "role": "coder-rust",
+      "action": "lora_training",
+      "reason": "repeated role skill failure is attributed to model behavior",
+      "task_id": "task-rust-skill",
+      "trace_id": "trace-rust-skill",
+      "diagnostics": {
+        "kind": "autonomous_evolution_decision",
+        "role": "coder-rust",
+        "failure_kind": "repeated_role_skill_failure",
+        "action": "lora_training",
+        "reason": "repeated role skill failure is attributed to model behavior",
+        "repeated_count": 4,
+        "source_evidence": {
+          "failure_type": "borrow-checker",
+          "recent_failures": 4,
+          "dataset_role": "coder-rust"
+        }
+      }
+    },
+    {
+      "role": "critic-coder",
+      "action": "critic_role_evolution",
+      "reason": "critic feedback lacks actionable detail, so the critic role evolves first",
+      "task_id": "task-weak-critic",
+      "trace_id": "trace-weak-critic",
+      "diagnostics": {
+        "kind": "autonomous_evolution_decision",
+        "role": "critic-coder",
+        "failure_kind": "weak_critic_feedback",
+        "action": "critic_role_evolution",
+        "reason": "critic feedback lacks actionable detail, so the critic role evolves first",
+        "repeated_count": 2,
+        "source_evidence": {
+          "critic_comment": "bad",
+          "missing": [
+            "reason",
+            "blocking_issues",
+            "remediation_proposal"
+          ]
+        }
+      }
+    },
+    {
+      "role": "security",
+      "action": "security_policy",
+      "reason": "security/tool-use failure is routed to policy before model training",
+      "task_id": "task-security-policy",
+      "trace_id": "trace-security-policy",
+      "diagnostics": {
+        "kind": "autonomous_evolution_decision",
+        "role": "security",
+        "failure_kind": "security_policy_gap",
+        "action": "security_policy",
+        "reason": "security/tool-use failure is routed to policy before model training",
+        "repeated_count": 1,
+        "source_evidence": {
+          "tool_misuse": "untrusted shell args",
+          "policy_gap": "missing allowlist rule"
+        }
+      }
+    },
+    {
+      "role": "orchestrator",
+      "action": "benchmark_expansion",
+      "reason": "failure attribution is under-specified, so benchmarks expand before training",
+      "task_id": "task-benchmark-gap",
+      "trace_id": "trace-benchmark-gap",
+      "diagnostics": {
+        "kind": "autonomous_evolution_decision",
+        "role": "orchestrator",
+        "failure_kind": "benchmark_coverage_gap",
+        "action": "benchmark_expansion",
+        "reason": "failure attribution is under-specified, so benchmarks expand before training",
+        "repeated_count": 1,
+        "source_evidence": {
+          "unknown_failure": true,
+          "coverage_gap": "no regression fixture for decomposition depth"
+        }
+      }
+    }
+  ],
+  "action_counts": {
+    "benchmark_expansion": 1,
+    "critic_role_evolution": 1,
+    "lora_training": 1,
+    "prompt_evolution": 1,
+    "rag_fix": 1,
+    "security_policy": 1
+  },
+  "diagnostics": [
+    {
+      "kind": "autonomous_evolution_decision",
+      "role": "coder-python",
+      "failure_kind": "bad_context",
+      "action": "rag_fix",
+      "reason": "failure is attributed to retrieved/project context, so LoRA training is blocked",
+      "repeated_count": 1,
+      "source_evidence": {
+        "rag_selected_context_relevance": 0.18,
+        "missing_evidence_ids": [
+          "python-docs-exception-handling"
+        ],
+        "why_not_lora": "model answered from wrong context"
+      }
+    },
+    {
+      "kind": "autonomous_evolution_decision",
+      "role": "qa",
+      "failure_kind": "schema",
+      "action": "prompt_evolution",
+      "reason": "schema/format failure is routed to prompt evolution before LoRA",
+      "repeated_count": 1,
+      "source_evidence": {
+        "schema_errors": [
+          "missing field blocking_issues"
+        ],
+        "prompt_version_id": "qa-prompt-v1"
+      }
+    },
+    {
+      "kind": "autonomous_evolution_decision",
+      "role": "coder-rust",
+      "failure_kind": "repeated_role_skill_failure",
+      "action": "lora_training",
+      "reason": "repeated role skill failure is attributed to model behavior",
+      "repeated_count": 4,
+      "source_evidence": {
+        "failure_type": "borrow-checker",
+        "recent_failures": 4,
+        "dataset_role": "coder-rust"
+      }
+    },
+    {
+      "kind": "autonomous_evolution_decision",
+      "role": "critic-coder",
+      "failure_kind": "weak_critic_feedback",
+      "action": "critic_role_evolution",
+      "reason": "critic feedback lacks actionable detail, so the critic role evolves first",
+      "repeated_count": 2,
+      "source_evidence": {
+        "critic_comment": "bad",
+        "missing": [
+          "reason",
+          "blocking_issues",
+          "remediation_proposal"
+        ]
+      }
+    },
+    {
+      "kind": "autonomous_evolution_decision",
+      "role": "security",
+      "failure_kind": "security_policy_gap",
+      "action": "security_policy",
+      "reason": "security/tool-use failure is routed to policy before model training",
+      "repeated_count": 1,
+      "source_evidence": {
+        "tool_misuse": "untrusted shell args",
+        "policy_gap": "missing allowlist rule"
+      }
+    },
+    {
+      "kind": "autonomous_evolution_decision",
+      "role": "orchestrator",
+      "failure_kind": "benchmark_coverage_gap",
+      "action": "benchmark_expansion",
+      "reason": "failure attribution is under-specified, so benchmarks expand before training",
+      "repeated_count": 1,
+      "source_evidence": {
+        "unknown_failure": true,
+        "coverage_gap": "no regression fixture for decomposition depth"
+      }
+    }
+  ],
+  "gates": [
+    {
+      "name": "bad_context_routes_to_rag_fix_not_lora",
+      "passed": true,
+      "evidence": "context attribution blocks LoRA training"
+    },
+    {
+      "name": "schema_format_routes_to_prompt_first",
+      "passed": true,
+      "evidence": "format/schema failures go to Prompt Evolution"
+    },
+    {
+      "name": "repeated_role_skill_failure_routes_to_lora",
+      "passed": true,
+      "evidence": "repeated skill failure routes to role LoRA training"
+    },
+    {
+      "name": "weak_critic_routes_to_critic_role_evolution",
+      "passed": true,
+      "evidence": "critic detail quality evolves critic role first"
+    },
+    {
+      "name": "security_gap_routes_to_policy",
+      "passed": true,
+      "evidence": "tool misuse/prompt injection policy gaps do not train LoRA"
+    },
+    {
+      "name": "unknown_or_coverage_gap_routes_to_benchmark_expansion",
+      "passed": true,
+      "evidence": "uncertain attribution expands benchmarks before training"
+    },
+    {
+      "name": "diagnostics_saved_for_every_decision",
+      "passed": true,
+      "evidence": "decisions=6, diagnostics=6"
+    }
+  ],
+  "evidence": {
+    "policy": "attribute failure before changing RAG, prompt, LoRA, security policy, benchmarks, or critic role",
+    "all_roles": true,
+    "lora_guardrail": "bad context and schema/format failures never train LoRA first"
+  }
+}

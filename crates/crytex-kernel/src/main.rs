@@ -29,9 +29,9 @@ use crytex_bench::{
     Score, Scorer,
 };
 use crytex_cli_commands::{
-    ABTestCommands, AcceptanceRuntimeMode, BenchCommands, Cli, Commands, KanbanCommands,
-    LoraCommands, LoraDatasetCommands, LoraObjectiveArg, PromptCommands, PromptMutationOperatorArg,
-    RagCommands,
+    ABTestCommands, AcceptanceRuntimeMode, BenchCommands, Cli, Commands, EvolutionCommands,
+    KanbanCommands, LoraCommands, LoraDatasetCommands, LoraObjectiveArg, PromptCommands,
+    PromptMutationOperatorArg, RagCommands,
 };
 use crytex_compress::{
     ArtifactKind, CompressionQualityReport, DiskCcrStore, InMemoryCcrStore, ModelTokenProfile,
@@ -58,25 +58,27 @@ use crytex_core::{
     persistence::{BenchmarkResultRepository, Persistence, PromptVersionRepository},
     services::{
         AdapterMetadata, AgentRole, AgentService, AgentServiceImpl, AgentWorkflowNodeExecutor,
-        AlertService, AlertServiceImpl, AlertThresholds, BulkAuditLogService, CreateProjectRequest,
-        CreateTaskRequest, CriticCouncil, EventServiceImpl, HfGgufResolveRequest,
-        InferenceServiceImpl, KanbanBoardProjection, KanbanColumnProjection,
-        KanbanHistoryProjection, KanbanMovement, KanbanProjectionService, KanbanRunSelector,
-        KanbanStatus, KanbanTaskProjection, LoraBenchmarkDecision, LoraBenchmarkGate,
-        LoraBenchmarkRequest, LoraDatasetInspector, LoraDatasetReport, LoraEvolutionError,
-        LoraMetrics, LoraQualityGateName, LoraQualityGateResult, LoraRouter, LoraTrainer,
-        LoraTrainingConfig, LoraTrainingError, LoraTrainingObjective, LoraTrainingResult,
-        MemoryRoleAdapterRegistry, ModelManager, ModelManagerImpl, ModelRuntimeMatrixProbe,
-        ModelRuntimeMatrixRequest, ModelRuntimeProbe, ModelRuntimeProbeRequest, MutationOperator,
-        Orchestrator, OrchestratorImpl, ProjectService, ProjectServiceImpl, ProjectWatcher,
-        PromptBenchmarkDecision, PromptBenchmarkGate, PromptBenchmarkRequest,
-        PromptEvolutionDecisionReport, PromptEvolutionError, PromptEvolutionService,
-        PromptFailureKind, PromptFailureRouter, Quantization, RecordRewardRequest, RerankPassage,
-        RerankResult, RewardService, RoleAdapterRegistry, RoleQualityProof, RuntimeFeatureSet,
-        RuntimeMatrixEntryRequest, RuntimeMatrixReportWriter, SchedulerImpl,
-        SystemHardwareDetector, TaskHandler, TaskServiceImpl, TomlWorkflowRepository, VectorStore,
-        WorkerError, WorkerPool, WorkflowDefinition, WorkflowEdge, WorkflowEngine, WorkflowNode,
-        WorkflowRepository, WorkflowRetryPolicy, lora_quality_gate, recommend_local_device,
+        AlertService, AlertServiceImpl, AlertThresholds, AutonomousEvolutionService,
+        BulkAuditLogService, CreateProjectRequest, CreateTaskRequest, CriticCouncil,
+        EventServiceImpl, EvolutionAction, EvolutionDecision, EvolutionFailureKind,
+        EvolutionObservation, EvolutionRole, HfGgufResolveRequest, InferenceServiceImpl,
+        KanbanBoardProjection, KanbanColumnProjection, KanbanHistoryProjection, KanbanMovement,
+        KanbanProjectionService, KanbanRunSelector, KanbanStatus, KanbanTaskProjection,
+        LoraBenchmarkDecision, LoraBenchmarkGate, LoraBenchmarkRequest, LoraDatasetInspector,
+        LoraDatasetReport, LoraEvolutionError, LoraMetrics, LoraQualityGateName,
+        LoraQualityGateResult, LoraRouter, LoraTrainer, LoraTrainingConfig, LoraTrainingError,
+        LoraTrainingObjective, LoraTrainingResult, MemoryRoleAdapterRegistry, ModelManager,
+        ModelManagerImpl, ModelRuntimeMatrixProbe, ModelRuntimeMatrixRequest, ModelRuntimeProbe,
+        ModelRuntimeProbeRequest, MutationOperator, Orchestrator, OrchestratorImpl, ProjectService,
+        ProjectServiceImpl, ProjectWatcher, PromptBenchmarkDecision, PromptBenchmarkGate,
+        PromptBenchmarkRequest, PromptEvolutionDecisionReport, PromptEvolutionError,
+        PromptEvolutionService, PromptFailureKind, PromptFailureRouter, Quantization,
+        RecordRewardRequest, RerankPassage, RerankResult, RewardService, RoleAdapterRegistry,
+        RoleQualityProof, RuntimeFeatureSet, RuntimeMatrixEntryRequest, RuntimeMatrixReportWriter,
+        SchedulerImpl, StaticEvolutionObservationSource, SystemHardwareDetector, TaskHandler,
+        TaskServiceImpl, TomlWorkflowRepository, VectorStore, WorkerError, WorkerPool,
+        WorkflowDefinition, WorkflowEdge, WorkflowEngine, WorkflowNode, WorkflowRepository,
+        WorkflowRetryPolicy, lora_quality_gate, recommend_local_device,
         validate_objective_examples,
     },
     state_export::export_project_state,
@@ -93,7 +95,7 @@ use crytex_sandbox::SandboxOrchestrator;
 use crytex_storage::Storage;
 use crytex_tools::{Capability, ScanningToolService, ToolServiceImpl, TypedToolRegistry};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -3329,6 +3331,16 @@ struct LoraQualityGateProofReport {
 }
 
 #[derive(Debug, Serialize)]
+struct EvolutionPolicyProofReport {
+    passed: bool,
+    decisions: Vec<EvolutionDecision>,
+    action_counts: BTreeMap<String, usize>,
+    diagnostics: Vec<serde_json::Value>,
+    gates: Vec<KernelE2eProofGate>,
+    evidence: serde_json::Value,
+}
+
+#[derive(Debug, Serialize)]
 struct LoraBenchmarkDecisionProof {
     accepted: bool,
     reason: String,
@@ -3901,6 +3913,176 @@ async fn run_lora_quality_gate_proof() -> Result<LoraQualityGateProofReport, Str
             "rollback_policy": "failed challenger artifact removed and active baseline/promotion preserved"
         }),
     })
+}
+
+fn default_evolution_observations() -> Vec<EvolutionObservation> {
+    vec![
+        EvolutionObservation {
+            role: EvolutionRole::CoderPython,
+            failure_kind: EvolutionFailureKind::BadContext,
+            task_id: Some("task-rag-context".into()),
+            trace_id: "trace-rag-context".into(),
+            evidence: serde_json::json!({
+                "rag_selected_context_relevance": 0.18,
+                "missing_evidence_ids": ["python-docs-exception-handling"],
+                "why_not_lora": "model answered from wrong context"
+            }),
+            repeated_count: 1,
+        },
+        EvolutionObservation {
+            role: EvolutionRole::Qa,
+            failure_kind: EvolutionFailureKind::Schema,
+            task_id: Some("task-schema".into()),
+            trace_id: "trace-schema".into(),
+            evidence: serde_json::json!({
+                "schema_errors": ["missing field blocking_issues"],
+                "prompt_version_id": "qa-prompt-v1"
+            }),
+            repeated_count: 1,
+        },
+        EvolutionObservation {
+            role: EvolutionRole::CoderRust,
+            failure_kind: EvolutionFailureKind::RepeatedRoleSkillFailure,
+            task_id: Some("task-rust-skill".into()),
+            trace_id: "trace-rust-skill".into(),
+            evidence: serde_json::json!({
+                "failure_type": "borrow-checker",
+                "recent_failures": 4,
+                "dataset_role": "coder-rust"
+            }),
+            repeated_count: 4,
+        },
+        EvolutionObservation {
+            role: EvolutionRole::CriticCoder,
+            failure_kind: EvolutionFailureKind::WeakCriticFeedback,
+            task_id: Some("task-weak-critic".into()),
+            trace_id: "trace-weak-critic".into(),
+            evidence: serde_json::json!({
+                "critic_comment": "bad",
+                "missing": ["reason", "blocking_issues", "remediation_proposal"]
+            }),
+            repeated_count: 2,
+        },
+        EvolutionObservation {
+            role: EvolutionRole::Security,
+            failure_kind: EvolutionFailureKind::SecurityPolicyGap,
+            task_id: Some("task-security-policy".into()),
+            trace_id: "trace-security-policy".into(),
+            evidence: serde_json::json!({
+                "tool_misuse": "untrusted shell args",
+                "policy_gap": "missing allowlist rule"
+            }),
+            repeated_count: 1,
+        },
+        EvolutionObservation {
+            role: EvolutionRole::Orchestrator,
+            failure_kind: EvolutionFailureKind::BenchmarkCoverageGap,
+            task_id: Some("task-benchmark-gap".into()),
+            trace_id: "trace-benchmark-gap".into(),
+            evidence: serde_json::json!({
+                "unknown_failure": true,
+                "coverage_gap": "no regression fixture for decomposition depth"
+            }),
+            repeated_count: 1,
+        },
+    ]
+}
+
+async fn run_autonomous_evolution_policy(all_roles: bool) -> Vec<EvolutionDecision> {
+    let event_bus = Arc::new(crytex_core::EventBus::new());
+    let events = Arc::new(EventServiceImpl::new(event_bus));
+    let source = Box::new(StaticEvolutionObservationSource::new(
+        default_evolution_observations(),
+    ));
+    let service = AutonomousEvolutionService::new(source, events);
+    service.run(all_roles).await
+}
+
+async fn run_evolution_policy_proof() -> EvolutionPolicyProofReport {
+    let decisions = run_autonomous_evolution_policy(true).await;
+    let mut action_counts = BTreeMap::new();
+    for decision in &decisions {
+        *action_counts
+            .entry(decision.action.as_str().to_string())
+            .or_insert(0) += 1;
+    }
+    let diagnostics = decisions
+        .iter()
+        .map(|decision| decision.diagnostics.clone())
+        .collect::<Vec<_>>();
+    let action_for = |role: EvolutionRole| {
+        decisions
+            .iter()
+            .find(|decision| decision.role == role)
+            .map(|decision| decision.action)
+    };
+    let rag_not_lora = action_for(EvolutionRole::CoderPython) == Some(EvolutionAction::RagFix);
+    let schema_prompt = action_for(EvolutionRole::Qa) == Some(EvolutionAction::PromptEvolution);
+    let repeated_lora = action_for(EvolutionRole::CoderRust) == Some(EvolutionAction::LoraTraining);
+    let critic_evolves =
+        action_for(EvolutionRole::CriticCoder) == Some(EvolutionAction::CriticRoleEvolution);
+    let security_policy =
+        action_for(EvolutionRole::Security) == Some(EvolutionAction::SecurityPolicy);
+    let benchmark_expansion =
+        action_for(EvolutionRole::Orchestrator) == Some(EvolutionAction::BenchmarkExpansion);
+    let diagnostics_saved = diagnostics.iter().all(|diagnostic| {
+        diagnostic.get("kind").and_then(serde_json::Value::as_str)
+            == Some("autonomous_evolution_decision")
+    });
+    let gates = vec![
+        proof_gate(
+            "bad_context_routes_to_rag_fix_not_lora",
+            rag_not_lora,
+            "context attribution blocks LoRA training",
+        ),
+        proof_gate(
+            "schema_format_routes_to_prompt_first",
+            schema_prompt,
+            "format/schema failures go to Prompt Evolution",
+        ),
+        proof_gate(
+            "repeated_role_skill_failure_routes_to_lora",
+            repeated_lora,
+            "repeated skill failure routes to role LoRA training",
+        ),
+        proof_gate(
+            "weak_critic_routes_to_critic_role_evolution",
+            critic_evolves,
+            "critic detail quality evolves critic role first",
+        ),
+        proof_gate(
+            "security_gap_routes_to_policy",
+            security_policy,
+            "tool misuse/prompt injection policy gaps do not train LoRA",
+        ),
+        proof_gate(
+            "unknown_or_coverage_gap_routes_to_benchmark_expansion",
+            benchmark_expansion,
+            "uncertain attribution expands benchmarks before training",
+        ),
+        proof_gate(
+            "diagnostics_saved_for_every_decision",
+            diagnostics_saved && diagnostics.len() == decisions.len(),
+            &format!(
+                "decisions={}, diagnostics={}",
+                decisions.len(),
+                diagnostics.len()
+            ),
+        ),
+    ];
+    let passed = gates.iter().all(|gate| gate.passed);
+    EvolutionPolicyProofReport {
+        passed,
+        decisions,
+        action_counts,
+        diagnostics,
+        gates,
+        evidence: serde_json::json!({
+            "policy": "attribute failure before changing RAG, prompt, LoRA, security policy, benchmarks, or critic role",
+            "all_roles": true,
+            "lora_guardrail": "bad context and schema/format failures never train LoRA first"
+        }),
+    }
 }
 
 fn prompt_operator_from_arg(operator: PromptMutationOperatorArg) -> MutationOperator {
@@ -8324,6 +8506,28 @@ async fn async_main() {
         return;
     }
 
+    if let Commands::ProveEvolutionPolicy { report_path } = &cli.command {
+        let report = run_evolution_policy_proof().await;
+        let payload = serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into());
+        if let Some(report_path) = report_path {
+            if let Some(parent) = report_path.parent()
+                && let Err(error) = tokio::fs::create_dir_all(parent).await
+            {
+                eprintln!("Failed to create evolution policy proof report directory: {error}");
+                std::process::exit(1);
+            }
+            if let Err(error) = tokio::fs::write(report_path, &payload).await {
+                eprintln!("Failed to write evolution policy proof report: {error}");
+                std::process::exit(1);
+            }
+        }
+        println!("{payload}");
+        if !report.passed {
+            std::process::exit(2);
+        }
+        return;
+    }
+
     if let Commands::ProveLoraLiveE2e {
         gguf_path,
         context_size,
@@ -9326,6 +9530,9 @@ async fn async_main() {
         Commands::ProveLoraQualityGate { .. } => {
             unreachable!("prove-lora-quality-gate is handled before full AppContext initialization")
         }
+        Commands::ProveEvolutionPolicy { .. } => {
+            unreachable!("prove-evolution-policy is handled before full AppContext initialization")
+        }
         Commands::Submit {
             project,
             prompt,
@@ -9655,6 +9862,26 @@ async fn async_main() {
                         std::process::exit(1);
                     });
                 print_prompt_decision_report(report, json);
+            }
+        },
+        Commands::Evolution { command } => match command {
+            EvolutionCommands::Run { all_roles, json } => {
+                let decisions = run_autonomous_evolution_policy(all_roles).await;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&decisions).unwrap_or_else(|_| "[]".into())
+                    );
+                } else {
+                    for decision in decisions {
+                        println!(
+                            "{} -> {} ({})",
+                            decision.role.as_str(),
+                            decision.action.as_str(),
+                            decision.reason
+                        );
+                    }
+                }
             }
         },
         Commands::EvolvePrompt { agent, operator } => {

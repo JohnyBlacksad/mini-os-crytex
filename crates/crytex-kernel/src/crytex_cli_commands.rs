@@ -327,6 +327,11 @@ pub enum Commands {
         #[arg(long)]
         report_path: Option<PathBuf>,
     },
+    /// Prove autonomous evolution policy routes failures to the right module
+    ProveEvolutionPolicy {
+        #[arg(long)]
+        report_path: Option<PathBuf>,
+    },
     /// Add or update a managed HuggingFace/local model entry
     AddModel {
         #[arg(short, long)]
@@ -470,6 +475,11 @@ pub enum Commands {
     Prompts {
         #[command(subcommand)]
         command: PromptCommands,
+    },
+    /// Run autonomous evolution policy routing
+    Evolution {
+        #[command(subcommand)]
+        command: EvolutionCommands,
     },
     /// Evolve the active prompt for an agent
     EvolvePrompt {
@@ -621,6 +631,17 @@ pub enum PromptMutationOperatorArg {
     AddConstraint,
     InjectExample,
     ChangeTone,
+}
+
+#[derive(Subcommand)]
+pub enum EvolutionCommands {
+    /// Attribute failures and route improvements.
+    Run {
+        #[arg(long)]
+        all_roles: bool,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1249,6 +1270,40 @@ mod tests {
         assert_eq!(
             report_path,
             Some(PathBuf::from("reports/lora-quality-gate-p10.json"))
+        );
+    }
+
+    #[test]
+    fn evolution_run_parses_all_roles_json_contract() {
+        let cli = Cli::parse_from(["crytex-kernel", "evolution", "run", "--all-roles", "--json"]);
+
+        assert!(matches!(
+            cli.command,
+            Commands::Evolution {
+                command: EvolutionCommands::Run {
+                    all_roles: true,
+                    json: true
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn evolution_policy_proof_command_parses_report_path() {
+        let cli = Cli::parse_from([
+            "crytex-kernel",
+            "prove-evolution-policy",
+            "--report-path",
+            "reports/evolution-policy-p11.json",
+        ]);
+
+        let Commands::ProveEvolutionPolicy { report_path } = cli.command else {
+            panic!("expected evolution policy proof command");
+        };
+
+        assert_eq!(
+            report_path,
+            Some(PathBuf::from("reports/evolution-policy-p11.json"))
         );
     }
 }

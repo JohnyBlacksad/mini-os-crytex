@@ -25,6 +25,7 @@ pub fn is_proof_command(command: &Commands) -> bool {
             | Commands::ProveLoraDataset { .. }
             | Commands::ProveLoraTrainingObjectives { .. }
             | Commands::ProveLoraQualityGate { .. }
+            | Commands::ProveEvolutionPolicy { .. }
             | Commands::BackendAcceptance { .. }
     )
 }
@@ -125,6 +126,13 @@ mod tests {
     #[test]
     fn lora_quality_gate_is_proof_only() {
         let command = Commands::ProveLoraQualityGate { report_path: None };
+
+        assert!(is_proof_command(&command));
+    }
+
+    #[test]
+    fn evolution_policy_is_proof_only() {
+        let command = Commands::ProveEvolutionPolicy { report_path: None };
 
         assert!(is_proof_command(&command));
     }

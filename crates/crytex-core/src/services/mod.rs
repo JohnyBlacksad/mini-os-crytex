@@ -7,6 +7,7 @@ pub mod agent_service;
 pub mod alert_service;
 pub mod artifact_contract;
 pub mod audit_log_service;
+pub mod autonomous_evolution_policy;
 pub mod bulk_audit_log;
 pub mod caching;
 pub mod context_assembler;
@@ -54,6 +55,11 @@ pub use artifact_contract::{
 };
 pub use audit_log_service::{
     AuditError, AuditEvent, AuditLogEntry, AuditLogService, AuditLogServiceImpl,
+};
+pub use autonomous_evolution_policy::{
+    AutonomousEvolutionPolicy, AutonomousEvolutionService, EvolutionAction, EvolutionDecision,
+    EvolutionFailureKind, EvolutionObservation, EvolutionObservationSource, EvolutionRole,
+    StaticEvolutionObservationSource,
 };
 pub use bulk_audit_log::BulkAuditLogService;
 pub use context_assembler::{

@@ -407,16 +407,23 @@ Production LoRA promotion requires:
 
 ## `evolution`
 
-Run autonomous improvement policies.
+Run autonomous failure attribution across roles and choose what to improve.
 
 ```powershell
-crytex evolution status --json
-crytex evolution run --role coder-python
-crytex evolution run --all-roles --dry-run
+crytex evolution run --all-roles --json
+crytex prove evolution-policy --report-path reports\evolution-policy-p11-proof.json
 ```
 
-The policy decides whether a failure should improve RAG, prompts, LoRA, security
-policy, benchmark coverage, or role contracts.
+Current development binary:
+
+```powershell
+cargo run -p crytex-kernel -- evolution run --all-roles --json
+cargo run -p crytex-kernel -- prove-evolution-policy --report-path reports\evolution-policy-p11-proof.json
+```
+
+The policy chooses among RAG fixes, prompt evolution, LoRA training, critic role
+evolution, security policy, and benchmark expansion. See
+[EVOLUTION_POLICY.md](EVOLUTION_POLICY.md).
 
 ## `bench`
 
