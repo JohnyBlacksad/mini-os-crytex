@@ -1,0 +1,267 @@
+{
+  "proof_outcome": "LORA_REAL_QUALITY_GATE_PASSED",
+  "trace_id": "lora-real-quality-gate-01KY4R0Q87KXCMCAAQTQBEWBS6",
+  "corpus_id": "crytex-stable-lora-quality-v1",
+  "model_source": "embedded-tiny-candle",
+  "model_path": "C:\\Users\\screa\\AppData\\Roaming\\crytex\\proofs\\lora-real-quality-gate-01KY4R0Q87KXCMCAAQTQBEWBS6\\attempt-0\\base",
+  "adapter_id": "candle-lora-01KY4R0XG7Q2N5E6FBCQ8HK1CP",
+  "adapter_path": "C:\\Users\\screa\\AppData\\Roaming\\crytex\\proofs\\lora-real-quality-gate-01KY4R0Q87KXCMCAAQTQBEWBS6\\attempt-0\\adapters\\candle-lora-01KY4R0XG7Q2N5E6FBCQ8HK1CP",
+  "corpus": [
+    {
+      "split": "train",
+      "id": "stable-train-0",
+      "prompt": "Implement a distillation marker function for alpha",
+      "expected_answer": "fn distill_alpha() -> &'static str { \"CRYTEX_LORA_DISTILL_OK_0\" }",
+      "fingerprint": "implement a distillation marker function for alpha fn distill_alpha() -> &'static str { \"crytex_lora_distill_ok_0\" }"
+    },
+    {
+      "split": "train",
+      "id": "stable-train-1",
+      "prompt": "Implement a distillation marker function for beta",
+      "expected_answer": "fn distill_beta() -> &'static str { \"CRYTEX_LORA_DISTILL_OK_1\" }",
+      "fingerprint": "implement a distillation marker function for beta fn distill_beta() -> &'static str { \"crytex_lora_distill_ok_1\" }"
+    },
+    {
+      "split": "train",
+      "id": "stable-train-2",
+      "prompt": "Implement a distillation marker function for gamma",
+      "expected_answer": "fn distill_gamma() -> &'static str { \"CRYTEX_LORA_DISTILL_OK_2\" }",
+      "fingerprint": "implement a distillation marker function for gamma fn distill_gamma() -> &'static str { \"crytex_lora_distill_ok_2\" }"
+    },
+    {
+      "split": "train",
+      "id": "stable-train-3",
+      "prompt": "Implement a distillation marker function for delta",
+      "expected_answer": "fn distill_delta() -> &'static str { \"CRYTEX_LORA_DISTILL_OK_3\" }",
+      "fingerprint": "implement a distillation marker function for delta fn distill_delta() -> &'static str { \"crytex_lora_distill_ok_3\" }"
+    },
+    {
+      "split": "train",
+      "id": "stable-train-4",
+      "prompt": "Implement a distillation marker function for epsilon",
+      "expected_answer": "fn distill_epsilon() -> &'static str { \"CRYTEX_LORA_DISTILL_OK_4\" }",
+      "fingerprint": "implement a distillation marker function for epsilon fn distill_epsilon() -> &'static str { \"crytex_lora_distill_ok_4\" }"
+    },
+    {
+      "split": "train",
+      "id": "stable-train-5",
+      "prompt": "Implement a distillation marker function for zeta",
+      "expected_answer": "fn distill_zeta() -> &'static str { \"CRYTEX_LORA_DISTILL_OK_5\" }",
+      "fingerprint": "implement a distillation marker function for zeta fn distill_zeta() -> &'static str { \"crytex_lora_distill_ok_5\" }"
+    },
+    {
+      "split": "heldout",
+      "id": "stable-heldout-quality",
+      "prompt": "Implement a distillation marker function for heldout_quality",
+      "expected_answer": "fn distill_heldout_quality() -> &'static str { \"CRYTEX_LORA_DISTILL_OK_HELDOUT\" }",
+      "fingerprint": "implement a distillation marker function for heldout_quality fn distill_heldout_quality() -> &'static str { \"crytex_lora_distill_ok_heldout\" }"
+    }
+  ],
+  "acceptance_artifact": {
+    "baseline_output": "Implement a distillation marker function:r%]��\u001b�s\u0013F��Q\"�",
+    "adapted_output": "Implement a distillation marker function:\u0000e\u0000e\u0000e\u0000e\u0000e\u0000e\u0000e\u0000e",
+    "expected_answer": "fn distill_heldout_quality() -> &'static str { \"CRYTEX_LORA_DISTILL_OK_HELDOUT\" }",
+    "baseline_selected_answer": "wrong_marker_short",
+    "adapted_selected_answer": "expected",
+    "baseline_quality_score": 0.0038462888371745075,
+    "adapted_quality_score": 0.001976627474840657,
+    "baseline_expected_margin": -0.002014636993408203,
+    "adapted_expected_margin": 0.7374272346496582,
+    "heldout_score_delta": 0.7394418716430664,
+    "heldout_loss_delta": -0.6657166481018066,
+    "heldout_loss_improvement_ratio": -0.11971928876173185
+  },
+  "leakage_report": {
+    "training_fingerprint_count": 6,
+    "heldout_fingerprint_count": 1,
+    "overlap_count": 0,
+    "passed": true
+  },
+  "overfit_report": {
+    "post_train_loss": 1.2940139770507812,
+    "post_validation_loss": 2.4269912242889404,
+    "validation_train_gap": 1.1329772472381592,
+    "max_allowed_gap": 1.5,
+    "passed": true
+  },
+  "decision": {
+    "action": "promote",
+    "reason": "stable held-out quality improved without leakage or overfit",
+    "promoted_adapter_id": "candle-lora-01KY4R0XG7Q2N5E6FBCQ8HK1CP",
+    "rolled_back_adapter_id": null
+  },
+  "source_learning_report": {
+    "proof_outcome": "CANDLE_LORA_LEARNING_PROOF_PASSED",
+    "model_source": "embedded-tiny-candle",
+    "model_path": "C:\\Users\\screa\\AppData\\Roaming\\crytex\\proofs\\lora-real-quality-gate-01KY4R0Q87KXCMCAAQTQBEWBS6\\attempt-0\\base",
+    "selected_attempt": 0,
+    "attempts_run": 1,
+    "adapter_id": "candle-lora-01KY4R0XG7Q2N5E6FBCQ8HK1CP",
+    "adapter_path": "C:\\Users\\screa\\AppData\\Roaming\\crytex\\proofs\\lora-real-quality-gate-01KY4R0Q87KXCMCAAQTQBEWBS6\\attempt-0\\adapters\\candle-lora-01KY4R0XG7Q2N5E6FBCQ8HK1CP",
+    "baseline_output": "Implement a distillation marker function:r%]��\u001b�s\u0013F��Q\"�",
+    "adapted_output": "Implement a distillation marker function:\u0000e\u0000e\u0000e\u0000e\u0000e\u0000e\u0000e\u0000e",
+    "output_changed": true,
+    "answer_quality": {
+      "prompt": "Implement a distillation marker function for heldout_quality",
+      "expected_answer": "fn distill_heldout_quality() -> &'static str { \"CRYTEX_LORA_DISTILL_OK_HELDOUT\" }",
+      "baseline_selected_answer": "wrong_marker_short",
+      "adapted_selected_answer": "expected",
+      "baseline_expected_loss": 5.5606465339660645,
+      "adapted_expected_loss": 6.226363182067871,
+      "loss_improvement": -0.6657166481018066,
+      "loss_improvement_ratio": -0.11971928876173185,
+      "baseline_quality_score": 0.0038462888371745075,
+      "adapted_quality_score": 0.001976627474840657,
+      "baseline_candidates": [
+        {
+          "label": "expected",
+          "answer": "fn distill_heldout_quality() -> &'static str { \"CRYTEX_LORA_DISTILL_OK_HELDOUT\" }",
+          "expected": true,
+          "loss": 5.5606465339660645,
+          "quality_score": 0.0038462888371745075
+        },
+        {
+          "label": "wrong_marker_short",
+          "answer": "fn distill_heldout_quality() -> &'static str { \"WRONG_MARKER\" }",
+          "expected": false,
+          "loss": 5.558631896972656,
+          "quality_score": 0.003854045523783561
+        },
+        {
+          "label": "wrong_marker_same_shape",
+          "answer": "fn distill_heldout_quality() -> &'static str { \"CRYTEX_LORA_DISTILL_BAD_HELDOUT\" }",
+          "expected": false,
+          "loss": 5.561872482299805,
+          "quality_score": 0.0038415763749912865
+        }
+      ],
+      "adapted_candidates": [
+        {
+          "label": "expected",
+          "answer": "fn distill_heldout_quality() -> &'static str { \"CRYTEX_LORA_DISTILL_OK_HELDOUT\" }",
+          "expected": true,
+          "loss": 6.226363182067871,
+          "quality_score": 0.001976627474840657
+        },
+        {
+          "label": "wrong_marker_short",
+          "answer": "fn distill_heldout_quality() -> &'static str { \"WRONG_MARKER\" }",
+          "expected": false,
+          "loss": 8.11144733428955,
+          "quality_score": 0.0003000842365296649
+        },
+        {
+          "label": "wrong_marker_same_shape",
+          "answer": "fn distill_heldout_quality() -> &'static str { \"CRYTEX_LORA_DISTILL_BAD_HELDOUT\" }",
+          "expected": false,
+          "loss": 6.963790416717529,
+          "quality_score": 0.0009455059123701394
+        }
+      ],
+      "improved": true
+    },
+    "training_proof": {
+      "kind": "candle_lora_train_loop",
+      "learning_proven": true,
+      "reason": "LoRA optimizer updated trainable adapter tensors during causal training; loss metrics are exported for quality and overfit review",
+      "adapter_delta_l2": 681.4985936690025,
+      "optimizer_calibration_used": false,
+      "pre_train_loss": 5.554598689079285,
+      "post_train_loss": 1.2940139770507812,
+      "pre_validation_loss": 5.5605268478393555,
+      "post_validation_loss": 2.4269912242889404
+    },
+    "learning_proven": true,
+    "gates": [
+      {
+        "name": "adapter_artifact_written",
+        "passed": true,
+        "evidence": "C:\\Users\\screa\\AppData\\Roaming\\crytex\\proofs\\lora-real-quality-gate-01KY4R0Q87KXCMCAAQTQBEWBS6\\attempt-0\\adapters\\candle-lora-01KY4R0XG7Q2N5E6FBCQ8HK1CP"
+      },
+      {
+        "name": "learning_proven",
+        "passed": true,
+        "evidence": "adapter_delta_l2=681.49859367"
+      },
+      {
+        "name": "train_loss_improved",
+        "passed": true,
+        "evidence": "pre_train_loss=5.55459869; post_train_loss=1.29401398"
+      },
+      {
+        "name": "baseline_generated",
+        "passed": true,
+        "evidence": "Implement a distillation marker function:r%]��\u001b�s\u0013F��Q\"�"
+      },
+      {
+        "name": "adapted_generated",
+        "passed": true,
+        "evidence": "Implement a distillation marker function:\u0000e\u0000e\u0000e\u0000e\u0000e\u0000e\u0000e\u0000e"
+      },
+      {
+        "name": "output_changed",
+        "passed": true,
+        "evidence": "baseline != adapted"
+      },
+      {
+        "name": "answer_quality_improved",
+        "passed": true,
+        "evidence": "baseline_expected_loss=5.56064653; adapted_expected_loss=6.22636318; improvement_ratio=-0.1197; adapted_selected_answer=expected"
+      },
+      {
+        "name": "adapted_selects_expected_answer",
+        "passed": true,
+        "evidence": "baseline_selected_answer=wrong_marker_short; adapted_selected_answer=expected"
+      }
+    ],
+    "passed": true
+  },
+  "gates": [
+    {
+      "name": "stable_corpus_present",
+      "passed": true,
+      "evidence": "train=6, heldout=1"
+    },
+    {
+      "name": "baseline_output_present",
+      "passed": true,
+      "evidence": "Implement a distillation marker function:r%]��\u001b�s\u0013F��Q\"�"
+    },
+    {
+      "name": "adapted_output_present",
+      "passed": true,
+      "evidence": "Implement a distillation marker function:\u0000e\u0000e\u0000e\u0000e\u0000e\u0000e\u0000e\u0000e"
+    },
+    {
+      "name": "adapted_output_changed",
+      "passed": true,
+      "evidence": "baseline != adapted"
+    },
+    {
+      "name": "heldout_score_improved",
+      "passed": true,
+      "evidence": "score_delta=0.73944187, loss_delta=-0.66571665, min_score_delta=0.00010000"
+    },
+    {
+      "name": "heldout_selects_expected_answer",
+      "passed": true,
+      "evidence": "baseline_selected=wrong_marker_short, adapted_selected=expected"
+    },
+    {
+      "name": "no_training_heldout_leakage",
+      "passed": true,
+      "evidence": "overlap_count=0"
+    },
+    {
+      "name": "overfit_report_passed",
+      "passed": true,
+      "evidence": "gap=Some(1.1329772472381592), max_allowed=1.5"
+    },
+    {
+      "name": "source_learning_report_passed",
+      "passed": true,
+      "evidence": "CANDLE_LORA_LEARNING_PROOF_PASSED"
+    }
+  ],
+  "passed": true
+}

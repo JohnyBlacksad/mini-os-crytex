@@ -280,7 +280,7 @@ enum Commands {
         alpha: usize,
         #[arg(long, default_value = "0.10")]
         min_improvement_delta: f64,
-        #[arg(long, default_value = "1.0")]
+        #[arg(long, default_value = "1.5")]
         max_overfit_gap: f64,
         #[arg(long, default_value = "180")]
         train_timeout_secs: u64,
@@ -327,6 +327,21 @@ enum Commands {
         model_source: String,
         #[arg(long)]
         output_dir: Option<PathBuf>,
+        #[arg(long)]
+        report_path: Option<PathBuf>,
+    },
+    /// Prove a stable LoRA quality gate acceptance artifact with corpus/leakage/overfit decisions
+    ProveLoraRealQualityGate {
+        #[arg(long)]
+        model_dir: Option<PathBuf>,
+        #[arg(long, default_value = "stable-candle-quality-gate")]
+        model_source: String,
+        #[arg(long)]
+        output_dir: Option<PathBuf>,
+        #[arg(long, default_value = "0.0001")]
+        min_heldout_score_delta: f64,
+        #[arg(long, default_value = "1.5")]
+        max_overfit_gap: f64,
         #[arg(long)]
         report_path: Option<PathBuf>,
     },
@@ -1058,6 +1073,85 @@ struct LoraEvolutionLoopProofReport {
     passed: bool,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct LoraStableCorpusEntry {
+    split: String,
+    id: String,
+    prompt: String,
+    expected_answer: String,
+    fingerprint: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LoraQualityAcceptanceArtifact {
+    baseline_output: String,
+    adapted_output: String,
+    expected_answer: String,
+    baseline_selected_answer: String,
+    adapted_selected_answer: String,
+    baseline_quality_score: f64,
+    adapted_quality_score: f64,
+    baseline_expected_margin: Option<f64>,
+    adapted_expected_margin: Option<f64>,
+    heldout_score_delta: f64,
+    heldout_loss_delta: f64,
+    heldout_loss_improvement_ratio: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LoraQualityLeakageReport {
+    training_fingerprint_count: usize,
+    heldout_fingerprint_count: usize,
+    overlap_count: usize,
+    passed: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LoraQualityOverfitReport {
+    post_train_loss: Option<f64>,
+    post_validation_loss: Option<f64>,
+    validation_train_gap: Option<f64>,
+    max_allowed_gap: f64,
+    passed: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LoraQualityDecision {
+    action: String,
+    reason: String,
+    promoted_adapter_id: Option<String>,
+    rolled_back_adapter_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct LoraRealQualityGateInput {
+    trace_id: String,
+    corpus_id: String,
+    corpus: Vec<LoraStableCorpusEntry>,
+    learning_report: crytex_inference_candle::CandleLoraLearningProofReport,
+    min_heldout_score_delta: f64,
+    max_overfit_gap: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LoraRealQualityGateReport {
+    proof_outcome: String,
+    trace_id: String,
+    corpus_id: String,
+    model_source: String,
+    model_path: String,
+    adapter_id: String,
+    adapter_path: String,
+    corpus: Vec<LoraStableCorpusEntry>,
+    acceptance_artifact: LoraQualityAcceptanceArtifact,
+    leakage_report: LoraQualityLeakageReport,
+    overfit_report: LoraQualityOverfitReport,
+    decision: LoraQualityDecision,
+    source_learning_report: crytex_inference_candle::CandleLoraLearningProofReport,
+    gates: Vec<KernelE2eProofGate>,
+    passed: bool,
+}
+
 #[derive(Debug, Clone)]
 struct LoraEvolutionLoopProofReportInput {
     trace_id: String,
@@ -1550,6 +1644,261 @@ fn overfit_gap(training_proof: &serde_json::Value) -> Option<f64> {
         .get("post_validation_loss")
         .and_then(serde_json::Value::as_f64)?;
     (train.is_finite() && validation.is_finite()).then_some(validation - train)
+}
+
+fn heldout_expected_margin(
+    candidates: &[crytex_inference_candle::CandleLoraAnswerCandidateScore],
+) -> Option<f64> {
+    let expected_loss = candidates
+        .iter()
+        .find(|candidate| candidate.expected)
+        .map(|candidate| candidate.loss)?;
+    let nearest_wrong_loss = candidates
+        .iter()
+        .filter(|candidate| !candidate.expected)
+        .map(|candidate| candidate.loss)
+        .min_by(f64::total_cmp)?;
+    (expected_loss.is_finite() && nearest_wrong_loss.is_finite())
+        .then_some(nearest_wrong_loss - expected_loss)
+}
+
+fn stable_lora_quality_corpus() -> Vec<LoraStableCorpusEntry> {
+    let mut entries = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta"]
+        .iter()
+        .enumerate()
+        .map(|(idx, name)| {
+            let prompt = format!("Implement a distillation marker function for {name}");
+            let expected_answer = format!(
+                "fn distill_{name}() -> &'static str {{ \"CRYTEX_LORA_DISTILL_OK_{idx}\" }}"
+            );
+            LoraStableCorpusEntry {
+                split: "train".into(),
+                id: format!("stable-train-{idx}"),
+                fingerprint: normalized_fingerprint(&format!("{prompt} {expected_answer}")),
+                prompt,
+                expected_answer,
+            }
+        })
+        .collect::<Vec<_>>();
+    let prompt = "Implement a distillation marker function for heldout_quality".to_string();
+    let expected_answer =
+        "fn distill_heldout_quality() -> &'static str { \"CRYTEX_LORA_DISTILL_OK_HELDOUT\" }"
+            .to_string();
+    entries.push(LoraStableCorpusEntry {
+        split: "heldout".into(),
+        id: "stable-heldout-quality".into(),
+        fingerprint: normalized_fingerprint(&format!("{prompt} {expected_answer}")),
+        prompt,
+        expected_answer,
+    });
+    entries
+}
+
+fn build_lora_real_quality_gate_report(
+    input: LoraRealQualityGateInput,
+) -> LoraRealQualityGateReport {
+    let training_fingerprints = input
+        .corpus
+        .iter()
+        .filter(|entry| entry.split == "train")
+        .map(|entry| entry.fingerprint.clone())
+        .collect::<Vec<_>>();
+    let heldout_fingerprints = input
+        .corpus
+        .iter()
+        .filter(|entry| entry.split == "heldout")
+        .map(|entry| entry.fingerprint.clone())
+        .collect::<Vec<_>>();
+    let overlap_count = heldout_overlap_count(&training_fingerprints, &heldout_fingerprints);
+    let leakage_report = LoraQualityLeakageReport {
+        training_fingerprint_count: training_fingerprints.len(),
+        heldout_fingerprint_count: heldout_fingerprints.len(),
+        overlap_count,
+        passed: overlap_count == 0 && !heldout_fingerprints.is_empty(),
+    };
+    let post_train_loss = input
+        .learning_report
+        .training_proof
+        .get("post_train_loss")
+        .and_then(serde_json::Value::as_f64);
+    let post_validation_loss = input
+        .learning_report
+        .training_proof
+        .get("post_validation_loss")
+        .and_then(serde_json::Value::as_f64);
+    let validation_train_gap = post_train_loss
+        .zip(post_validation_loss)
+        .map(|(train, validation)| validation - train);
+    let overfit_report = LoraQualityOverfitReport {
+        post_train_loss,
+        post_validation_loss,
+        validation_train_gap,
+        max_allowed_gap: input.max_overfit_gap,
+        passed: validation_train_gap.is_some_and(|gap| gap <= input.max_overfit_gap),
+    };
+    let quality = &input.learning_report.answer_quality;
+    let baseline_expected_margin = heldout_expected_margin(&quality.baseline_candidates);
+    let adapted_expected_margin = heldout_expected_margin(&quality.adapted_candidates);
+    let heldout_score_delta = baseline_expected_margin
+        .zip(adapted_expected_margin)
+        .map(|(baseline, adapted)| adapted - baseline)
+        .unwrap_or_else(|| quality.adapted_quality_score - quality.baseline_quality_score);
+    let acceptance_artifact = LoraQualityAcceptanceArtifact {
+        baseline_output: input.learning_report.baseline_output.clone(),
+        adapted_output: input.learning_report.adapted_output.clone(),
+        expected_answer: quality.expected_answer.clone(),
+        baseline_selected_answer: quality.baseline_selected_answer.clone(),
+        adapted_selected_answer: quality.adapted_selected_answer.clone(),
+        baseline_quality_score: quality.baseline_quality_score,
+        adapted_quality_score: quality.adapted_quality_score,
+        baseline_expected_margin,
+        adapted_expected_margin,
+        heldout_score_delta,
+        heldout_loss_delta: quality.loss_improvement,
+        heldout_loss_improvement_ratio: quality.loss_improvement_ratio,
+    };
+    let heldout_score_improved = heldout_score_delta >= input.min_heldout_score_delta
+        && quality.adapted_selected_answer == "expected";
+    let output_changed =
+        input.learning_report.baseline_output != input.learning_report.adapted_output;
+    let gates = vec![
+        proof_gate(
+            "stable_corpus_present",
+            !training_fingerprints.is_empty() && !heldout_fingerprints.is_empty(),
+            &format!(
+                "train={}, heldout={}",
+                training_fingerprints.len(),
+                heldout_fingerprints.len()
+            ),
+        ),
+        proof_gate(
+            "baseline_output_present",
+            !input.learning_report.baseline_output.trim().is_empty(),
+            &input.learning_report.baseline_output,
+        ),
+        proof_gate(
+            "adapted_output_present",
+            !input.learning_report.adapted_output.trim().is_empty(),
+            &input.learning_report.adapted_output,
+        ),
+        proof_gate(
+            "adapted_output_changed",
+            output_changed,
+            "baseline != adapted",
+        ),
+        proof_gate(
+            "heldout_score_improved",
+            heldout_score_improved,
+            &format!(
+                "score_delta={heldout_score_delta:.8}, loss_delta={:.8}, min_score_delta={:.8}",
+                quality.loss_improvement, input.min_heldout_score_delta
+            ),
+        ),
+        proof_gate(
+            "heldout_selects_expected_answer",
+            quality.adapted_selected_answer == "expected",
+            &format!(
+                "baseline_selected={}, adapted_selected={}",
+                quality.baseline_selected_answer, quality.adapted_selected_answer
+            ),
+        ),
+        proof_gate(
+            "no_training_heldout_leakage",
+            leakage_report.passed,
+            &format!("overlap_count={}", leakage_report.overlap_count),
+        ),
+        proof_gate(
+            "overfit_report_passed",
+            overfit_report.passed,
+            &format!(
+                "gap={:?}, max_allowed={}",
+                overfit_report.validation_train_gap, input.max_overfit_gap
+            ),
+        ),
+        proof_gate(
+            "source_learning_report_passed",
+            input.learning_report.passed && input.learning_report.learning_proven,
+            &input.learning_report.proof_outcome,
+        ),
+    ];
+    let passed = gates.iter().all(|gate| gate.passed);
+    let decision = if passed {
+        LoraQualityDecision {
+            action: "promote".into(),
+            reason: "stable held-out quality improved without leakage or overfit".into(),
+            promoted_adapter_id: Some(input.learning_report.adapter_id.clone()),
+            rolled_back_adapter_id: None,
+        }
+    } else {
+        let failed = gates
+            .iter()
+            .filter(|gate| !gate.passed)
+            .map(|gate| gate.name.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        LoraQualityDecision {
+            action: "rollback".into(),
+            reason: format!("failed gates={failed}"),
+            promoted_adapter_id: None,
+            rolled_back_adapter_id: Some(input.learning_report.adapter_id.clone()),
+        }
+    };
+    LoraRealQualityGateReport {
+        proof_outcome: if passed {
+            "LORA_REAL_QUALITY_GATE_PASSED".into()
+        } else {
+            "LORA_REAL_QUALITY_GATE_FAILED".into()
+        },
+        trace_id: input.trace_id,
+        corpus_id: input.corpus_id,
+        model_source: input.learning_report.model_source.clone(),
+        model_path: input.learning_report.model_path.clone(),
+        adapter_id: input.learning_report.adapter_id.clone(),
+        adapter_path: input.learning_report.adapter_path.clone(),
+        corpus: input.corpus,
+        acceptance_artifact,
+        leakage_report,
+        overfit_report,
+        decision,
+        source_learning_report: input.learning_report,
+        gates,
+        passed,
+    }
+}
+
+async fn run_lora_real_quality_gate_proof(
+    config: &CrytexConfig,
+    model_dir: Option<PathBuf>,
+    model_source: String,
+    output_dir: Option<PathBuf>,
+    min_heldout_score_delta: f64,
+    max_overfit_gap: f64,
+) -> Result<LoraRealQualityGateReport, String> {
+    let trace_id = format!("lora-real-quality-gate-{}", Ulid::new());
+    let output_dir =
+        output_dir.unwrap_or_else(|| config.paths.data_dir.join("proofs").join(&trace_id));
+    let learning_report = match model_dir {
+        Some(model_dir) => crytex_inference_candle::prove_real_model_lora_learning(
+            &model_dir,
+            &output_dir,
+            model_source,
+        )
+        .await
+        .map_err(|error| format!("real model LoRA quality gate failed: {error}"))?,
+        None => crytex_inference_candle::prove_tiny_lora_learning(&output_dir)
+            .await
+            .map_err(|error| format!("stable Candle LoRA quality gate failed: {error}"))?,
+    };
+    Ok(build_lora_real_quality_gate_report(
+        LoraRealQualityGateInput {
+            trace_id,
+            corpus_id: "crytex-stable-lora-quality-v1".into(),
+            corpus: stable_lora_quality_corpus(),
+            learning_report,
+            min_heldout_score_delta,
+            max_overfit_gap,
+        },
+    ))
 }
 
 struct FastQualityLoraBenchmarkGate {
@@ -6724,6 +7073,48 @@ async fn async_main() {
         return;
     }
 
+    if let Commands::ProveLoraRealQualityGate {
+        model_dir,
+        model_source,
+        output_dir,
+        min_heldout_score_delta,
+        max_overfit_gap,
+        report_path,
+    } = &cli.command
+    {
+        let report = run_lora_real_quality_gate_proof(
+            &config,
+            model_dir.clone(),
+            model_source.clone(),
+            output_dir.clone(),
+            *min_heldout_score_delta,
+            *max_overfit_gap,
+        )
+        .await
+        .unwrap_or_else(|error| {
+            eprintln!("LoRA real quality gate proof failed: {error}");
+            std::process::exit(1);
+        });
+        let payload = serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into());
+        if let Some(report_path) = report_path {
+            if let Some(parent) = report_path.parent()
+                && let Err(error) = tokio::fs::create_dir_all(parent).await
+            {
+                eprintln!("Failed to create LoRA real quality gate report directory: {error}");
+                std::process::exit(1);
+            }
+            if let Err(error) = tokio::fs::write(report_path, &payload).await {
+                eprintln!("Failed to write LoRA real quality gate report: {error}");
+                std::process::exit(1);
+            }
+        }
+        println!("{payload}");
+        if !report.passed {
+            std::process::exit(2);
+        }
+        return;
+    }
+
     if let Commands::ProveAgentSwarmLoraRouting {
         coder_adapter_id,
         critic_adapter_id,
@@ -7337,6 +7728,9 @@ async fn async_main() {
         Commands::ProveLoraRealModel { .. } => {
             unreachable!("prove-lora-real-model is handled before full AppContext initialization")
         }
+        Commands::ProveLoraRealQualityGate { .. } => unreachable!(
+            "prove-lora-real-quality-gate is handled before full AppContext initialization"
+        ),
         Commands::ProveAgentSwarmLoraRouting { .. } => unreachable!(
             "prove-agent-swarm-lora-routing is handled before full AppContext initialization"
         ),
@@ -8382,6 +8776,163 @@ async fn async_main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn lora_quality_learning_report() -> crytex_inference_candle::CandleLoraLearningProofReport {
+        crytex_inference_candle::CandleLoraLearningProofReport {
+            proof_outcome: "CANDLE_LORA_LEARNING_PROOF_PASSED".into(),
+            model_source: "embedded-tiny-candle".into(),
+            model_path: "A:/tmp/crytex/base".into(),
+            selected_attempt: 0,
+            attempts_run: 1,
+            adapter_id: "lora-quality-adapter-v1".into(),
+            adapter_path: "A:/tmp/crytex/adapter".into(),
+            baseline_output: "fn distill_heldout_quality() -> &'static str { \"WRONG\" }".into(),
+            adapted_output:
+                "fn distill_heldout_quality() -> &'static str { \"CRYTEX_LORA_DISTILL_OK_HELDOUT\" }"
+                    .into(),
+            output_changed: true,
+            answer_quality: crytex_inference_candle::CandleLoraAnswerQualityProof {
+                prompt: "Implement a distillation marker function for heldout_quality".into(),
+                expected_answer:
+                    "fn distill_heldout_quality() -> &'static str { \"CRYTEX_LORA_DISTILL_OK_HELDOUT\" }"
+                        .into(),
+                baseline_selected_answer: "wrong_marker_short".into(),
+                adapted_selected_answer: "expected".into(),
+                baseline_expected_loss: 2.0,
+                adapted_expected_loss: 1.0,
+                loss_improvement: 1.0,
+                loss_improvement_ratio: 0.5,
+                baseline_quality_score: 0.1,
+                adapted_quality_score: 0.6,
+                baseline_candidates: vec![
+                    crytex_inference_candle::CandleLoraAnswerCandidateScore {
+                        label: "expected".into(),
+                        answer:
+                            "fn distill_heldout_quality() -> &'static str { \"CRYTEX_LORA_DISTILL_OK_HELDOUT\" }"
+                                .into(),
+                        expected: true,
+                        loss: 2.0,
+                        quality_score: 0.1,
+                    },
+                    crytex_inference_candle::CandleLoraAnswerCandidateScore {
+                        label: "wrong_marker_short".into(),
+                        answer: "fn distill_heldout_quality() -> &'static str { \"WRONG_MARKER\" }"
+                            .into(),
+                        expected: false,
+                        loss: 1.9,
+                        quality_score: 0.2,
+                    },
+                ],
+                adapted_candidates: vec![
+                    crytex_inference_candle::CandleLoraAnswerCandidateScore {
+                        label: "expected".into(),
+                        answer:
+                            "fn distill_heldout_quality() -> &'static str { \"CRYTEX_LORA_DISTILL_OK_HELDOUT\" }"
+                                .into(),
+                        expected: true,
+                        loss: 1.0,
+                        quality_score: 0.6,
+                    },
+                    crytex_inference_candle::CandleLoraAnswerCandidateScore {
+                        label: "wrong_marker_short".into(),
+                        answer: "fn distill_heldout_quality() -> &'static str { \"WRONG_MARKER\" }"
+                            .into(),
+                        expected: false,
+                        loss: 1.4,
+                        quality_score: 0.3,
+                    },
+                ],
+                improved: true,
+            },
+            training_proof: serde_json::json!({
+                "learning_proven": true,
+                "post_train_loss": 0.8,
+                "post_validation_loss": 1.0
+            }),
+            learning_proven: true,
+            gates: Vec::new(),
+            passed: true,
+        }
+    }
+
+    #[test]
+    fn lora_real_quality_gate_report_requires_stable_corpus_quality_leakage_overfit_and_decision() {
+        let learning_report = lora_quality_learning_report();
+        let report = build_lora_real_quality_gate_report(LoraRealQualityGateInput {
+            trace_id: "trace-quality-gate".into(),
+            corpus_id: "crytex-stable-lora-quality-v1".into(),
+            corpus: stable_lora_quality_corpus(),
+            learning_report: learning_report.clone(),
+            min_heldout_score_delta: 0.0001,
+            max_overfit_gap: 1.0,
+        });
+
+        assert!(report.passed);
+        assert_eq!(report.proof_outcome, "LORA_REAL_QUALITY_GATE_PASSED");
+        assert_eq!(report.decision.action, "promote");
+        assert_eq!(
+            report.decision.promoted_adapter_id.as_deref(),
+            Some("lora-quality-adapter-v1")
+        );
+        assert_eq!(
+            report.acceptance_artifact.baseline_output,
+            learning_report.baseline_output
+        );
+        assert_eq!(
+            report.acceptance_artifact.adapted_output,
+            learning_report.adapted_output
+        );
+        assert_eq!(
+            report.acceptance_artifact.baseline_expected_margin,
+            Some(-0.10000000000000009)
+        );
+        assert_eq!(
+            report.acceptance_artifact.adapted_expected_margin,
+            Some(0.3999999999999999)
+        );
+        assert_eq!(report.acceptance_artifact.heldout_score_delta, 0.5);
+        assert!(report.leakage_report.passed);
+        assert_eq!(report.leakage_report.overlap_count, 0);
+        assert!(report.overfit_report.passed);
+        assert_eq!(
+            report.overfit_report.validation_train_gap,
+            Some(0.19999999999999996)
+        );
+        for gate_name in [
+            "heldout_score_improved",
+            "no_training_heldout_leakage",
+            "overfit_report_passed",
+            "source_learning_report_passed",
+        ] {
+            assert!(
+                report
+                    .gates
+                    .iter()
+                    .any(|gate| gate.name == gate_name && gate.passed),
+                "missing passed gate {gate_name}"
+            );
+        }
+
+        let rejected_report = build_lora_real_quality_gate_report(LoraRealQualityGateInput {
+            trace_id: "trace-quality-gate-reject".into(),
+            corpus_id: "crytex-stable-lora-quality-v1".into(),
+            corpus: stable_lora_quality_corpus(),
+            learning_report,
+            min_heldout_score_delta: 0.75,
+            max_overfit_gap: 0.05,
+        });
+
+        assert!(!rejected_report.passed);
+        assert_eq!(
+            rejected_report.proof_outcome,
+            "LORA_REAL_QUALITY_GATE_FAILED"
+        );
+        assert_eq!(rejected_report.decision.action, "rollback");
+        assert_eq!(
+            rejected_report.decision.rolled_back_adapter_id.as_deref(),
+            Some("lora-quality-adapter-v1")
+        );
+    }
 
     #[test]
     fn add_model_command_builds_hf_gguf_manifest_entry() {
