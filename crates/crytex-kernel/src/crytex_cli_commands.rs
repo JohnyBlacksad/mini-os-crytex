@@ -176,6 +176,11 @@ pub enum Commands {
         #[arg(long)]
         report_path: Option<PathBuf>,
     },
+    /// Run proof-only backend gates without mixing them into everyday CLI commands
+    Prove {
+        #[command(subcommand)]
+        command: ProveCommands,
+    },
     /// Prove real LoRA training, GGUF adapter application, hot-swap, and held-out benchmark
     ProveLoraLiveE2e {
         #[arg(long)]
@@ -905,6 +910,91 @@ pub enum RagCommands {
     },
 }
 
+#[derive(Subcommand)]
+pub enum ProveCommands {
+    /// Prove the kernel happy path as one JSON artifact.
+    KernelE2e {
+        #[arg(short, long)]
+        path: PathBuf,
+        #[arg(short, long, default_value = "Kernel E2E Proof")]
+        name: String,
+        #[arg(
+            short,
+            long,
+            default_value = "Implement a validated utility with tests"
+        )]
+        goal: String,
+        #[arg(long, default_value = "ollama")]
+        live_backend: String,
+        #[arg(long, default_value = "qwen3.5:9b")]
+        live_model: String,
+        #[arg(long, default_value = "http://localhost:11434")]
+        live_url: String,
+        #[arg(long)]
+        deterministic: bool,
+        #[arg(long)]
+        report_path: Option<PathBuf>,
+    },
+    /// Prove mixed-project RAG indexing, hybrid retrieval, rerank, and context evidence.
+    RagFull {
+        #[arg(long)]
+        report_path: Option<PathBuf>,
+    },
+    /// Prove backend Kanban projection, history, and task movement diagnostics.
+    KanbanProjection {
+        #[arg(long)]
+        report_path: Option<PathBuf>,
+    },
+    /// Prove token headroom, shared context, CCR offload, and required-fact preservation.
+    TokenEconomy {
+        #[arg(long, default_value = "ollama")]
+        backend: String,
+        #[arg(long, default_value = "qwen3.5:9b")]
+        model: String,
+        #[arg(long, default_value = "32768")]
+        context_window: usize,
+        #[arg(long, default_value = "512")]
+        expected_completion_tokens: usize,
+        #[arg(long)]
+        report_path: Option<PathBuf>,
+    },
+    /// Prove role quality contracts, role smoke fixtures, critic feedback, and role LoRA swaps.
+    RoleQualityContracts {
+        #[arg(long)]
+        report_path: Option<PathBuf>,
+    },
+    /// Prove autonomous prompt evolution with challenger, regression gate, diagnostics, and rollback.
+    PromptEvolution {
+        #[arg(long)]
+        report_path: Option<PathBuf>,
+    },
+    /// Prove LoRA positive/negative dataset construction, filtering, balancing, and leakage checks.
+    LoraDataset {
+        #[arg(long)]
+        report_path: Option<PathBuf>,
+    },
+    /// Prove objective-aware LoRA training contracts, metadata, state, and artifact validation.
+    LoraTrainingObjectives {
+        #[arg(long)]
+        report_path: Option<PathBuf>,
+    },
+    /// Prove LoRA promotion only after quality, safety, runtime, and rollback gates pass.
+    LoraQualityGate {
+        #[arg(long)]
+        report_path: Option<PathBuf>,
+    },
+    /// Prove autonomous evolution policy routes failures to the right module.
+    EvolutionPolicy {
+        #[arg(long)]
+        report_path: Option<PathBuf>,
+    },
+    /// Prove release readiness: build, docs, completions, schemas, CI, smoke, and preflight.
+    ReleaseGate {
+        #[arg(long)]
+        report_path: Option<PathBuf>,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum AcceptanceRuntimeMode {
     Deterministic,
@@ -1464,6 +1554,43 @@ mod tests {
             report_path,
             Some(PathBuf::from("reports/release-gate-p16-proof.json"))
         );
+    }
+
+    #[test]
+    fn nested_release_gate_proof_command_parses_report_path() {
+        let cli = Cli::parse_from([
+            "crytex-kernel",
+            "prove",
+            "release-gate",
+            "--report-path",
+            "reports/release-gate-p16-proof.json",
+        ]);
+
+        let Commands::Prove {
+            command: ProveCommands::ReleaseGate { report_path },
+        } = cli.command
+        else {
+            panic!("expected nested release gate proof command");
+        };
+
+        assert_eq!(
+            report_path,
+            Some(PathBuf::from("reports/release-gate-p16-proof.json"))
+        );
+    }
+
+    #[test]
+    fn prove_group_help_lists_release_gate() {
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("prove")
+            .expect("prove command exists")
+            .render_long_help()
+            .to_string();
+
+        assert!(help.contains("release-gate"));
+        assert!(help.contains("rag-full"));
+        assert!(help.contains("kernel-e2e"));
     }
 
     #[test]

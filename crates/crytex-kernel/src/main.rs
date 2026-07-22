@@ -31,8 +31,8 @@ use crytex_bench::{
 use crytex_cli_commands::{
     ABTestCommands, AcceptanceRuntimeMode, BenchCommands, Cli, Commands, DiagCommands,
     EvolutionCommands, KanbanCommands, LoraCommands, LoraDatasetCommands, LoraObjectiveArg,
-    ModelCommands, PromptCommands, PromptMutationOperatorArg, RagCommands, SandboxCommands,
-    SecurityCommands,
+    ModelCommands, PromptCommands, PromptMutationOperatorArg, ProveCommands, RagCommands,
+    SandboxCommands, SecurityCommands,
 };
 use crytex_compress::{
     ArtifactKind, CompressionQualityReport, DiskCcrStore, InMemoryCcrStore, ModelTokenProfile,
@@ -4563,18 +4563,8 @@ async fn run_kernel_e2e_proof(
         .map(|task| task.id.clone())
         .collect::<Vec<_>>();
 
-    let mut goal_result = serde_json::json!({
-        "source": "kernel_e2e_proof",
-        "plan_approved": true,
-        "tasks": orchestrated_tasks.iter().map(|task| {
-            serde_json::json!({
-                "id": task.id,
-                "kind": task.kind,
-                "agent": task.assigned_agent,
-                "title": task.title
-            })
-        }).collect::<Vec<_>>()
-    });
+    let mut goal_result =
+        kernel_e2e_architect_goal_result(&goal_task.id, &goal, &orchestrated_tasks);
     if let Some(inference) = live_inference.as_ref() {
         let evidence = run_live_agent_generation(
             inference.clone(),
@@ -4593,11 +4583,18 @@ async fn run_kernel_e2e_proof(
     let goal_task = complete_proof_task(task_service.as_ref(), &goal_task.id, goal_result).await?;
 
     let mut chain_task_ids = vec![goal_task.id.clone()];
-    let mut previous_artifact = serde_json::json!({
-        "artifact_id": format!("artifact-{}", goal_task.id),
-        "source_task_id": goal_task.id,
-        "content": "approved plan"
-    });
+    let mut previous_artifact = goal_task
+        .result
+        .as_ref()
+        .and_then(|result| result.get("artifact"))
+        .cloned()
+        .unwrap_or_else(|| {
+            serde_json::json!({
+                "artifact_id": format!("artifact-{}", goal_task.id),
+                "source_task_id": goal_task.id,
+                "content": "approved plan"
+            })
+        });
     let review_task_id = orchestrated_tasks
         .iter()
         .find(|task| task.kind == "review" || task.assigned_agent.as_deref() == Some("critic"))
@@ -4610,16 +4607,8 @@ async fn run_kernel_e2e_proof(
     {
         let agent = task.assigned_agent.as_deref().unwrap_or("agent");
         let title = task.title.as_str();
-        let result = serde_json::json!({
-            "source": "kernel_e2e_proof",
-            "agent": agent,
-            "artifact": {
-                "artifact_id": format!("artifact-{}", task.id),
-                "source_task_id": task.id,
-                "previous": previous_artifact,
-                "summary": format!("{agent} completed {title}")
-            }
-        });
+        let result =
+            kernel_e2e_agent_task_result(agent, &task.id, title, previous_artifact.clone());
         let mut result = result;
         if let Some(inference) = live_inference.as_ref() {
             let evidence = run_live_agent_generation(
@@ -4656,6 +4645,21 @@ async fn run_kernel_e2e_proof(
         "source": "kernel_e2e_proof",
         "agent": "critic",
         "decision": "reject",
+        "reason": "missing deterministic regression evidence",
+        "target_task": previous_artifact
+            .get("source_task_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("previous-task"),
+        "blocking_issues": [
+            {
+                "kind": "missing-regression-evidence",
+                "message": "deterministic regression evidence is required before approval"
+            }
+        ],
+        "remediation_proposal": {
+            "agent": "coder",
+            "action": "add deterministic regression evidence"
+        },
         "feedback": "missing deterministic regression evidence"
     });
     if let Some(inference) = live_inference.as_ref() {
@@ -4704,7 +4708,15 @@ async fn run_kernel_e2e_proof(
         "source": "kernel_e2e_proof",
         "agent": "coder",
         "remediation_for": rejected.id,
-        "evidence": "deterministic regression benchmark added"
+        "evidence": "deterministic regression benchmark added",
+        "artifact": {
+            "artifact_id": format!("artifact-{}", remediation.id),
+            "source_task_id": remediation.id,
+            "previous": previous_artifact,
+            "summary": "coder remediated critic rejection with deterministic regression evidence",
+            "files_changed": ["tests/regression.rs"],
+            "tests_run": ["cargo test -p crytex-kernel --no-default-features"]
+        }
     });
     if let Some(inference) = live_inference.as_ref() {
         let evidence = run_live_agent_generation(
@@ -4869,6 +4881,99 @@ async fn run_kernel_e2e_proof(
         lora_adapter_id: lora_adapter.id,
         lora_promoted: lora_adapter.active,
     }))
+}
+
+fn kernel_e2e_architect_goal_result(
+    goal_task_id: &str,
+    goal: &str,
+    orchestrated_tasks: &[Task],
+) -> serde_json::Value {
+    let tasks = orchestrated_tasks
+        .iter()
+        .map(|task| {
+            serde_json::json!({
+                "id": task.id,
+                "kind": task.kind,
+                "agent": task.assigned_agent,
+                "title": task.title
+            })
+        })
+        .collect::<Vec<_>>();
+
+    serde_json::json!({
+        "source": "kernel_e2e_proof",
+        "agent": "architect",
+        "plan_approved": true,
+        "artifact": {
+            "artifact_id": format!("artifact-{goal_task_id}"),
+            "source_task_id": goal_task_id,
+            "summary": format!("Architect approved deterministic backend plan for: {goal}"),
+            "content": "approved plan",
+            "decisions": [
+                "use canonical backend acceptance runner",
+                "preserve typed artifact contracts for every role",
+                "carry artifacts between clean agent sessions"
+            ],
+            "tasks": tasks
+        }
+    })
+}
+
+fn kernel_e2e_agent_task_result(
+    agent: &str,
+    task_id: &str,
+    title: &str,
+    previous_artifact: serde_json::Value,
+) -> serde_json::Value {
+    let artifact = match agent {
+        "architect" => serde_json::json!({
+            "artifact_id": format!("artifact-{task_id}"),
+            "source_task_id": task_id,
+            "previous": previous_artifact,
+            "summary": format!("architect completed {title}"),
+            "content": "deterministic architecture decision recorded",
+            "decisions": ["preserve acceptance contract", "handoff typed artifacts"]
+        }),
+        "coder" | "coder-python" | "coder-rust" | "coder-ts" | "coder-etc" => serde_json::json!({
+            "artifact_id": format!("artifact-{task_id}"),
+            "source_task_id": task_id,
+            "previous": previous_artifact,
+            "summary": format!("{agent} completed {title}"),
+            "files_changed": ["src/lib.rs"],
+            "tests_run": ["cargo test -p crytex-kernel --no-default-features"]
+        }),
+        "qa" => serde_json::json!({
+            "artifact_id": format!("artifact-{task_id}"),
+            "source_task_id": task_id,
+            "previous": previous_artifact,
+            "summary": format!("qa completed {title}"),
+            "test_results": "deterministic acceptance checks passed"
+        }),
+        "security" => serde_json::json!({
+            "artifact_id": format!("artifact-{task_id}"),
+            "source_task_id": task_id,
+            "previous": previous_artifact,
+            "summary": format!("security completed {title}"),
+            "findings": [
+                {
+                    "severity": "info",
+                    "message": "deterministic security review completed"
+                }
+            ]
+        }),
+        _ => serde_json::json!({
+            "artifact_id": format!("artifact-{task_id}"),
+            "source_task_id": task_id,
+            "previous": previous_artifact,
+            "summary": format!("{agent} completed {title}")
+        }),
+    };
+
+    serde_json::json!({
+        "source": "kernel_e2e_proof",
+        "agent": agent,
+        "artifact": artifact
+    })
 }
 
 async fn run_kernel_e2e_proof_command(
@@ -5845,10 +5950,15 @@ async fn seed_lora_training_examples(
         let task = task_service
             .set_result(
                 &task.id,
-                serde_json::json!({
-                    "summary": format!("Implemented held-out kernel proof behavior {idx} with tests"),
-                    "evidence": "golden dataset curated for kernel e2e proof"
-                }),
+                kernel_e2e_agent_task_result(
+                    "coder",
+                    &task.id,
+                    &format!("LoRA golden proof example {idx}"),
+                    serde_json::json!({
+                        "source": "kernel_e2e_proof",
+                        "evidence": "golden dataset curated for kernel e2e proof"
+                    }),
+                ),
             )
             .await
             .map_err(|error| format!("failed to complete LoRA training task: {error}"))?;
@@ -6441,10 +6551,15 @@ async fn seed_lora_evolution_loop_tasks(
         task_service
             .set_result(
                 &task.id,
-                serde_json::json!({
-                    "content": format!("Approved solution {idx}: CRYTEX_LORA_DISTILL_OK"),
-                    "evidence": "human approved real-task evolution proof output"
-                }),
+                kernel_e2e_agent_task_result(
+                    "coder",
+                    &task.id,
+                    &format!("Approved LoRA evolution task {idx}"),
+                    serde_json::json!({
+                        "content": format!("Approved solution {idx}: CRYTEX_LORA_DISTILL_OK"),
+                        "evidence": "human approved real-task evolution proof output"
+                    }),
+                ),
             )
             .await
             .map_err(|error| format!("failed to complete approved task {idx}: {error}"))?;
@@ -6483,10 +6598,15 @@ async fn seed_lora_evolution_loop_tasks(
         task_service
             .set_result(
                 &task.id,
-                serde_json::json!({
-                    "content": format!("Rejected bad solution {idx}: DO_NOT_LEARN_THIS"),
-                    "evidence": "human rejected counter-example output"
-                }),
+                kernel_e2e_agent_task_result(
+                    "coder",
+                    &task.id,
+                    &format!("Rejected LoRA evolution task {idx}"),
+                    serde_json::json!({
+                        "content": format!("Rejected bad solution {idx}: DO_NOT_LEARN_THIS"),
+                        "evidence": "human rejected counter-example output"
+                    }),
+                ),
             )
             .await
             .map_err(|error| format!("failed to complete rejected task {idx}: {error}"))?;
@@ -6536,10 +6656,15 @@ async fn seed_lora_proof_training_tasks(
         let task = task_service
             .set_result(
                 &task.id,
-                serde_json::json!({
-                    "answer": "CRYTEX_LORA_DISTILL_OK",
-                    "evidence": format!("approved distillation behavior {idx}")
-                }),
+                kernel_e2e_agent_task_result(
+                    "coder",
+                    &task.id,
+                    &format!("LoRA distillation task {idx}"),
+                    serde_json::json!({
+                        "answer": "CRYTEX_LORA_DISTILL_OK",
+                        "evidence": format!("approved distillation behavior {idx}")
+                    }),
+                ),
             )
             .await
             .map_err(|error| format!("failed to complete LoRA proof task: {error}"))?;
@@ -8919,6 +9044,187 @@ async fn async_main() {
         return;
     }
 
+    if let Commands::Prove { command } = &cli.command {
+        match command {
+            ProveCommands::KernelE2e {
+                path,
+                name,
+                goal,
+                live_backend,
+                live_model,
+                live_url,
+                deterministic,
+                report_path,
+            } => {
+                let report = run_kernel_e2e_proof_command(
+                    &config,
+                    KernelE2eProofCommandRequest {
+                        path: path.clone(),
+                        name: name.clone(),
+                        goal: goal.clone(),
+                        live_backend: live_backend.clone(),
+                        live_model: live_model.clone(),
+                        live_url: live_url.clone(),
+                        deterministic: *deterministic,
+                    },
+                )
+                .await
+                .unwrap_or_else(|error| {
+                    eprintln!("Kernel E2E proof failed: {error}");
+                    std::process::exit(1);
+                });
+                let payload = serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into());
+                if let Some(path) = report_path {
+                    write_json_report(path, &payload, "kernel E2E proof");
+                }
+                println!("{payload}");
+                if !report.passed {
+                    std::process::exit(2);
+                }
+            }
+            ProveCommands::RagFull { report_path } => {
+                let report = run_rag_full_proof(&config).await.unwrap_or_else(|error| {
+                    eprintln!("RAG full proof failed: {error}");
+                    std::process::exit(1);
+                });
+                let payload = serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into());
+                if let Some(path) = report_path {
+                    write_json_report(path, &payload, "RAG full proof");
+                }
+                println!("{payload}");
+                if !report.passed {
+                    std::process::exit(2);
+                }
+            }
+            ProveCommands::KanbanProjection { report_path } => {
+                let report = build_kanban_projection_proof_report();
+                let payload = serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into());
+                if let Some(path) = report_path {
+                    write_json_report(path, &payload, "Kanban projection proof");
+                }
+                println!("{payload}");
+                if !report.passed {
+                    std::process::exit(2);
+                }
+            }
+            ProveCommands::TokenEconomy {
+                backend,
+                model,
+                context_window,
+                expected_completion_tokens,
+                report_path,
+            } => {
+                let report = run_token_economy_proof(
+                    backend.clone(),
+                    model.clone(),
+                    *context_window,
+                    *expected_completion_tokens,
+                )
+                .unwrap_or_else(|error| {
+                    eprintln!("Token economy proof failed: {error}");
+                    std::process::exit(1);
+                });
+                let payload = serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into());
+                if let Some(path) = report_path {
+                    write_json_report(path, &payload, "token economy proof");
+                }
+                println!("{payload}");
+                if !report.passed {
+                    std::process::exit(2);
+                }
+            }
+            ProveCommands::RoleQualityContracts { report_path } => {
+                let report = RoleQualityProof::deterministic().run();
+                let payload = serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into());
+                if let Some(path) = report_path {
+                    write_json_report(path, &payload, "role quality proof");
+                }
+                println!("{payload}");
+                if !report.passed {
+                    std::process::exit(2);
+                }
+            }
+            ProveCommands::PromptEvolution { report_path } => {
+                let report = run_prompt_evolution_proof().await.unwrap_or_else(|error| {
+                    eprintln!("Prompt evolution proof failed: {error}");
+                    std::process::exit(1);
+                });
+                let payload = serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into());
+                if let Some(path) = report_path {
+                    write_json_report(path, &payload, "prompt evolution proof");
+                }
+                println!("{payload}");
+                if !report.passed {
+                    std::process::exit(2);
+                }
+            }
+            ProveCommands::LoraDataset { report_path } => {
+                let report = run_lora_dataset_proof();
+                let payload = serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into());
+                if let Some(path) = report_path {
+                    write_json_report(path, &payload, "LoRA dataset proof");
+                }
+                println!("{payload}");
+                if !report.passed {
+                    std::process::exit(2);
+                }
+            }
+            ProveCommands::LoraTrainingObjectives { report_path } => {
+                let report = run_lora_training_objectives_proof()
+                    .await
+                    .unwrap_or_else(|error| {
+                        eprintln!("LoRA training objectives proof failed: {error}");
+                        std::process::exit(1);
+                    });
+                let payload = serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into());
+                if let Some(path) = report_path {
+                    write_json_report(path, &payload, "LoRA training objectives proof");
+                }
+                println!("{payload}");
+                if !report.passed {
+                    std::process::exit(2);
+                }
+            }
+            ProveCommands::LoraQualityGate { report_path } => {
+                let report = run_lora_quality_gate_proof().await.unwrap_or_else(|error| {
+                    eprintln!("LoRA quality gate proof failed: {error}");
+                    std::process::exit(1);
+                });
+                let payload = serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into());
+                if let Some(path) = report_path {
+                    write_json_report(path, &payload, "LoRA quality gate proof");
+                }
+                println!("{payload}");
+                if !report.passed {
+                    std::process::exit(2);
+                }
+            }
+            ProveCommands::EvolutionPolicy { report_path } => {
+                let report = run_evolution_policy_proof().await;
+                let payload = serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into());
+                if let Some(path) = report_path {
+                    write_json_report(path, &payload, "evolution policy proof");
+                }
+                println!("{payload}");
+                if !report.passed {
+                    std::process::exit(2);
+                }
+            }
+            ProveCommands::ReleaseGate { report_path } => {
+                let report = ReleaseGateService::deterministic_report();
+                let payload = serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into());
+                if let Some(path) = report_path {
+                    write_json_report(path, &payload, "release gate proof");
+                }
+                println!("{payload}");
+                if !report.passed {
+                    std::process::exit(2);
+                }
+            }
+        }
+        return;
+    }
+
     if let Commands::ProveKanbanProjection { report_path } = &cli.command {
         let report = build_kanban_projection_proof_report();
         let payload = serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into());
@@ -10156,6 +10462,9 @@ async fn async_main() {
         }
         Commands::ProveReleaseGate { .. } => {
             unreachable!("prove-release-gate is handled before full AppContext initialization")
+        }
+        Commands::Prove { .. } => {
+            unreachable!("prove is handled before full AppContext initialization")
         }
         Commands::Submit {
             project,
@@ -12115,6 +12424,88 @@ mod tests {
                 "missing backend acceptance stage {stage}"
             );
         }
+    }
+
+    #[test]
+    fn kernel_e2e_architect_goal_result_satisfies_design_artifact_contract() {
+        let task = Task {
+            id: "architect-child".into(),
+            project_id: "project-1".into(),
+            parent_id: Some("goal-1".into()),
+            title: "Design acceptance path".into(),
+            description: None,
+            kind: "architecture".into(),
+            status: TaskStatus::Ready,
+            assigned_agent: Some("architect".into()),
+            priority: 10,
+            created_at: 1,
+            started_at: None,
+            finished_at: None,
+            payload: serde_json::json!({}),
+            result: None,
+            iteration_count: 0,
+            priority_score: 10.0,
+            critic_score: None,
+            human_score: None,
+            prompt_version_id: None,
+            lora_adapter_id: None,
+            trace_id: "trace-1".into(),
+        };
+
+        let result =
+            kernel_e2e_architect_goal_result("goal-1", "Prove backend acceptance", &[task]);
+
+        crytex_core::services::validate_agent_result(Some("architect"), "codegen", &result)
+            .expect("kernel e2e goal result must satisfy architect artifact contract");
+        assert_eq!(result["artifact"]["content"], "approved plan");
+        assert_eq!(result["artifact"]["tasks"][0]["id"], "architect-child");
+    }
+
+    #[test]
+    fn kernel_e2e_role_task_results_satisfy_artifact_contracts() {
+        for (agent, fallback_kind) in [
+            ("architect", "architecture"),
+            ("coder", "codegen"),
+            ("qa", "qa"),
+            ("security", "security"),
+        ] {
+            let result = kernel_e2e_agent_task_result(
+                agent,
+                "task-1",
+                "Complete deterministic task",
+                serde_json::json!({"artifact_id": "previous"}),
+            );
+
+            crytex_core::services::validate_agent_result(Some(agent), fallback_kind, &result)
+                .unwrap_or_else(|error| {
+                    panic!("{agent} artifact should satisfy its role contract: {error}")
+                });
+        }
+    }
+
+    #[test]
+    fn kernel_e2e_critic_rejection_result_satisfies_review_contract() {
+        let result = serde_json::json!({
+            "source": "kernel_e2e_proof",
+            "agent": "critic",
+            "decision": "reject",
+            "reason": "missing deterministic regression evidence",
+            "target_task": "task-1",
+            "blocking_issues": [
+                {
+                    "kind": "missing-regression-evidence",
+                    "message": "deterministic regression evidence is required before approval"
+                }
+            ],
+            "remediation_proposal": {
+                "agent": "coder",
+                "action": "add deterministic regression evidence"
+            },
+            "feedback": "missing deterministic regression evidence"
+        });
+
+        crytex_core::services::validate_agent_result(Some("critic"), "review", &result)
+            .expect("kernel e2e critic result must satisfy review decision contract");
     }
 
     #[tokio::test]

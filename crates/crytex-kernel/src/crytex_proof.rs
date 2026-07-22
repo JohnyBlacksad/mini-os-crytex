@@ -6,7 +6,8 @@ use crate::crytex_cli_commands::Commands;
 pub fn is_proof_command(command: &Commands) -> bool {
     matches!(
         command,
-        Commands::ProveHfModel { .. }
+        Commands::Prove { .. }
+            | Commands::ProveHfModel { .. }
             | Commands::ProveHfRuntimeMatrix { .. }
             | Commands::ProveKernelE2e { .. }
             | Commands::ProveLoraLiveE2e { .. }
@@ -141,6 +142,15 @@ mod tests {
     #[test]
     fn release_gate_is_proof_only() {
         let command = Commands::ProveReleaseGate { report_path: None };
+
+        assert!(is_proof_command(&command));
+    }
+
+    #[test]
+    fn nested_prove_group_is_proof_only() {
+        let command = Commands::Prove {
+            command: crate::crytex_cli_commands::ProveCommands::ReleaseGate { report_path: None },
+        };
 
         assert!(is_proof_command(&command));
     }
