@@ -75,13 +75,13 @@ use crytex_core::{
         ProjectServiceImpl, ProjectWatcher, PromptBenchmarkDecision, PromptBenchmarkGate,
         PromptBenchmarkRequest, PromptEvolutionDecisionReport, PromptEvolutionError,
         PromptEvolutionService, PromptFailureKind, PromptFailureRouter, Quantization,
-        RecordRewardRequest, RerankPassage, RerankResult, RewardService, RoleAdapterRegistry,
-        RoleQualityProof, RuntimeFeatureSet, RuntimeMatrixEntryRequest, RuntimeMatrixReportWriter,
-        RuntimeModelMatrix, SchedulerImpl, StaticEvolutionObservationSource,
-        SystemHardwareDetector, TaskHandler, TaskServiceImpl, TomlWorkflowRepository, VectorStore,
-        WorkerError, WorkerPool, WorkflowDefinition, WorkflowEdge, WorkflowEngine, WorkflowNode,
-        WorkflowRepository, WorkflowRetryPolicy, lora_quality_gate, recommend_local_device,
-        validate_objective_examples,
+        RecordRewardRequest, RecoveryService, RerankPassage, RerankResult, RewardService,
+        RoleAdapterRegistry, RoleQualityProof, RuntimeFeatureSet, RuntimeMatrixEntryRequest,
+        RuntimeMatrixReportWriter, RuntimeModelMatrix, SchedulerImpl,
+        StaticEvolutionObservationSource, SystemHardwareDetector, TaskHandler, TaskServiceImpl,
+        TomlWorkflowRepository, VectorStore, WorkerError, WorkerPool, WorkflowDefinition,
+        WorkflowEdge, WorkflowEngine, WorkflowNode, WorkflowRepository, WorkflowRetryPolicy,
+        lora_quality_gate, recommend_local_device, validate_objective_examples,
     },
     state_export::export_project_state,
 };
@@ -8221,22 +8221,48 @@ async fn async_main() {
         warn!("Failed to create data directories: {}", e);
     }
 
-    if let Commands::Diag {
-        command: DiagCommands::ProbeRuntimeMatrix { json, report_path },
-    } = &cli.command
-    {
-        let report = RuntimeModelMatrix::report();
-        let payload = unwrap_or_exit!(
-            serde_json::to_string_pretty(&report),
-            "Failed to serialize runtime/model matrix"
-        );
-        if let Some(path) = report_path {
-            write_json_report(path, &payload, "runtime/model matrix");
-        }
-        if *json {
-            println!("{payload}");
-        } else {
-            print_runtime_model_matrix_human(&report);
+    if let Commands::Diag { command } = &cli.command {
+        match command {
+            DiagCommands::ProbeRuntimeMatrix { json, report_path } => {
+                let report = RuntimeModelMatrix::report();
+                let payload = unwrap_or_exit!(
+                    serde_json::to_string_pretty(&report),
+                    "Failed to serialize runtime/model matrix"
+                );
+                if let Some(path) = report_path {
+                    write_json_report(path, &payload, "runtime/model matrix");
+                }
+                if *json {
+                    println!("{payload}");
+                } else {
+                    print_runtime_model_matrix_human(&report);
+                }
+            }
+            DiagCommands::StorageRecovery { json, report_path } => {
+                let report = RecoveryService::deterministic_proof();
+                let payload = unwrap_or_exit!(
+                    serde_json::to_string_pretty(&report),
+                    "Failed to serialize storage recovery proof"
+                );
+                if let Some(path) = report_path {
+                    write_json_report(path, &payload, "storage recovery proof");
+                }
+                if *json {
+                    println!("{payload}");
+                } else {
+                    println!(
+                        "Storage recovery proof: {}",
+                        if report.passed { "passed" } else { "failed" }
+                    );
+                    println!("schema_version: {}", report.schema_version);
+                    for gate in &report.gates {
+                        println!("{}: {}", gate.name, gate.passed);
+                    }
+                }
+                if !report.passed {
+                    std::process::exit(2);
+                }
+            }
         }
         return;
     }

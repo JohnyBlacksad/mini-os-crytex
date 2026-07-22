@@ -734,6 +734,13 @@ pub enum DiagCommands {
         #[arg(long)]
         report_path: Option<PathBuf>,
     },
+    /// Prove storage migrations, backup/export/import, resume, locks, and adapter recovery.
+    StorageRecovery {
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        report_path: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1525,6 +1532,28 @@ mod tests {
             cli.command,
             Commands::Diag {
                 command: DiagCommands::ProbeRuntimeMatrix {
+                    json: true,
+                    report_path: Some(_)
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn diag_group_parses_storage_recovery_contract() {
+        let cli = Cli::parse_from([
+            "crytex-kernel",
+            "diag",
+            "storage-recovery",
+            "--json",
+            "--report-path",
+            "reports/storage-recovery-p14-proof.json",
+        ]);
+
+        assert!(matches!(
+            cli.command,
+            Commands::Diag {
+                command: DiagCommands::StorageRecovery {
                     json: true,
                     report_path: Some(_)
                 }

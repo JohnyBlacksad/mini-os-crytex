@@ -1,0 +1,128 @@
+{
+  "passed": true,
+  "schema_version": 14,
+  "migration_plan": {
+    "from_version": 2,
+    "current_version": 14,
+    "pending_versions": [
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14
+    ]
+  },
+  "backup": {
+    "strategy": "copy-before-migrate",
+    "consistent_snapshot": true,
+    "restore_verified": true
+  },
+  "export_import": {
+    "format": "zip+json",
+    "manifest": "crytex-export-manifest.json",
+    "checksum": "sha256",
+    "roundtrip_verified": true
+  },
+  "run_resume": {
+    "in_progress": "Ready",
+    "review": "Review",
+    "remediation": "Remediation"
+  },
+  "training_resume": {
+    "running_valid_adapter": "Queued",
+    "running_corrupt_adapter": "Failed"
+  },
+  "model_download_resume": {
+    "action": "resume",
+    "resume_from_bytes": 128,
+    "registry_safe": false
+  },
+  "index_rebuild": {
+    "project_id": "project-a",
+    "source_generation": 42,
+    "uses_staging_collection": true,
+    "atomic_swap": true,
+    "resume_cursor": "project-a:42"
+  },
+  "windows_lock_policy": {
+    "lock_file_name": ".crytex.lock",
+    "exclusive_commands": [
+      "run",
+      "index rebuild",
+      "lora train",
+      "models download",
+      "storage import"
+    ],
+    "shared_read_commands": [
+      "kanban show",
+      "kanban history",
+      "diag export",
+      "models list"
+    ],
+    "stale_lock_timeout_ms": 30000
+  },
+  "corrupt_adapter": {
+    "artifact_valid": false,
+    "quality_gates_passed": true,
+    "promoted": false
+  },
+  "gates": [
+    {
+      "name": "versioned_migrations",
+      "passed": true,
+      "evidence": "schema version 14 plans ordered migrations"
+    },
+    {
+      "name": "old_db_fixture",
+      "passed": true,
+      "evidence": "v2 fixture migrates through all pending versions"
+    },
+    {
+      "name": "backup_export_import",
+      "passed": true,
+      "evidence": "backup is required before upgrade and export/import is checksummed"
+    },
+    {
+      "name": "resume_interrupted_run",
+      "passed": true,
+      "evidence": "in_progress tasks return to ready while review/remediation are preserved"
+    },
+    {
+      "name": "resume_or_reject_training",
+      "passed": true,
+      "evidence": "running jobs resume only when adapter artifacts are valid"
+    },
+    {
+      "name": "resume_model_download",
+      "passed": true,
+      "evidence": "partial downloads resume without registry promotion"
+    },
+    {
+      "name": "index_rebuild",
+      "passed": true,
+      "evidence": "rebuild uses staging collection and atomic swap"
+    },
+    {
+      "name": "windows_concurrent_cli_policy",
+      "passed": true,
+      "evidence": "writers are exclusive and read commands stay shared"
+    },
+    {
+      "name": "corrupt_adapter_never_promoted",
+      "passed": true,
+      "evidence": "promotion requires artifact validation and quality gates"
+    }
+  ],
+  "references": [
+    "https://www.sqlite.org/pragma.html#pragma_user_version",
+    "https://www.sqlite.org/backup.html",
+    "https://learn.microsoft.com/windows/win32/fileio/locking-and-unlocking-byte-ranges-in-files"
+  ]
+}

@@ -31,6 +31,7 @@ pub mod project_service;
 pub mod project_watcher;
 pub mod prompt_evolution;
 pub mod rate_limit;
+pub mod recovery;
 pub mod reranker;
 pub mod reward_service;
 pub mod role;
@@ -131,6 +132,11 @@ pub use prompt_evolution::{
     PromptProposal,
 };
 pub use rate_limit::{RetryPolicy, RetryRateLimitBackend, TokenBucket};
+pub use recovery::{
+    AdapterRecoveryPolicy, CliLockPolicy, DownloadRecoveryPolicy, IndexRecoveryPolicy,
+    MigrationPlan, RecoveryService, RunRecoveryPolicy, StorageRecoveryReport,
+    TrainingRecoveryPolicy,
+};
 pub use reranker::{RerankPassage, RerankResult, Reranker, RerankerError};
 pub use reward_service::{RecordRewardRequest, RewardService, RewardServiceError};
 pub use role::AgentRole;

@@ -158,6 +158,7 @@ cargo run -p crytex-kernel -- prove-evolution-policy --report-path reports\evolu
 cargo run -p crytex-kernel -- diag probe-runtime-matrix --json --report-path reports\runtime-model-matrix-p12-proof.json
 cargo run -p crytex-kernel -- sandbox prove --json --report-path reports\sandbox-security-p13-proof.json
 cargo run -p crytex-kernel -- security prove --malicious-rag-fixture --json --report-path reports\security-p13-proof.json
+cargo run -p crytex-kernel -- diag storage-recovery --json --report-path reports\storage-recovery-p14-proof.json
 ```
 
 The token-economy report proves model headroom reservation, shared RAG-context reuse, CCR
@@ -199,6 +200,11 @@ path traversal blocking, malicious RAG prompt-injection detection, Docker/WASI/h
 sandbox posture, audited tool calls, and routing of security failures into
 negative examples for the relevant role.
 
+The storage/recovery report proves versioned schema migration from old DB
+fixtures, backup/export/import invariants, interrupted run/training/download
+resume policy, crash-safe index rebuild, Windows concurrent CLI lock policy, and
+the rule that corrupt LoRA adapters are never promoted.
+
 The LoRA dataset report proves Crytex stores accepted outputs as positive
 targets, rejected outputs as negative preference sides, preserves critic
 feedback/failure type/RAG evidence/model id, scopes datasets per role, and
@@ -218,6 +224,8 @@ service boundaries.
   and inspect selected chunks and rejection reasons.
 - If a project document tries to control the agent, run
   `crytex security prove --malicious-rag-fixture`.
+- If an upgrade, crash, Windows file lock, interrupted training, or partial
+  model download looks suspicious, run `crytex diag storage-recovery --json`.
 - If a LoRA adapter does not improve quality, inspect
   `crytex lora benchmark <role> --include-negative`.
 - If Windows blocks test artifacts, stop stale `cargo`, `rustc`, or test

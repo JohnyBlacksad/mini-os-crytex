@@ -289,6 +289,10 @@ pub enum DiagCommand {
         #[arg(long)]
         model: Option<String>,
     },
+    StorageRecovery {
+        #[arg(long)]
+        report_path: Option<std::path::PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]

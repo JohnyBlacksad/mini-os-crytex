@@ -298,11 +298,16 @@ Export diagnostics and runtime reports.
 ```powershell
 crytex diag export --run latest --out reports\latest.json
 crytex diag probe-runtime-matrix --json --report-path reports\runtime-model-matrix-p12-proof.json
+crytex diag storage-recovery --json --report-path reports\storage-recovery-p14-proof.json
 ```
 
 Diagnostics include runtime, task graph, Kanban transitions, RAG evidence,
 prompts, LoRA adapters, tool calls, artifacts, benchmark results, and evolution
-decisions.
+decisions. Storage recovery diagnostics additionally prove schema migration,
+backup/export/import, interrupted run/training/download resume, index rebuild,
+Windows CLI locking, and corrupt-adapter rejection policy.
+
+See [STORAGE_RECOVERY.md](STORAGE_RECOVERY.md).
 
 ## `models`
 

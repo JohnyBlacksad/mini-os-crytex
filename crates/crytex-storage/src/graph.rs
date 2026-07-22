@@ -11,6 +11,8 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use ulid::Ulid;
 
+const CURRENT_SCHEMA_VERSION: u32 = 14;
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("sqlite error: {0}")]
@@ -114,6 +116,45 @@ impl GraphStore {
         )?;
         if count == 0 {
             conn.execute("ALTER TABLE tasks ADD COLUMN trace_id TEXT DEFAULT ''", [])?;
+        }
+        Ok(())
+    }
+
+    async fn migrate_task_recovery_columns(conn: &Connection) -> Result<(), Error> {
+        for (column, ddl) in [
+            (
+                "iteration_count",
+                "ALTER TABLE tasks ADD COLUMN iteration_count INTEGER DEFAULT 0",
+            ),
+            (
+                "priority_score",
+                "ALTER TABLE tasks ADD COLUMN priority_score REAL DEFAULT 0.0",
+            ),
+            (
+                "critic_score",
+                "ALTER TABLE tasks ADD COLUMN critic_score REAL",
+            ),
+            (
+                "human_score",
+                "ALTER TABLE tasks ADD COLUMN human_score REAL",
+            ),
+            (
+                "prompt_version_id",
+                "ALTER TABLE tasks ADD COLUMN prompt_version_id TEXT",
+            ),
+            (
+                "lora_adapter_id",
+                "ALTER TABLE tasks ADD COLUMN lora_adapter_id TEXT",
+            ),
+        ] {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = ?1",
+                [column],
+                |row| row.get(0),
+            )?;
+            if count == 0 {
+                conn.execute(ddl, [])?;
+            }
         }
         Ok(())
     }
@@ -438,12 +479,20 @@ CREATE INDEX IF NOT EXISTS idx_ab_test_challenger ON ab_test_reports(challenger_
 "#,
         )?;
         Self::migrate_trace_id(&conn).await?;
+        Self::migrate_task_recovery_columns(&conn).await?;
         Self::migrate_lora_task_kind(&conn).await?;
         Self::migrate_lora_agent_role(&conn).await?;
         Self::migrate_training_example_agent_role(&conn).await?;
         Self::migrate_training_example_dataset_fields(&conn).await?;
         Self::migrate_prompt_version_metrics(&conn).await?;
+        conn.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
         Ok(())
+    }
+
+    pub async fn schema_version(&self) -> Result<u32, Error> {
+        let conn = self.conn.lock().await;
+        let version = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        Ok(version)
     }
 
     pub async fn insert_project(&self, project: &Project) -> Result<(), Error> {
@@ -1818,6 +1867,56 @@ mod tests {
         let fetched = store.get_task("task-1").await.unwrap().unwrap();
         assert_eq!(fetched.status, TaskStatus::InProgress);
         assert!(fetched.started_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn old_database_fixture_migrates_to_current_schema_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("old-v2.db");
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                r#"
+                PRAGMA user_version = 2;
+                CREATE TABLE projects (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    root_path TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    metadata TEXT DEFAULT '{}'
+                );
+                CREATE TABLE tasks (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL REFERENCES projects(id),
+                    parent_id TEXT,
+                    title TEXT NOT NULL,
+                    description TEXT,
+                    kind TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    assigned_agent TEXT,
+                    priority INTEGER DEFAULT 0,
+                    created_at INTEGER NOT NULL,
+                    started_at INTEGER,
+                    finished_at INTEGER,
+                    payload TEXT DEFAULT '{}',
+                    result TEXT
+                );
+                INSERT INTO projects (id, name, root_path, created_at, updated_at, metadata)
+                VALUES ('proj-old', 'Old', '/tmp/old', 1, 1, '{}');
+                INSERT INTO tasks (id, project_id, title, kind, status, created_at, payload)
+                VALUES ('task-old', 'proj-old', 'Old task', 'codegen', 'in_progress', 1, '{}');
+                "#,
+            )
+            .unwrap();
+        }
+
+        let store = GraphStore::new(db_path.to_str().unwrap()).await.unwrap();
+
+        assert_eq!(store.schema_version().await.unwrap(), 14);
+        let task = store.get_task("task-old").await.unwrap().unwrap();
+        assert_eq!(task.status, TaskStatus::InProgress);
+        assert_eq!(task.trace_id, "");
     }
 
     #[tokio::test]
