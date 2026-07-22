@@ -1,0 +1,242 @@
+{
+  "trace_id": "01KY4S62KRHXN1BNCZDZFJGCX6",
+  "model_id": "hf-tiny-random-llama-q2-runtime-proof",
+  "repo": "tensorblock/tiny-random-llama-GGUF",
+  "filename": "tiny-random-llama-Q2_K.gguf",
+  "local_path": "C:\\Users\\screa\\AppData\\Roaming\\crytex\\models\\hf-tiny-random-llama-q2-runtime-proof\\tiny-random-llama-Q2_K.gguf",
+  "backend_id": "local-hf-runtime-proof",
+  "build_profile": "debug",
+  "lifecycle": [
+    {
+      "name": "add_managed_model",
+      "status": "passed",
+      "evidence": "id=hf-tiny-random-llama-q2-runtime-proof, repo=tensorblock/tiny-random-llama-GGUF, filename=tiny-random-llama-Q2_K.gguf"
+    },
+    {
+      "name": "download",
+      "status": "passed",
+      "evidence": "local_path=C:\\Users\\screa\\AppData\\Roaming\\crytex\\models\\hf-tiny-random-llama-q2-runtime-proof\\tiny-random-llama-Q2_K.gguf"
+    },
+    {
+      "name": "activate",
+      "status": "passed",
+      "evidence": "default_backend=local-hf-runtime-proof"
+    },
+    {
+      "name": "load_generate",
+      "status": "passed",
+      "evidence": "preview=obj\tobj\tobj\tobj"
+    }
+  ],
+  "recommendation": {
+    "backend": "mistral_rs",
+    "quantization": "q2_k",
+    "gpu_layers": 999,
+    "context_size": 4096
+  },
+  "runtime_placement": {
+    "kind": "cuda_full_offload",
+    "gpu_layers": 999,
+    "compatibility_strategy": "CudaFused",
+    "evidence": "gpu_layers=999 pins all supported GGUF layers to CUDA to avoid mixed CPU/GPU auto mapping"
+  },
+  "support_matrix": {
+    "state_definitions": [
+      {
+        "state": "supported",
+        "meaning": "backend can run the model with the selected strategy"
+      },
+      {
+        "state": "partial",
+        "meaning": "backend can run, but diagnostics warn about degraded execution"
+      },
+      {
+        "state": "unsupported",
+        "meaning": "backend must not load/generate because compatibility blockers exist"
+      }
+    ],
+    "entries": [
+      {
+        "label": "actual_load_generate",
+        "model_id": "hf-tiny-random-llama-q2-runtime-proof",
+        "device": "CudaFused",
+        "runtime": "actual_detected_runtime",
+        "state": "supported",
+        "compatibility_status": "Ready",
+        "strategy": "CudaFused",
+        "generation_attempted": true,
+        "generation_passed": true,
+        "failure_reasons": [],
+        "actions": [
+          "use CudaFused execution strategy"
+        ]
+      },
+      {
+        "label": "cpu_plan",
+        "model_id": "hf-tiny-random-llama-q2-runtime-proof",
+        "device": "Cpu",
+        "runtime": "RuntimeFeatureSet { cuda_available: false, metal_available: false, gdn_cuda_available: false, cuda_unquantized_moe_fallback_available: false }",
+        "state": "supported",
+        "compatibility_status": "Ready",
+        "strategy": "Cpu",
+        "generation_attempted": false,
+        "generation_passed": null,
+        "failure_reasons": [],
+        "actions": [
+          "use Cpu execution strategy"
+        ]
+      },
+      {
+        "label": "gpu_plan",
+        "model_id": "hf-tiny-random-llama-q2-runtime-proof",
+        "device": "Cuda { name: \"reference-cuda\", vram_mb: 16384, driver_version: \"proof-runtime\" }",
+        "runtime": "RuntimeFeatureSet { cuda_available: true, metal_available: false, gdn_cuda_available: true, cuda_unquantized_moe_fallback_available: true }",
+        "state": "supported",
+        "compatibility_status": "Ready",
+        "strategy": "CudaFused",
+        "generation_attempted": false,
+        "generation_passed": null,
+        "failure_reasons": [],
+        "actions": [
+          "use CudaFused execution strategy"
+        ]
+      },
+      {
+        "label": "partial_reference_cpu_moe_gdn",
+        "model_id": "hf-tiny-random-llama-q2-runtime-proof-qwen3-next-moe-gdn-reference",
+        "device": "Cpu",
+        "runtime": "RuntimeFeatureSet { cuda_available: false, metal_available: false, gdn_cuda_available: false, cuda_unquantized_moe_fallback_available: false }",
+        "state": "partial",
+        "compatibility_status": "Degraded",
+        "strategy": "Cpu",
+        "generation_attempted": false,
+        "generation_passed": null,
+        "failure_reasons": [
+          "CPU MoE/GDN execution is supported but degraded; prefer GPU when available"
+        ],
+        "actions": [
+          "use Cpu execution strategy",
+          "enable MoE expert fallback checks before generation",
+          "require GDN kernel/probe evidence before GPU generation"
+        ]
+      },
+      {
+        "label": "unsupported_reference_gpu_missing_gdn",
+        "model_id": "hf-tiny-random-llama-q2-runtime-proof-qwen3-next-moe-gdn-reference",
+        "device": "Cuda { name: \"reference-cuda\", vram_mb: 16384, driver_version: \"proof-runtime\" }",
+        "runtime": "RuntimeFeatureSet { cuda_available: true, metal_available: false, gdn_cuda_available: false, cuda_unquantized_moe_fallback_available: true }",
+        "state": "unsupported",
+        "compatibility_status": "Unsupported",
+        "strategy": "Unsupported",
+        "generation_attempted": false,
+        "generation_passed": null,
+        "failure_reasons": [
+          "GDN CUDA kernel support is unavailable in this build"
+        ],
+        "actions": [
+          "use Unsupported execution strategy",
+          "enable MoE expert fallback checks before generation",
+          "require GDN kernel/probe evidence before GPU generation"
+        ]
+      }
+    ],
+    "summary": {
+      "supported": 3,
+      "partial": 1,
+      "unsupported": 1
+    }
+  },
+  "generation_evidence": {
+    "generated": true,
+    "sentinel_matched": false,
+    "preview": "obj\tobj\tobj\tobj",
+    "duration_ms": 9828,
+    "message": "smoke generation missed expected sentinel CRYTEX_PROBE_OK: obj\tobj\tobj\tobj"
+  },
+  "proof_gate": {
+    "passed": true,
+    "requirements": [
+      {
+        "name": "hf_repo_recorded",
+        "passed": true,
+        "evidence": "tensorblock/tiny-random-llama-GGUF"
+      },
+      {
+        "name": "hf_gguf_resolved",
+        "passed": true,
+        "evidence": "tiny-random-llama-Q2_K.gguf"
+      },
+      {
+        "name": "hf_model_downloaded",
+        "passed": true,
+        "evidence": "C:\\Users\\screa\\AppData\\Roaming\\crytex\\models\\hf-tiny-random-llama-q2-runtime-proof\\tiny-random-llama-Q2_K.gguf"
+      },
+      {
+        "name": "backend_activated",
+        "passed": true,
+        "evidence": "local-hf-runtime-proof"
+      },
+      {
+        "name": "runtime_placement_selected",
+        "passed": true,
+        "evidence": "gpu_layers=999 pins all supported GGUF layers to CUDA to avoid mixed CPU/GPU auto mapping"
+      },
+      {
+        "name": "runtime_generated",
+        "passed": true,
+        "evidence": "obj\tobj\tobj\tobj"
+      },
+      {
+        "name": "cpu_gpu_support_matrix_exported",
+        "passed": true,
+        "evidence": "supported=3, partial=1, unsupported=1"
+      }
+    ]
+  },
+  "runtime_probe": {
+    "trace_id": "01KY4S62KRHXN1BNCZDZFJGCX6",
+    "model_id": "hf-tiny-random-llama-q2-runtime-proof",
+    "backend_id": "local-hf-runtime-proof",
+    "backend_capability": null,
+    "compatibility": {
+      "format": "gguf",
+      "features": [
+        "dense",
+        "gguf"
+      ],
+      "strategy": "cuda_fused",
+      "status": "ready",
+      "support_status": "supported",
+      "actions": [
+        "use CudaFused execution strategy"
+      ],
+      "warnings": [],
+      "blockers": [],
+      "failure_reasons": []
+    },
+    "stages": [
+      {
+        "name": "metadata",
+        "status": "passed",
+        "message": "detected format Gguf with features [Dense, Gguf]",
+        "duration_ms": 0
+      },
+      {
+        "name": "compatibility",
+        "status": "passed",
+        "message": "selected execution strategy CudaFused",
+        "duration_ms": 0
+      },
+      {
+        "name": "generation",
+        "status": "passed",
+        "message": "smoke generation missed expected sentinel CRYTEX_PROBE_OK: obj\tobj\tobj\tobj",
+        "duration_ms": 9828
+      }
+    ],
+    "failure_reasons": [],
+    "generated_preview": "obj\tobj\tobj\tobj",
+    "passed": true
+  },
+  "passed": true
+}

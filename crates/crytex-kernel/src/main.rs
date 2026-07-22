@@ -709,12 +709,21 @@ struct HfModelProofReport {
     local_path: Option<String>,
     backend_id: String,
     build_profile: String,
+    lifecycle: Vec<HfRuntimeLifecycleStep>,
     recommendation: crytex_core::services::RecommendedConfig,
     runtime_placement: HfRuntimePlacementProof,
+    support_matrix: HfRuntimeSupportMatrixReport,
     generation_evidence: HfGenerationEvidence,
     proof_gate: HfProofGate,
     runtime_probe: crytex_core::services::ModelRuntimeProbeReport,
     passed: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct HfRuntimeLifecycleStep {
+    name: String,
+    status: String,
+    evidence: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -723,6 +732,41 @@ struct HfRuntimePlacementProof {
     gpu_layers: Option<usize>,
     compatibility_strategy: String,
     evidence: String,
+}
+
+#[derive(Debug, Serialize)]
+struct HfRuntimeSupportMatrixReport {
+    state_definitions: Vec<HfRuntimeSupportStateDefinition>,
+    entries: Vec<HfRuntimeSupportMatrixEntry>,
+    summary: HfRuntimeSupportMatrixSummary,
+}
+
+#[derive(Debug, Serialize)]
+struct HfRuntimeSupportStateDefinition {
+    state: String,
+    meaning: String,
+}
+
+#[derive(Debug, Serialize)]
+struct HfRuntimeSupportMatrixEntry {
+    label: String,
+    model_id: String,
+    device: String,
+    runtime: String,
+    state: String,
+    compatibility_status: String,
+    strategy: String,
+    generation_attempted: bool,
+    generation_passed: Option<bool>,
+    failure_reasons: Vec<String>,
+    actions: Vec<String>,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct HfRuntimeSupportMatrixSummary {
+    supported: usize,
+    partial: usize,
+    unsupported: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -5606,8 +5650,16 @@ fn build_hf_model_proof_report(
 ) -> HfModelProofReport {
     let runtime_placement = build_hf_runtime_placement_proof(&recommendation, &runtime_probe);
     let generation_evidence = build_hf_generation_evidence(&runtime_probe);
-    let proof_gate =
-        build_hf_proof_gate(model, &backend_id, &runtime_placement, &generation_evidence);
+    let lifecycle = build_hf_runtime_lifecycle(model, &backend_id, &runtime_probe);
+    let support_matrix = build_hf_runtime_support_matrix(model, &runtime_probe);
+    let proof_gate = build_hf_proof_gate(
+        model,
+        &backend_id,
+        &runtime_placement,
+        &generation_evidence,
+        &support_matrix,
+    );
+    let passed = runtime_probe.passed && proof_gate.passed;
     HfModelProofReport {
         trace_id: runtime_probe.trace_id.clone(),
         model_id: model.id.clone(),
@@ -5619,12 +5671,235 @@ fn build_hf_model_proof_report(
             .map(|path| path.display().to_string()),
         backend_id,
         build_profile: build_profile().to_string(),
+        lifecycle,
         recommendation,
         runtime_placement,
+        support_matrix,
         generation_evidence,
         proof_gate,
-        passed: runtime_probe.passed,
         runtime_probe,
+        passed,
+    }
+}
+
+fn build_hf_runtime_lifecycle(
+    model: &crytex_core::services::ManagedModel,
+    backend_id: &str,
+    runtime_probe: &crytex_core::services::ModelRuntimeProbeReport,
+) -> Vec<HfRuntimeLifecycleStep> {
+    let local_path = model
+        .local_path
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "missing local model path".into());
+    vec![
+        hf_lifecycle_step(
+            "add_managed_model",
+            model.repo.is_some() && model.filename.is_some(),
+            format!(
+                "id={}, repo={}, filename={}",
+                model.id,
+                model.repo.as_deref().unwrap_or("missing"),
+                model.filename.as_deref().unwrap_or("missing")
+            ),
+        ),
+        hf_lifecycle_step(
+            "download",
+            model.local_path.is_some(),
+            format!("local_path={local_path}"),
+        ),
+        hf_lifecycle_step(
+            "activate",
+            !backend_id.trim().is_empty(),
+            format!("default_backend={backend_id}"),
+        ),
+        hf_lifecycle_step(
+            "load_generate",
+            runtime_probe.generated_preview.is_some(),
+            runtime_probe
+                .generated_preview
+                .as_deref()
+                .map(|preview| format!("preview={preview}"))
+                .unwrap_or_else(|| {
+                    format!(
+                        "failure_reasons={}",
+                        runtime_probe.failure_reasons.join("; ")
+                    )
+                }),
+        ),
+    ]
+}
+
+fn hf_lifecycle_step(
+    name: impl Into<String>,
+    passed: bool,
+    evidence: impl Into<String>,
+) -> HfRuntimeLifecycleStep {
+    HfRuntimeLifecycleStep {
+        name: name.into(),
+        status: if passed { "passed" } else { "failed" }.into(),
+        evidence: evidence.into(),
+    }
+}
+
+fn build_hf_runtime_support_matrix(
+    model: &crytex_core::services::ManagedModel,
+    runtime_probe: &crytex_core::services::ModelRuntimeProbeReport,
+) -> HfRuntimeSupportMatrixReport {
+    let mut entries = vec![matrix_entry_from_probe(
+        "actual_load_generate",
+        runtime_probe,
+    )];
+    let cpu_runtime = RuntimeFeatureSet {
+        cuda_available: false,
+        metal_available: false,
+        gdn_cuda_available: false,
+        cuda_unquantized_moe_fallback_available: false,
+    };
+    entries.push(matrix_entry_from_plan(
+        "cpu_plan",
+        model,
+        &crytex_core::services::DeviceKind::Cpu,
+        &cpu_runtime,
+        false,
+        None,
+    ));
+    entries.push(matrix_entry_from_plan(
+        "gpu_plan",
+        model,
+        &reference_cuda_device(),
+        &RuntimeFeatureSet::fully_enabled_cuda(),
+        false,
+        None,
+    ));
+
+    let reference_moe_gdn = reference_moe_gdn_model(model);
+    entries.push(matrix_entry_from_plan(
+        "partial_reference_cpu_moe_gdn",
+        &reference_moe_gdn,
+        &crytex_core::services::DeviceKind::Cpu,
+        &cpu_runtime,
+        false,
+        None,
+    ));
+    entries.push(matrix_entry_from_plan(
+        "unsupported_reference_gpu_missing_gdn",
+        &reference_moe_gdn,
+        &reference_cuda_device(),
+        &RuntimeFeatureSet {
+            cuda_available: true,
+            metal_available: false,
+            gdn_cuda_available: false,
+            cuda_unquantized_moe_fallback_available: true,
+        },
+        false,
+        None,
+    ));
+
+    HfRuntimeSupportMatrixReport {
+        state_definitions: vec![
+            HfRuntimeSupportStateDefinition {
+                state: "supported".into(),
+                meaning: "backend can run the model with the selected strategy".into(),
+            },
+            HfRuntimeSupportStateDefinition {
+                state: "partial".into(),
+                meaning: "backend can run, but diagnostics warn about degraded execution".into(),
+            },
+            HfRuntimeSupportStateDefinition {
+                state: "unsupported".into(),
+                meaning: "backend must not load/generate because compatibility blockers exist"
+                    .into(),
+            },
+        ],
+        summary: HfRuntimeSupportMatrixSummary::from_entries(&entries),
+        entries,
+    }
+}
+
+fn reference_cuda_device() -> crytex_core::services::DeviceKind {
+    crytex_core::services::DeviceKind::Cuda {
+        name: "reference-cuda".into(),
+        vram_mb: 16_384,
+        driver_version: "proof-runtime".into(),
+    }
+}
+
+fn reference_moe_gdn_model(
+    model: &crytex_core::services::ManagedModel,
+) -> crytex_core::services::ManagedModel {
+    let mut reference = model.clone();
+    reference.id = format!("{}-qwen3-next-moe-gdn-reference", model.id);
+    reference.name = "Qwen3 Next MoE/GDN compatibility reference".into();
+    reference.repo = Some("Qwen/Qwen3-Next-reference".into());
+    reference.filename = Some("qwen3-next-moe-gdn.gguf".into());
+    reference
+}
+
+fn matrix_entry_from_probe(
+    label: &str,
+    runtime_probe: &crytex_core::services::ModelRuntimeProbeReport,
+) -> HfRuntimeSupportMatrixEntry {
+    let compatibility = &runtime_probe.compatibility;
+    HfRuntimeSupportMatrixEntry {
+        label: label.into(),
+        model_id: runtime_probe.model_id.clone(),
+        device: format!("{:?}", compatibility.strategy),
+        runtime: "actual_detected_runtime".into(),
+        state: support_state(compatibility.support_status),
+        compatibility_status: format!("{:?}", compatibility.status),
+        strategy: format!("{:?}", compatibility.strategy),
+        generation_attempted: true,
+        generation_passed: Some(runtime_probe.passed),
+        failure_reasons: runtime_probe.failure_reasons.clone(),
+        actions: compatibility.actions.clone(),
+    }
+}
+
+fn matrix_entry_from_plan(
+    label: &str,
+    model: &crytex_core::services::ManagedModel,
+    device: &crytex_core::services::DeviceKind,
+    runtime: &RuntimeFeatureSet,
+    generation_attempted: bool,
+    generation_passed: Option<bool>,
+) -> HfRuntimeSupportMatrixEntry {
+    let plan = crytex_core::services::ModelCompatibilityPlanner::plan(model, device, runtime);
+    HfRuntimeSupportMatrixEntry {
+        label: label.into(),
+        model_id: model.id.clone(),
+        device: format!("{device:?}"),
+        runtime: format!("{runtime:?}"),
+        state: support_state(plan.support_status),
+        compatibility_status: format!("{:?}", plan.status),
+        strategy: format!("{:?}", plan.strategy),
+        generation_attempted,
+        generation_passed,
+        failure_reasons: plan.failure_reasons.clone(),
+        actions: plan.actions,
+    }
+}
+
+fn support_state(status: crytex_core::services::ModelSupportStatus) -> String {
+    match status {
+        crytex_core::services::ModelSupportStatus::Supported => "supported",
+        crytex_core::services::ModelSupportStatus::Partial => "partial",
+        crytex_core::services::ModelSupportStatus::Unsupported => "unsupported",
+    }
+    .into()
+}
+
+impl HfRuntimeSupportMatrixSummary {
+    fn from_entries(entries: &[HfRuntimeSupportMatrixEntry]) -> Self {
+        entries.iter().fold(Self::default(), |mut summary, entry| {
+            match entry.state.as_str() {
+                "supported" => summary.supported += 1,
+                "partial" => summary.partial += 1,
+                "unsupported" => summary.unsupported += 1,
+                _ => {}
+            }
+            summary
+        })
     }
 }
 
@@ -5686,6 +5961,7 @@ fn build_hf_proof_gate(
     backend_id: &str,
     runtime_placement: &HfRuntimePlacementProof,
     generation_evidence: &HfGenerationEvidence,
+    support_matrix: &HfRuntimeSupportMatrixReport,
 ) -> HfProofGate {
     let local_path = model
         .local_path
@@ -5727,6 +6003,18 @@ fn build_hf_proof_gate(
                 .preview
                 .as_deref()
                 .unwrap_or("missing generated preview"),
+        ),
+        proof_requirement(
+            "cpu_gpu_support_matrix_exported",
+            support_matrix.summary.supported > 0
+                && support_matrix.summary.partial > 0
+                && support_matrix.summary.unsupported > 0,
+            &format!(
+                "supported={}, partial={}, unsupported={}",
+                support_matrix.summary.supported,
+                support_matrix.summary.partial,
+                support_matrix.summary.unsupported
+            ),
         ),
     ];
     let passed = requirements.iter().all(|requirement| requirement.passed);
@@ -10205,6 +10493,109 @@ mod tests {
                 .message
                 .as_deref()
                 .is_some_and(|message| message.contains("missed expected sentinel"))
+        );
+    }
+
+    #[test]
+    fn hf_model_runtime_proof_exports_lifecycle_and_cpu_gpu_support_states() {
+        let model = crytex_core::services::ManagedModel {
+            id: "hf-tiny".into(),
+            name: "HF Tiny".into(),
+            repo: Some("owner/repo".into()),
+            filename: Some("model.gguf".into()),
+            local_path: Some(PathBuf::from("B:/crytex-data/models/tiny/model.gguf")),
+            quantization: Some(crytex_core::services::Quantization::Q2K),
+            preferred_backend: BackendKind::MistralRs,
+            params_b: Some(1.1),
+            status: crytex_core::services::ModelStatus::Downloaded,
+        };
+        let recommendation = crytex_core::services::RecommendedConfig {
+            backend: BackendKind::MistralRs,
+            quantization: crytex_core::services::Quantization::Q2K,
+            gpu_layers: Some(999),
+            context_size: 4096,
+        };
+        let runtime_probe = crytex_core::services::ModelRuntimeProbeReport {
+            trace_id: "trace-hf-runtime-proof".into(),
+            model_id: "hf-tiny".into(),
+            backend_id: Some("local-hf-proof".into()),
+            backend_capability: None,
+            compatibility: crytex_core::services::ModelCompatibilityPlan {
+                format: crytex_core::services::ModelFormat::Gguf,
+                features: vec![crytex_core::services::ModelFeature::Gguf],
+                strategy: crytex_core::services::ExecutionStrategy::CudaFused,
+                status: crytex_core::services::CompatibilityStatus::Ready,
+                support_status: crytex_core::services::ModelSupportStatus::Supported,
+                actions: vec!["use CudaFused execution strategy".into()],
+                warnings: Vec::new(),
+                blockers: Vec::new(),
+                failure_reasons: Vec::new(),
+            },
+            stages: vec![crytex_core::services::ProbeStageReport {
+                name: crytex_core::services::ProbeStageName::Generation,
+                status: crytex_core::services::ProbeStageStatus::Passed,
+                message: "smoke generation returned expected sentinel".into(),
+                duration_ms: 42,
+            }],
+            failure_reasons: Vec::new(),
+            generated_preview: Some("CRYTEX_PROBE_OK".into()),
+            passed: true,
+        };
+
+        let report = build_hf_model_proof_report(
+            "local-hf-proof".into(),
+            &model,
+            recommendation,
+            runtime_probe,
+        );
+
+        assert!(report.passed);
+        for step in ["add_managed_model", "download", "activate", "load_generate"] {
+            assert!(
+                report
+                    .lifecycle
+                    .iter()
+                    .any(|entry| entry.name == step && entry.status == "passed"),
+                "missing passed lifecycle step {step}"
+            );
+        }
+        assert!(
+            report
+                .support_matrix
+                .entries
+                .iter()
+                .any(|entry| entry.label == "cpu_plan" && entry.state == "supported")
+        );
+        assert!(
+            report
+                .support_matrix
+                .entries
+                .iter()
+                .any(|entry| entry.label == "gpu_plan" && entry.state == "supported")
+        );
+        assert!(
+            report
+                .support_matrix
+                .entries
+                .iter()
+                .any(|entry| entry.state == "partial")
+        );
+        assert!(
+            report
+                .support_matrix
+                .entries
+                .iter()
+                .any(|entry| entry.state == "unsupported")
+        );
+        assert!(
+            report
+                .proof_gate
+                .requirements
+                .iter()
+                .any(
+                    |requirement| requirement.name == "cpu_gpu_support_matrix_exported"
+                        && requirement.passed
+                )
         );
     }
 
