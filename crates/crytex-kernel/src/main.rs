@@ -31,13 +31,16 @@ use crytex_cli_commands::{
     ABTestCommands, AcceptanceRuntimeMode, BenchCommands, Cli, Commands, LoraCommands, RagCommands,
 };
 use crytex_compress::{
-    DiskCcrStore,
+    ArtifactKind, CompressionQualityReport, DiskCcrStore, InMemoryCcrStore, ModelTokenProfile,
+    SharedContextStats, TokenBudgetAllocation, TokenBudgetPlanner, TokenEconomyEngine,
+    TokenEconomyMetrics, TokenEconomyReport, TokenEconomyRequest,
     compressors::{
         CodeCompressor, DiffCompressor, JsonCompressor, LogCompressor, SearchCompressor,
         SmartCompressor, TextCompressor, TruncateCompressor,
     },
     content::ContentType,
     pipeline::CompressionPipeline,
+    token::CharTokenEstimator,
     tokenizer::TokenizerEstimator,
 };
 use crytex_core::capabilities::{CapabilityAuditReport, CapabilityStatus};
@@ -409,6 +412,22 @@ struct RagFullProofReport {
     retrieval_candidates: Vec<RagFullChunkProof>,
     reranked_chunks: Vec<RagFullChunkProof>,
     selected_chunks: Vec<RagFullChunkProof>,
+    gates: Vec<KernelE2eProofGate>,
+    passed: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TokenEconomyProofReport {
+    proof_outcome: String,
+    trace_id: String,
+    backend: String,
+    model: String,
+    context_window: usize,
+    budget: TokenBudgetAllocation,
+    shared_context: SharedContextStats,
+    metrics: TokenEconomyMetrics,
+    quality: CompressionQualityReport,
+    ccr_markers: Vec<String>,
     gates: Vec<KernelE2eProofGate>,
     passed: bool,
 }
@@ -1952,6 +1971,166 @@ fn proof_gate(name: &str, passed: bool, evidence: &str) -> KernelE2eProofGate {
         name: name.to_string(),
         passed,
         evidence: evidence.to_string(),
+    }
+}
+
+fn run_token_economy_proof(
+    backend: String,
+    model: String,
+    context_window: usize,
+    expected_completion_tokens: usize,
+) -> Result<TokenEconomyProofReport, String> {
+    let trace_id = format!("token-economy-{}", Ulid::new());
+    let estimator = Arc::new(CharTokenEstimator);
+    let planner = TokenBudgetPlanner::new().with_profile(ModelTokenProfile::new(
+        backend.clone(),
+        model.clone(),
+        context_window,
+    ));
+    let budget = planner
+        .plan(&backend, &model, 2_048, expected_completion_tokens)
+        .map_err(|error| format!("failed to plan token budget: {error}"))?;
+
+    let mut shared_context = crytex_compress::SharedContext::new(16, 3_600, estimator.clone());
+    let rag_context =
+        "REQUIRED_FACT_RAG_SHARED Crytex agents reuse the same reranked project context. "
+            .repeat(160);
+    shared_context
+        .put("project-rag", &rag_context, Some("researcher"))
+        .map_err(|error| format!("failed to store researcher shared context: {error}"))?;
+    shared_context
+        .put("project-rag", &rag_context, Some("coder"))
+        .map_err(|error| format!("failed to reuse coder shared context: {error}"))?;
+    let shared_stats = shared_context.stats();
+
+    let store = Arc::new(InMemoryCcrStore::new());
+    let mut engine = TokenEconomyEngine::new(estimator.clone(), store)
+        .with_shared_context(crytex_compress::SharedContext::new(16, 3_600, estimator));
+    let engine_report = engine
+        .optimize(TokenEconomyRequest {
+            backend: backend.clone(),
+            model: model.clone(),
+            messages: vec![
+                crytex_compress::Message::system("You are Crytex token economy proof runner."),
+                crytex_compress::Message::user(
+                    "REQUIRED_FACT_RAG_SHARED REQUIRED_FACT_PROMPT_QUALITY ".repeat(220),
+                ),
+            ],
+            artifacts: vec![
+                (
+                    ArtifactKind::Diff,
+                    "REQUIRED_FACT_DIFF_CCR + changed rust module with preserved invariant\n"
+                        .repeat(180),
+                ),
+                (
+                    ArtifactKind::Log,
+                    "REQUIRED_FACT_LOG_CCR runtime output kept in retrievable CCR\n".repeat(180),
+                ),
+                (
+                    ArtifactKind::Report,
+                    "REQUIRED_FACT_REPORT_CCR benchmark conclusion is retained\n".repeat(180),
+                ),
+                (
+                    ArtifactKind::ToolOutput,
+                    "REQUIRED_FACT_TOOL_CCR cargo test evidence is retrievable\n".repeat(180),
+                ),
+            ],
+            required_facts: vec![
+                "REQUIRED_FACT_RAG_SHARED".into(),
+                "REQUIRED_FACT_PROMPT_QUALITY".into(),
+                "REQUIRED_FACT_DIFF_CCR".into(),
+                "REQUIRED_FACT_LOG_CCR".into(),
+                "REQUIRED_FACT_REPORT_CCR".into(),
+                "REQUIRED_FACT_TOOL_CCR".into(),
+            ],
+            expected_completion_tokens,
+            trace_id: trace_id.clone(),
+        })
+        .map_err(|error| format!("failed to optimize token economy proof: {error}"))?;
+
+    Ok(build_token_economy_proof_report(
+        trace_id,
+        backend,
+        model,
+        context_window,
+        budget,
+        shared_stats,
+        engine_report,
+    ))
+}
+
+fn build_token_economy_proof_report(
+    trace_id: String,
+    backend: String,
+    model: String,
+    context_window: usize,
+    budget: TokenBudgetAllocation,
+    shared_context: SharedContextStats,
+    engine_report: TokenEconomyReport,
+) -> TokenEconomyProofReport {
+    let ccr_markers = engine_report
+        .optimized_messages
+        .iter()
+        .filter(|message| message.content.contains("ccr:"))
+        .map(|message| message.content.clone())
+        .collect::<Vec<_>>();
+    let metrics = engine_report.metrics;
+    let quality = engine_report.quality;
+    let gates = vec![
+        proof_gate(
+            "model_headroom_reserved",
+            budget.reserved_completion_tokens > 0 && budget.total_budget <= context_window,
+            &format!(
+                "reserved_completion={}, safety_margin={}, total_budget={}",
+                budget.reserved_completion_tokens, budget.safety_margin_tokens, budget.total_budget
+            ),
+        ),
+        proof_gate(
+            "shared_context_saved_tokens",
+            shared_context.total_tokens_saved > 0 && shared_context.cache_hits > 0,
+            &format!(
+                "saved={}, cache_hits={}",
+                shared_context.total_tokens_saved, shared_context.cache_hits
+            ),
+        ),
+        proof_gate(
+            "ccr_markers_emitted",
+            ccr_markers.len() == 4,
+            &format!("{} artifact markers emitted", ccr_markers.len()),
+        ),
+        proof_gate(
+            "required_facts_preserved",
+            quality.passed && quality.quality_loss == 0.0,
+            &format!(
+                "missing_facts={}, quality_loss={:.4}",
+                quality.missing_facts.len(),
+                quality.quality_loss
+            ),
+        ),
+        proof_gate(
+            "token_savings_measured",
+            metrics.saved_tokens > 0 && metrics.compression_ratio < 1.0,
+            &format!(
+                "saved_tokens={}, compression_ratio={:.4}",
+                metrics.saved_tokens, metrics.compression_ratio
+            ),
+        ),
+    ];
+    let passed = gates.iter().all(|gate| gate.passed);
+
+    TokenEconomyProofReport {
+        proof_outcome: if passed { "passed" } else { "failed" }.into(),
+        trace_id,
+        backend,
+        model,
+        context_window,
+        budget,
+        shared_context,
+        metrics,
+        quality,
+        ccr_markers,
+        gates,
+        passed,
     }
 }
 
@@ -6984,6 +7163,44 @@ async fn async_main() {
         return;
     }
 
+    if let Commands::ProveTokenEconomy {
+        backend,
+        model,
+        context_window,
+        expected_completion_tokens,
+        report_path,
+    } = &cli.command
+    {
+        let report = run_token_economy_proof(
+            backend.clone(),
+            model.clone(),
+            *context_window,
+            *expected_completion_tokens,
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("Token economy proof failed: {error}");
+            std::process::exit(1);
+        });
+        let payload = serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into());
+        if let Some(report_path) = report_path {
+            if let Some(parent) = report_path.parent()
+                && let Err(error) = tokio::fs::create_dir_all(parent).await
+            {
+                eprintln!("Failed to create token economy proof report directory: {error}");
+                std::process::exit(1);
+            }
+            if let Err(error) = tokio::fs::write(report_path, &payload).await {
+                eprintln!("Failed to write token economy proof report: {error}");
+                std::process::exit(1);
+            }
+        }
+        println!("{payload}");
+        if !report.passed {
+            std::process::exit(2);
+        }
+        return;
+    }
+
     if let Commands::ProveLoraLiveE2e {
         gguf_path,
         context_size,
@@ -7964,6 +8181,9 @@ async fn async_main() {
         ),
         Commands::ProveRagFull { .. } => {
             unreachable!("prove-rag-full is handled before full AppContext initialization")
+        }
+        Commands::ProveTokenEconomy { .. } => {
+            unreachable!("prove-token-economy is handled before full AppContext initialization")
         }
         Commands::Submit {
             project,

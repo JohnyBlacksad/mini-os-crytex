@@ -284,6 +284,19 @@ pub enum Commands {
         #[arg(long)]
         report_path: Option<PathBuf>,
     },
+    /// Prove token headroom, shared context, CCR offload, and required-fact preservation
+    ProveTokenEconomy {
+        #[arg(long, default_value = "ollama")]
+        backend: String,
+        #[arg(long, default_value = "qwen3.5:9b")]
+        model: String,
+        #[arg(long, default_value = "32768")]
+        context_window: usize,
+        #[arg(long, default_value = "512")]
+        expected_completion_tokens: usize,
+        #[arg(long)]
+        report_path: Option<PathBuf>,
+    },
     /// Add or update a managed HuggingFace/local model entry
     AddModel {
         #[arg(short, long)]
@@ -693,5 +706,40 @@ mod tests {
         };
 
         assert_eq!(fixture, "mixed-docs-code");
+    }
+
+    #[test]
+    fn token_economy_proof_command_parses_backend_model_and_report_path() {
+        let cli = Cli::parse_from([
+            "crytex-kernel",
+            "prove-token-economy",
+            "--backend",
+            "ollama",
+            "--model",
+            "qwen3.5:9b",
+            "--context-window",
+            "32768",
+            "--report-path",
+            "reports/token-economy.json",
+        ]);
+
+        let Commands::ProveTokenEconomy {
+            backend,
+            model,
+            context_window,
+            report_path,
+            ..
+        } = cli.command
+        else {
+            panic!("expected token economy proof command");
+        };
+
+        assert_eq!(backend, "ollama");
+        assert_eq!(model, "qwen3.5:9b");
+        assert_eq!(context_window, 32768);
+        assert_eq!(
+            report_path,
+            Some(PathBuf::from("reports/token-economy.json"))
+        );
     }
 }

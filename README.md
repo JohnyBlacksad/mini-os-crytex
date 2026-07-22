@@ -57,6 +57,7 @@ crytex doctor --strict
 crytex project open A:\Projects\my-app
 crytex index run
 crytex rag search "where is CSV import handled?" --rerank --explain --json
+crytex prove token-economy --report-path reports\token-economy-p4.json
 crytex goal submit "Add CSV import with validation, tests, and docs"
 crytex plan show
 crytex plan approve
@@ -112,6 +113,8 @@ backend acceptance harness, runtime modes, JSON artifact, and test profiles.
 See [docs/RAG.md](docs/RAG.md) for the project-brain RAG pipeline, supported
 formats, diagnostics, prompt-injection scanning, incremental reindex, and
 crash-safe rebuild.
+See [docs/TOKEN_ECONOMY.md](docs/TOKEN_ECONOMY.md) for headroom planning,
+shared context, CCR artifact offload, token metrics, and quality-loss gates.
 
 Every production command follows these rules:
 
@@ -129,6 +132,16 @@ The backend has strong foundations: project/task persistence, task lifecycle,
 agents, RAG indexing, hybrid retrieval, reranking hooks, compression, benchmark
 gates, prompt evolution, LoRA evolution, diagnostics, sandboxing, and multiple
 inference backends.
+
+Token economy now has a deterministic proof command in the development binary:
+
+```powershell
+cargo run -p crytex-kernel -- prove-token-economy --report-path reports\token-economy-p4.json
+```
+
+The report proves model headroom reservation, shared RAG-context reuse, CCR
+offload for large artifacts, measured token savings, compression ratio, and
+zero required-fact quality loss.
 
 The production CLI contract is now fixed in code at
 `crates/crytex-kernel/src/cli_contract.rs`. Existing legacy command handlers are

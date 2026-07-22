@@ -22,7 +22,7 @@ Primary implementation:
 | Agents | `InferenceService`, `ToolService`, `ContextAssembler` | `Agent`, `AgentService`, `CriticCouncil` | object-safe agent traits | required, individual capabilities can degrade |
 | Inference | `BackendConfig` | `InferenceManager`, `InferenceService` | object-safe backend manager/service | no backend/cloud/CUDA reports `degraded` |
 | RAG | `Embedder`, `VectorStore` | `ProjectIndexer`, `HybridRetriever`, `ContextAssembler` | object-safe embedder/vector/reranker traits | `config.modules.rag=false` reports `disabled` |
-| Token economy | `Tokenizer`, `TokenEstimator` | `Compressor`, `CcrStore`, `CompressionPipeline` | object-safe compression/token traits | `config.modules.token_economy=false` reports `disabled` |
+| Token economy | `TokenEstimator`, `CcrStore` | `TokenBudgetPlanner`, `SharedContext`, `ArtifactOffload`, `CompressionQualityBenchmark`, `TokenEconomyEngine` | object-safe token/CCR traits | `config.modules.token_economy=false` reports `disabled` |
 | LoRA | `LoraTrainer`, `LoraBenchmarkGate` | `LoraEvolutionService`, `LoraRouter` | object-safe trainer/router/evolution traits | `config.modules.lora=false` reports `disabled` |
 | Prompt Evolution | `PromptVersionRepository`, `PromptBenchmarkGate` | `PromptEvolutionService` | object-safe benchmark/repository traits | `config.modules.prompt_evolution=false` reports `disabled` |
 | Bench | `BenchmarkHarness`, `Scorer` | `BenchmarkRunner`, prompt/LoRA gates | object-safe runner/scorer traits | `config.modules.bench=false` reports `disabled` |
@@ -82,6 +82,9 @@ Covered by tests:
 - no external vector DB: `disabled_external_vector_db_degrades_rag_to_embedded_store`
 - factory no reranker: `create_reranker_returns_none_when_module_disabled`
 - factory no external vector DB: `select_vector_store_mode_uses_embedded_when_external_vector_db_disabled`
+- token economy proof: `prove-token-economy` verifies headroom, shared context,
+  CCR artifact offload, token metrics, and required-fact retention without
+  requiring inference, sandbox, cloud, CUDA, or external vector DB.
 
 ## CLI Split
 

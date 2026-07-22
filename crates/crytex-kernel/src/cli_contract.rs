@@ -43,6 +43,11 @@ pub enum ProductCommand {
         #[command(subcommand)]
         command: RagCommand,
     },
+    /// Plan token headroom, shared context, CCR offload, and quality gates.
+    TokenEconomy {
+        #[command(subcommand)]
+        command: TokenEconomyCommand,
+    },
     /// Submit and inspect user goals.
     Goal {
         #[command(subcommand)]
@@ -170,6 +175,29 @@ pub enum RagCommand {
         #[arg(long)]
         fixture: Option<std::path::PathBuf>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TokenEconomyCommand {
+    Plan {
+        #[arg(long, value_enum)]
+        backend: BackendKindArg,
+        #[arg(long)]
+        model: String,
+        #[arg(long)]
+        prompt_tokens: usize,
+        #[arg(long)]
+        completion_tokens: usize,
+    },
+    SharedContext {
+        #[command(subcommand)]
+        command: TokenEconomySharedContextCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TokenEconomySharedContextCommand {
+    Stats,
 }
 
 #[derive(Debug, Subcommand)]
@@ -377,6 +405,7 @@ pub enum ProveCommand {
     HfModel { id: String, repo: String },
     HfRuntimeMatrix,
     RagFull,
+    TokenEconomy,
     OrchestratorQuality,
     AgentSwarmLoraRouting,
     LoraLiveE2e { role: Option<AgentRoleArg> },
@@ -472,6 +501,7 @@ mod tests {
             "project",
             "index",
             "rag",
+            "token-economy",
             "goal",
             "plan",
             "kanban",
@@ -506,6 +536,7 @@ mod tests {
             "hf-model",
             "hf-runtime-matrix",
             "rag-full",
+            "token-economy",
             "orchestrator-quality",
             "agent-swarm-lora-routing",
             "lora-live-e2e",
@@ -608,6 +639,7 @@ mod tests {
             "project",
             "index",
             "rag",
+            "token-economy",
             "goal",
             "plan",
             "kanban",

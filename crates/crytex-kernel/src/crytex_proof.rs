@@ -18,6 +18,7 @@ pub fn is_proof_command(command: &Commands) -> bool {
             | Commands::ProveAgentSwarmLoraRouting { .. }
             | Commands::ProveOrchestratorQualityGate { .. }
             | Commands::ProveRagFull { .. }
+            | Commands::ProveTokenEconomy { .. }
             | Commands::BackendAcceptance { .. }
     )
 }
@@ -61,6 +62,19 @@ mod tests {
             gpu_layers: None,
             max_tokens: 8,
             generation_timeout_secs: 45,
+            report_path: None,
+        };
+
+        assert!(is_proof_command(&command));
+    }
+
+    #[test]
+    fn token_economy_is_proof_only() {
+        let command = Commands::ProveTokenEconomy {
+            backend: "ollama".into(),
+            model: "qwen3.5:9b".into(),
+            context_window: 32_768,
+            expected_completion_tokens: 512,
             report_path: None,
         };
 

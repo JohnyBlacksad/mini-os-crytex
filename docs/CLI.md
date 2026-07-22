@@ -151,6 +151,31 @@ evidence and token-budget decisions.
 See [RAG.md](RAG.md) for parser coverage, diagnostics schema,
 prompt-injection scanning, incremental reindex, and crash-safe rebuild behavior.
 
+## `token-economy`
+
+Plan headroom, share context across agents, offload large artifacts through CCR,
+and prove compression does not drop required facts.
+
+Production contract:
+
+```powershell
+crytex token-economy plan --backend ollama --model qwen3.5:9b --prompt-tokens 2000 --completion-tokens 512 --json
+crytex token-economy shared-context stats --project my-app --json
+crytex prove token-economy --report-path reports\token-economy-p4.json
+```
+
+Current development binary:
+
+```powershell
+cargo run -p crytex-kernel -- prove-token-economy --backend ollama --model qwen3.5:9b --context-window 32768 --expected-completion-tokens 512 --report-path reports\token-economy-p4.json
+```
+
+The proof JSON contains model budget allocation, shared-context stats, CCR
+markers for diff/log/report/tool-output artifacts, prompt/completion/saved token
+metrics, compression ratio, and required-fact quality loss.
+
+See [TOKEN_ECONOMY.md](TOKEN_ECONOMY.md) for the module contract.
+
 ## `goal`
 
 Submit user goals.
@@ -353,6 +378,7 @@ crytex prove kernel-e2e --full
 crytex prove hf-model <id> --repo owner/model
 crytex prove hf-runtime-matrix
 crytex prove rag-full
+crytex prove token-economy
 crytex prove orchestrator-quality
 crytex prove agent-swarm-lora-routing
 crytex prove lora-live-e2e --role coder-python
@@ -386,6 +412,10 @@ crytex index rebuild
 crytex rag
 crytex rag search
 crytex rag prove
+crytex token-economy
+crytex token-economy plan
+crytex token-economy shared-context
+crytex token-economy shared-context stats
 crytex goal
 crytex goal submit
 crytex goal status
@@ -449,6 +479,7 @@ crytex prove kernel-e2e
 crytex prove hf-model
 crytex prove hf-runtime-matrix
 crytex prove rag-full
+crytex prove token-economy
 crytex prove orchestrator-quality
 crytex prove agent-swarm-lora-routing
 crytex prove lora-live-e2e

@@ -18,6 +18,7 @@ pub mod pipeline;
 pub mod scoring;
 pub mod sizing;
 pub mod token;
+pub mod token_economy;
 pub mod tokenizer;
 pub mod tree_sitter_detector;
 pub mod unidiff_detector;
@@ -40,6 +41,12 @@ pub use scoring::{
 };
 pub use sizing::{SizingBias, optimal_k};
 pub use token::{CharTokenEstimator, TokenError, TokenEstimator, WordTokenEstimator};
+pub use token_economy::{
+    ArtifactKind, ArtifactOffload, CompressionQualityBenchmark, CompressionQualityReport,
+    ModelTokenProfile, SharedContext, SharedContextEntry, SharedContextStats,
+    TokenBudgetAllocation, TokenBudgetPlanner, TokenEconomyEngine, TokenEconomyMetrics,
+    TokenEconomyReport, TokenEconomyRequest,
+};
 pub use tokenizer::{Backend, Tokenizer, TokenizerEstimator, get_tokenizer};
 pub use unidiff_detector::{detect_diff, is_diff};
 
