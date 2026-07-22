@@ -86,6 +86,9 @@ CLI
   -> storage and diagnostics
 ```
 
+See [docs/MODULARITY.md](docs/MODULARITY.md) for the module map, trait
+boundaries, capability statuses, disabled-module behavior, and SOLID audit.
+
 Important crates:
 
 - `crytex-core`: domain models, orchestration, services, task lifecycle,

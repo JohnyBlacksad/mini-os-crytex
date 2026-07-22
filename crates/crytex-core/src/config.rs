@@ -138,6 +138,44 @@ pub struct InferenceConfig {
     pub context_token_budget: Option<usize>,
 }
 
+/// Optional module switches.
+///
+/// Disabled modules must degrade through typed capability reports. Required
+/// core modules keep running while optional capabilities are omitted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ModuleSwitchesConfig {
+    pub rag: bool,
+    pub reranker: bool,
+    pub lora: bool,
+    pub prompt_evolution: bool,
+    pub bench: bool,
+    pub sandbox: bool,
+    pub sandbox_docker: bool,
+    pub cloud: bool,
+    pub cuda: bool,
+    pub external_vector_db: bool,
+    pub token_economy: bool,
+}
+
+impl Default for ModuleSwitchesConfig {
+    fn default() -> Self {
+        Self {
+            rag: true,
+            reranker: true,
+            lora: true,
+            prompt_evolution: true,
+            bench: true,
+            sandbox: true,
+            sandbox_docker: true,
+            cloud: true,
+            cuda: false,
+            external_vector_db: true,
+            token_economy: true,
+        }
+    }
+}
+
 /// Hybrid search configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -377,6 +415,9 @@ pub struct CrytexConfig {
     /// Incremental indexing configuration.
     #[serde(default)]
     pub indexing: IndexingConfig,
+    /// Optional module switches used by capability reports and doctor.
+    #[serde(default)]
+    pub modules: ModuleSwitchesConfig,
     /// Static mapping from agent role to active LoRA adapter id.
     #[serde(default)]
     pub role_adapters: HashMap<String, String>,
@@ -395,6 +436,7 @@ impl Default for CrytexConfig {
             benchmark: BenchmarkConfig::default(),
             search: SearchConfig::default(),
             indexing: IndexingConfig::default(),
+            modules: ModuleSwitchesConfig::default(),
             role_adapters: HashMap::new(),
         }
     }
@@ -660,6 +702,28 @@ default_workflow = "research"
         let config = IndexingConfig::default();
         assert!(config.incremental_enabled);
         assert_eq!(config.debounce_ms, 500);
+    }
+
+    #[test]
+    fn module_switches_roundtrip_through_toml() {
+        let serialized = r#"
+[modules]
+reranker = false
+lora = false
+cloud = false
+sandbox_docker = false
+external_vector_db = false
+"#;
+
+        let config: CrytexConfig = toml::from_str(serialized).unwrap();
+
+        assert!(!config.modules.reranker);
+        assert!(!config.modules.lora);
+        assert!(!config.modules.cloud);
+        assert!(!config.modules.sandbox_docker);
+        assert!(!config.modules.external_vector_db);
+        assert!(config.modules.rag);
+        assert!(config.modules.token_economy);
     }
 
     #[test]

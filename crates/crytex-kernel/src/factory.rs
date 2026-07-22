@@ -103,25 +103,50 @@ pub fn create_vector_store(
     config: &CrytexConfig,
     metrics: Option<Arc<dyn MetricsService>>,
 ) -> Arc<dyn VectorStore> {
-    let raw: Arc<dyn VectorStore> = if let Some(url) = &config.inference.vector_store_url {
-        match QdrantVectorStore::new(url) {
+    let raw: Arc<dyn VectorStore> = match select_vector_store_mode(config) {
+        VectorStoreMode::ExternalQdrant(url) => match QdrantVectorStore::new(url) {
             Ok(store) => Arc::new(store),
             Err(e) => {
                 eprintln!(
                     "Warning: failed to connect to Qdrant at {url}: {e}. \
-                     Falling back to embedded vector store."
+                         Falling back to embedded vector store."
                 );
                 create_embedded_vector_store(config)
             }
+        },
+        VectorStoreMode::Embedded => create_embedded_vector_store(config),
+        VectorStoreMode::ExternalDisabled => {
+            eprintln!(
+                "Warning: external vector DB is disabled by config.modules.external_vector_db. \
+                 Using embedded vector store."
+            );
+            create_embedded_vector_store(config)
         }
-    } else {
-        create_embedded_vector_store(config)
     };
 
     if config.cache.vector_search_cache_enabled {
         Arc::new(CachedVectorStore::new(raw, metrics, config.cache.clone()))
     } else {
         raw
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum VectorStoreMode<'a> {
+    ExternalQdrant(&'a str),
+    Embedded,
+    ExternalDisabled,
+}
+
+fn select_vector_store_mode(config: &CrytexConfig) -> VectorStoreMode<'_> {
+    match (
+        config.modules.external_vector_db,
+        config.inference.vector_store_url.as_deref(),
+    ) {
+        (true, Some(url)) => VectorStoreMode::ExternalQdrant(url),
+        (true, None) => VectorStoreMode::Embedded,
+        (false, Some(_)) => VectorStoreMode::ExternalDisabled,
+        (false, None) => VectorStoreMode::Embedded,
     }
 }
 
@@ -257,6 +282,9 @@ pub fn create_project_indexer(
 }
 
 pub fn create_reranker(config: &CrytexConfig) -> Option<Arc<dyn Reranker>> {
+    if !config.modules.reranker {
+        return None;
+    }
     let backend_id = config.inference.rerank_backend.as_deref()?;
     let backend_config = config.inference.backend(backend_id)?;
     match backend_config.kind {
@@ -609,6 +637,32 @@ mod tests {
             embedder.is_none(),
             "expected no sparse embedder when disabled"
         );
+    }
+
+    #[test]
+    fn create_reranker_returns_none_when_module_disabled() {
+        let mut config = CrytexConfig::default();
+        config.modules.reranker = false;
+        config.inference.rerank_backend = Some("rerank".into());
+        config
+            .inference
+            .backends
+            .push(BackendConfig::onnx("rerank", "bge-reranker-base"));
+
+        let reranker = create_reranker(&config);
+
+        assert!(reranker.is_none(), "disabled reranker must degrade to None");
+    }
+
+    #[test]
+    fn select_vector_store_mode_uses_embedded_when_external_vector_db_disabled() {
+        let mut config = CrytexConfig::default();
+        config.modules.external_vector_db = false;
+        config.inference.vector_store_url = Some("http://127.0.0.1:1".into());
+
+        let mode = select_vector_store_mode(&config);
+
+        assert_eq!(mode, VectorStoreMode::ExternalDisabled);
     }
 
     #[tokio::test]

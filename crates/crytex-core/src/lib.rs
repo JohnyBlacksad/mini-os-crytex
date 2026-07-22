@@ -2,6 +2,7 @@
 
 pub mod app_context;
 pub mod bus;
+pub mod capabilities;
 pub mod config;
 pub mod indexer;
 pub mod metrics;
