@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://crytex.local/schemas/v1/release-gate.schema.json",
+  "title": "Crytex Release Gate Report",
+  "type": "object",
+  "required": [
+    "passed",
+    "version",
+    "build_profile",
+    "preflight_command",
+    "performance_budget_profile",
+    "schemas_version",
+    "target_platforms",
+    "gates",
+    "artifacts"
+  ],
+  "properties": {
+    "passed": { "type": "boolean" },
+    "version": { "type": "string" },
+    "build_profile": { "type": "string" },
+    "preflight_command": { "type": "string" },
+    "performance_budget_profile": { "type": "string" },
+    "schemas_version": { "type": "string" },
+    "target_platforms": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "gates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "passed", "evidence"],
+        "properties": {
+          "name": { "type": "string" },
+          "passed": { "type": "boolean" },
+          "evidence": { "type": "string" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "artifacts": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "references": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  },
+  "additionalProperties": false
+}

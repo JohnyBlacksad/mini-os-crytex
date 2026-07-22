@@ -75,9 +75,9 @@ use crytex_core::{
         ProjectServiceImpl, ProjectWatcher, PromptBenchmarkDecision, PromptBenchmarkGate,
         PromptBenchmarkRequest, PromptEvolutionDecisionReport, PromptEvolutionError,
         PromptEvolutionService, PromptFailureKind, PromptFailureRouter, Quantization,
-        RecordRewardRequest, RecoveryService, RerankPassage, RerankResult, RewardService,
-        RoleAdapterRegistry, RoleQualityProof, RuntimeFeatureSet, RuntimeMatrixEntryRequest,
-        RuntimeMatrixReportWriter, RuntimeModelMatrix, SchedulerImpl,
+        RecordRewardRequest, RecoveryService, ReleaseGateService, RerankPassage, RerankResult,
+        RewardService, RoleAdapterRegistry, RoleQualityProof, RuntimeFeatureSet,
+        RuntimeMatrixEntryRequest, RuntimeMatrixReportWriter, RuntimeModelMatrix, SchedulerImpl,
         StaticEvolutionObservationSource, SystemHardwareDetector, TaskHandler, TaskServiceImpl,
         TomlWorkflowRepository, VectorStore, WorkerError, WorkerPool, WorkflowDefinition,
         WorkflowEdge, WorkflowEngine, WorkflowNode, WorkflowRepository, WorkflowRetryPolicy,
@@ -8267,6 +8267,44 @@ async fn async_main() {
         return;
     }
 
+    if let Commands::Doctor { strict, json } = &cli.command {
+        let release = ReleaseGateService::deterministic_report();
+        let storage = RecoveryService::deterministic_proof();
+        let runtime = RuntimeModelMatrix::report();
+        let passed = release.passed && storage.passed;
+        let report = serde_json::json!({
+            "passed": passed,
+            "strict": strict,
+            "config_dirs": "ready",
+            "release_gate": {
+                "passed": release.passed,
+                "gates": release.gates,
+            },
+            "storage_recovery": {
+                "passed": storage.passed,
+                "schema_version": storage.schema_version,
+            },
+            "runtime_matrix": runtime,
+        });
+        if *json {
+            println!(
+                "{}",
+                unwrap_or_exit!(
+                    serde_json::to_string_pretty(&report),
+                    "Failed to serialize doctor report"
+                )
+            );
+        } else {
+            println!("Doctor: {}", if passed { "passed" } else { "failed" });
+            println!("strict: {strict}");
+            println!("storage schema: {}", storage.schema_version);
+        }
+        if *strict && !passed {
+            std::process::exit(2);
+        }
+        return;
+    }
+
     if let Commands::Sandbox { command } = &cli.command {
         match command {
             SandboxCommands::Doctor { json } => {
@@ -9076,6 +9114,28 @@ async fn async_main() {
             }
             if let Err(error) = tokio::fs::write(report_path, &payload).await {
                 eprintln!("Failed to write evolution policy proof report: {error}");
+                std::process::exit(1);
+            }
+        }
+        println!("{payload}");
+        if !report.passed {
+            std::process::exit(2);
+        }
+        return;
+    }
+
+    if let Commands::ProveReleaseGate { report_path } = &cli.command {
+        let report = ReleaseGateService::deterministic_report();
+        let payload = serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into());
+        if let Some(report_path) = report_path {
+            if let Some(parent) = report_path.parent()
+                && let Err(error) = tokio::fs::create_dir_all(parent).await
+            {
+                eprintln!("Failed to create release gate proof report directory: {error}");
+                std::process::exit(1);
+            }
+            if let Err(error) = tokio::fs::write(report_path, &payload).await {
+                eprintln!("Failed to write release gate proof report: {error}");
                 std::process::exit(1);
             }
         }
@@ -10034,6 +10094,9 @@ async fn async_main() {
                 }
             }
         }
+        Commands::Doctor { .. } => {
+            unreachable!("doctor is handled before full AppContext initialization")
+        }
         Commands::ProveKernelE2e { .. } => {
             unreachable!("prove-kernel-e2e is handled before full AppContext initialization")
         }
@@ -10090,6 +10153,9 @@ async fn async_main() {
         }
         Commands::ProveEvolutionPolicy { .. } => {
             unreachable!("prove-evolution-policy is handled before full AppContext initialization")
+        }
+        Commands::ProveReleaseGate { .. } => {
+            unreachable!("prove-release-gate is handled before full AppContext initialization")
         }
         Commands::Submit {
             project,

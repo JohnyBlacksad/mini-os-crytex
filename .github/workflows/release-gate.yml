@@ -1,0 +1,43 @@
+name: release-gate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  release-gate:
+    name: release gate (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: fmt
+        run: cargo fmt --check
+      - name: test kernel
+        run: cargo test -p crytex-kernel --no-default-features --bin crytex-kernel
+      - name: clippy kernel
+        run: cargo clippy -p crytex-kernel --no-default-features --bin crytex-kernel -- -D warnings
+      - name: release build
+        run: cargo build --release -p crytex-kernel --no-default-features
+      - name: doctor preflight
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            ./target/release/crytex-kernel.exe doctor --strict --json
+          else
+            ./target/release/crytex-kernel doctor --strict --json
+          fi
+      - name: binary smoke
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            pwsh ./scripts/smoke-windows.ps1
+          else
+            bash ./scripts/smoke-linux.sh
+          fi

@@ -135,6 +135,10 @@ leakage detection, and low-information filtering.
 See [docs/LORA_EVOLUTION.md](docs/LORA_EVOLUTION.md) for the end-to-end LoRA
 loop: objective selection, training, quality gates, promotion, rollback,
 recovery, and diagnostics.
+See [docs/INSTALL.md](docs/INSTALL.md), [docs/RELEASE.md](docs/RELEASE.md),
+and [docs/RELEASE_NOTES.md](docs/RELEASE_NOTES.md) for packaging, shell
+completions, JSON schemas, performance budgets, CI, smoke tests, changelog, and
+release gate preflight.
 
 ## Examples
 
@@ -177,6 +181,7 @@ cargo run -p crytex-kernel -- diag probe-runtime-matrix --json --report-path rep
 cargo run -p crytex-kernel -- sandbox prove --json --report-path reports\sandbox-security-p13-proof.json
 cargo run -p crytex-kernel -- security prove --malicious-rag-fixture --json --report-path reports\security-p13-proof.json
 cargo run -p crytex-kernel -- diag storage-recovery --json --report-path reports\storage-recovery-p14-proof.json
+cargo run -p crytex-kernel -- prove-release-gate --report-path reports\release-gate-p16-proof.json
 ```
 
 The token-economy report proves model headroom reservation, shared RAG-context reuse, CCR
@@ -222,6 +227,11 @@ The storage/recovery report proves versioned schema migration from old DB
 fixtures, backup/export/import invariants, interrupted run/training/download
 resume policy, crash-safe index rebuild, Windows concurrent CLI lock policy, and
 the rule that corrupt LoRA adapters are never promoted.
+
+The release-gate report proves release build expectations, install docs, shell
+completions, versioned JSON schemas, performance budgets, CI scripts, full
+acceptance fixtures, changelog/release notes, Windows/Linux binary smoke, and
+`crytex doctor --strict` preflight.
 
 The LoRA dataset report proves Crytex stores accepted outputs as positive
 targets, rejected outputs as negative preference sides, preserves critic

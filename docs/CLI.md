@@ -517,10 +517,22 @@ crytex prove lora-hot-swap
 crytex prove lora-candle-learning
 crytex prove lora-real-model
 crytex prove lora-real-quality-gate
+crytex prove release-gate
 ```
 
 Proof commands are allowed to be expensive and may download models or run CUDA
 smokes when explicitly requested.
+
+Current development binary:
+
+```powershell
+cargo run -p crytex-kernel -- prove-release-gate --report-path reports\release-gate-p16-proof.json
+```
+
+The release gate proof covers release build expectations, install docs, shell
+completions, JSON schemas, performance budgets, CI scripts, full acceptance
+fixtures, changelog/release notes, Windows/Linux binary smoke, and
+`crytex doctor --strict` preflight. See [RELEASE.md](RELEASE.md).
 
 ## Complete Help Snapshot Paths
 
@@ -619,6 +631,7 @@ crytex prove lora-hot-swap
 crytex prove lora-candle-learning
 crytex prove lora-real-model
 crytex prove lora-real-quality-gate
+crytex prove release-gate
 ```
 
 ## SOLID Extension Rules

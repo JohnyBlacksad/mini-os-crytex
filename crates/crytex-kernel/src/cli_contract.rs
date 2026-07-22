@@ -438,6 +438,7 @@ pub enum ProveCommand {
     LoraCandleLearning,
     LoraRealModel,
     LoraRealQualityGate,
+    ReleaseGate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -751,6 +752,87 @@ mod tests {
                     "role example should document `{required}`"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn p16_release_assets_are_documented_and_versioned() {
+        let files = [
+            ("docs/INSTALL.md", include_str!("../../../docs/INSTALL.md")),
+            ("docs/RELEASE.md", include_str!("../../../docs/RELEASE.md")),
+            (
+                "docs/RELEASE_NOTES.md",
+                include_str!("../../../docs/RELEASE_NOTES.md"),
+            ),
+            ("CHANGELOG.md", include_str!("../../../CHANGELOG.md")),
+            (
+                "schemas/v1/backend-acceptance.schema.json",
+                include_str!("../../../schemas/v1/backend-acceptance.schema.json"),
+            ),
+            (
+                "schemas/v1/release-gate.schema.json",
+                include_str!("../../../schemas/v1/release-gate.schema.json"),
+            ),
+            (
+                "release/performance-budgets.json",
+                include_str!("../../../release/performance-budgets.json"),
+            ),
+            (
+                "fixtures/full-acceptance/project.json",
+                include_str!("../../../fixtures/full-acceptance/project.json"),
+            ),
+            (
+                ".github/workflows/release-gate.yml",
+                include_str!("../../../.github/workflows/release-gate.yml"),
+            ),
+            (
+                "scripts/release-gate.ps1",
+                include_str!("../../../scripts/release-gate.ps1"),
+            ),
+            (
+                "scripts/release-gate.sh",
+                include_str!("../../../scripts/release-gate.sh"),
+            ),
+            (
+                "scripts/smoke-windows.ps1",
+                include_str!("../../../scripts/smoke-windows.ps1"),
+            ),
+            (
+                "scripts/smoke-linux.sh",
+                include_str!("../../../scripts/smoke-linux.sh"),
+            ),
+            (
+                "completions/crytex.bash",
+                include_str!("../../../completions/crytex.bash"),
+            ),
+            (
+                "completions/_crytex.ps1",
+                include_str!("../../../completions/_crytex.ps1"),
+            ),
+            (
+                "completions/crytex.fish",
+                include_str!("../../../completions/crytex.fish"),
+            ),
+        ];
+
+        for (path, contents) in files {
+            assert!(!contents.trim().is_empty(), "{path} must not be empty");
+        }
+
+        let release = include_str!("../../../docs/RELEASE.md");
+        for required in [
+            "cargo build --release",
+            "crytex doctor --strict",
+            "shell completions",
+            "JSON schemas",
+            "performance budgets",
+            "Windows",
+            "Linux",
+        ] {
+            assert!(
+                release.contains(required),
+                "release docs should mention {required}"
+            );
         }
     }
 

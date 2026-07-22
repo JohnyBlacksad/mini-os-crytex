@@ -32,6 +32,7 @@ pub mod project_watcher;
 pub mod prompt_evolution;
 pub mod rate_limit;
 pub mod recovery;
+pub mod release_gate;
 pub mod reranker;
 pub mod reward_service;
 pub mod role;
@@ -137,6 +138,7 @@ pub use recovery::{
     MigrationPlan, RecoveryService, RunRecoveryPolicy, StorageRecoveryReport,
     TrainingRecoveryPolicy,
 };
+pub use release_gate::{ReleaseGateReport, ReleaseGateService};
 pub use reranker::{RerankPassage, RerankResult, Reranker, RerankerError};
 pub use reward_service::{RecordRewardRequest, RewardService, RewardServiceError};
 pub use role::AgentRole;

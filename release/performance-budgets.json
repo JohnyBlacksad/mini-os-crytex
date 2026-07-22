@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "profile": "release",
+  "budgets": {
+    "help_ms": 500,
+    "doctor_strict_ms": 5000,
+    "release_gate_ms": 1000,
+    "storage_recovery_ms": 1000,
+    "backend_acceptance_deterministic_ms": 30000,
+    "rag_mixed_fixture_ms": 15000,
+    "token_economy_proof_ms": 5000,
+    "binary_smoke_ms": 10000
+  },
+  "notes": [
+    "Runtime, network, CUDA, and real model download profiles are measured separately.",
+    "Budgets are enforced by release scripts and CI before packaging."
+  ]
+}

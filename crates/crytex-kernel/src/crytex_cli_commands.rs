@@ -11,6 +11,13 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
+    /// Run backend preflight checks before normal CLI use or release.
+    Doctor {
+        #[arg(long)]
+        strict: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Create a new project
     CreateProject {
         #[arg(short, long)]
@@ -349,6 +356,11 @@ pub enum Commands {
     },
     /// Prove autonomous evolution policy routes failures to the right module
     ProveEvolutionPolicy {
+        #[arg(long)]
+        report_path: Option<PathBuf>,
+    },
+    /// Prove release readiness: build, docs, completions, schemas, CI, smoke, and preflight
+    ProveReleaseGate {
         #[arg(long)]
         report_path: Option<PathBuf>,
     },
@@ -1433,6 +1445,38 @@ mod tests {
             report_path,
             Some(PathBuf::from("reports/evolution-policy-p11.json"))
         );
+    }
+
+    #[test]
+    fn release_gate_proof_command_parses_report_path() {
+        let cli = Cli::parse_from([
+            "crytex-kernel",
+            "prove-release-gate",
+            "--report-path",
+            "reports/release-gate-p16-proof.json",
+        ]);
+
+        let Commands::ProveReleaseGate { report_path } = cli.command else {
+            panic!("expected release gate proof command");
+        };
+
+        assert_eq!(
+            report_path,
+            Some(PathBuf::from("reports/release-gate-p16-proof.json"))
+        );
+    }
+
+    #[test]
+    fn doctor_strict_json_preflight_parses() {
+        let cli = Cli::parse_from(["crytex-kernel", "doctor", "--strict", "--json"]);
+
+        assert!(matches!(
+            cli.command,
+            Commands::Doctor {
+                strict: true,
+                json: true
+            }
+        ));
     }
 
     #[test]

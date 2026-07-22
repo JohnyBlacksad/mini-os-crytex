@@ -1,0 +1,81 @@
+{
+  "passed": true,
+  "version": "0.1.0",
+  "build_profile": "release",
+  "preflight_command": "crytex doctor --strict --json",
+  "performance_budget_profile": "release/performance-budgets.json",
+  "schemas_version": "v1",
+  "target_platforms": [
+    "windows-latest",
+    "ubuntu-latest"
+  ],
+  "gates": [
+    {
+      "name": "release_build",
+      "passed": true,
+      "evidence": "cargo build --release is the canonical binary build"
+    },
+    {
+      "name": "install_docs",
+      "passed": true,
+      "evidence": "docs/INSTALL.md describes Windows/Linux install and completions"
+    },
+    {
+      "name": "shell_completions",
+      "passed": true,
+      "evidence": "bash, fish, and PowerShell completion files are shipped"
+    },
+    {
+      "name": "json_schemas_versioned",
+      "passed": true,
+      "evidence": "schemas/v1 contains stable JSON Schema 2020-12 files"
+    },
+    {
+      "name": "performance_budgets",
+      "passed": true,
+      "evidence": "release/performance-budgets.json defines startup, doctor, RAG, and acceptance limits"
+    },
+    {
+      "name": "ci_scripts",
+      "passed": true,
+      "evidence": "release-gate workflow runs fmt, tests, clippy, release build, doctor preflight, and smoke scripts"
+    },
+    {
+      "name": "full_acceptance_fixtures",
+      "passed": true,
+      "evidence": "fixtures/full-acceptance contains a deterministic project fixture"
+    },
+    {
+      "name": "changelog_release_notes",
+      "passed": true,
+      "evidence": "CHANGELOG.md and docs/RELEASE_NOTES.md are part of the release packet"
+    },
+    {
+      "name": "binary_smoke_windows_linux",
+      "passed": true,
+      "evidence": "scripts/smoke-windows.ps1 and scripts/smoke-linux.sh smoke the built binary"
+    },
+    {
+      "name": "doctor_strict_preflight",
+      "passed": true,
+      "evidence": "crytex doctor --strict is the required release preflight"
+    }
+  ],
+  "artifacts": [
+    "target/release/crytex-kernel(.exe)",
+    "docs/INSTALL.md",
+    "completions/crytex.bash",
+    "completions/_crytex.ps1",
+    "completions/crytex.fish",
+    "schemas/v1/backend-acceptance.schema.json",
+    "schemas/v1/release-gate.schema.json",
+    "fixtures/full-acceptance/project.json",
+    "CHANGELOG.md",
+    "docs/RELEASE_NOTES.md"
+  ],
+  "references": [
+    "https://docs.rs/clap_complete/latest/clap_complete/",
+    "https://json-schema.org/draft/2020-12",
+    "https://doc.rust-lang.org/cargo/commands/cargo-build.html"
+  ]
+}
