@@ -88,7 +88,9 @@ pub use lora_router::{
     RoleAdapterRegistry,
 };
 pub use lora_trainer::{
-    LoraMetrics, LoraTrainer, LoraTrainingConfig, LoraTrainingError, LoraTrainingResult,
+    AdapterArtifactValidator, AdapterMetadata, LoraMetrics, LoraTrainer, LoraTrainingConfig,
+    LoraTrainingError, LoraTrainingObjective, LoraTrainingResult, dataset_hash,
+    validate_objective_examples,
 };
 pub use memory_bank::{
     MemoryBankError, MemoryBankService, MemoryBankServiceImpl, MemoryEntryBuilder,

@@ -317,6 +317,11 @@ pub enum Commands {
         #[arg(long)]
         report_path: Option<PathBuf>,
     },
+    /// Prove objective-aware LoRA training contracts, metadata, state, and artifact validation
+    ProveLoraTrainingObjectives {
+        #[arg(long)]
+        report_path: Option<PathBuf>,
+    },
     /// Add or update a managed HuggingFace/local model entry
     AddModel {
         #[arg(short, long)]
@@ -510,8 +515,14 @@ pub enum LoraCommands {
     Swap { id: String },
     /// Select an adapter for a project and persist the choice as a snapshot
     Select { project: String, adapter: String },
-    /// Train a new adapter for a task kind
-    Train { kind: String },
+    /// Train a new adapter for a task kind or role objective
+    Train {
+        kind: String,
+        #[arg(long, value_enum, default_value_t = LoraObjectiveArg::Sft)]
+        objective: LoraObjectiveArg,
+        #[arg(long)]
+        role: Option<String>,
+    },
     /// Bind an adapter to a canonical agent role
     SelectRole { role: String, adapter: String },
     /// List role -> adapter bindings
@@ -540,6 +551,14 @@ pub enum LoraDatasetCommands {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum LoraObjectiveArg {
+    Sft,
+    Dpo,
+    Orpo,
+    Kto,
 }
 
 #[derive(Subcommand)]
@@ -1162,6 +1181,50 @@ mod tests {
         assert_eq!(
             report_path,
             Some(PathBuf::from("reports/lora-dataset-p8.json"))
+        );
+    }
+
+    #[test]
+    fn lora_train_parses_typed_objective_and_role() {
+        let cli = Cli::parse_from([
+            "crytex-kernel",
+            "lora",
+            "train",
+            "coder-python",
+            "--objective",
+            "dpo",
+            "--role",
+            "coder-python",
+        ]);
+
+        assert!(matches!(
+            cli.command,
+            Commands::Lora {
+                command: LoraCommands::Train {
+                    kind,
+                    objective: LoraObjectiveArg::Dpo,
+                    role: Some(role),
+                }
+            } if kind == "coder-python" && role == "coder-python"
+        ));
+    }
+
+    #[test]
+    fn lora_training_objectives_proof_command_parses_report_path() {
+        let cli = Cli::parse_from([
+            "crytex-kernel",
+            "prove-lora-training-objectives",
+            "--report-path",
+            "reports/lora-training-objectives-p9.json",
+        ]);
+
+        let Commands::ProveLoraTrainingObjectives { report_path } = cli.command else {
+            panic!("expected lora training objectives proof command");
+        };
+
+        assert_eq!(
+            report_path,
+            Some(PathBuf::from("reports/lora-training-objectives-p9.json"))
         );
     }
 }

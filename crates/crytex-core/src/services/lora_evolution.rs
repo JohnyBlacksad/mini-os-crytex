@@ -22,8 +22,9 @@ use crate::persistence::{
 };
 use crate::services::LoraMetrics;
 use crate::services::{
-    AgentRole, Embedder, EventService, InferenceService, LoraTrainer, LoraTrainingConfig,
-    LoraTrainingError, LoraTrainingResult, RewardService, TaskError, TaskService,
+    AdapterMetadata, AgentRole, Embedder, EventService, InferenceService, LoraTrainer,
+    LoraTrainingConfig, LoraTrainingError, LoraTrainingObjective, LoraTrainingResult,
+    RewardService, TaskError, TaskService, validate_objective_examples,
     vector_store::{VectorPoint, VectorStore},
 };
 
@@ -227,6 +228,21 @@ pub trait LoraEvolutionService: Send + Sync {
         &self,
         role: AgentRole,
     ) -> Result<LoraAdapter, LoraEvolutionError>;
+
+    /// Train and register a new role adapter with an explicit training objective.
+    async fn train_and_register_for_role_objective(
+        &self,
+        role: AgentRole,
+        objective: LoraTrainingObjective,
+    ) -> Result<LoraAdapter, LoraEvolutionError> {
+        let _ = role;
+        Err(LoraEvolutionError::Training(
+            LoraTrainingError::UnsupportedObjective {
+                backend: "lora-evolution-service".into(),
+                objective,
+            },
+        ))
+    }
 
     /// Select the best registered adapter for a task.
     async fn select_lora(
@@ -547,6 +563,7 @@ impl LoraEvolutionServiceImpl {
 
         let config_path = result.adapter_path.join("adapter_config.json");
         let weights_path = result.adapter_path.join("adapter_model.safetensors");
+        let metadata_path = result.adapter_path.join("adapter_metadata.json");
         let config = tokio::fs::read_to_string(&config_path).await.map_err(|e| {
             LoraEvolutionError::ValidationFailed(
                 key.to_string(),
@@ -584,6 +601,33 @@ impl LoraEvolutionServiceImpl {
                     "adapter_model.safetensors must be a non-empty file at {}",
                     weights_path.display()
                 ),
+            ));
+        }
+
+        let metadata = tokio::fs::read_to_string(&metadata_path)
+            .await
+            .map_err(|e| {
+                LoraEvolutionError::ValidationFailed(
+                    key.to_string(),
+                    format!(
+                        "adapter_metadata.json is unreadable at {}: {e}",
+                        metadata_path.display()
+                    ),
+                )
+            })?;
+        let metadata: AdapterMetadata = serde_json::from_str(&metadata).map_err(|e| {
+            LoraEvolutionError::ValidationFailed(
+                key.to_string(),
+                format!(
+                    "adapter_metadata.json is not valid adapter metadata at {}: {e}",
+                    metadata_path.display()
+                ),
+            )
+        })?;
+        if metadata.dataset_hash.trim().is_empty() {
+            return Err(LoraEvolutionError::ValidationFailed(
+                key.to_string(),
+                "adapter_metadata.json must contain dataset_hash".to_string(),
             ));
         }
 
@@ -839,32 +883,47 @@ impl LoraEvolutionServiceImpl {
         mut examples: Vec<TrainingExample>,
         key: &str,
         agent_role: Option<String>,
+        objective: LoraTrainingObjective,
     ) -> Result<LoraAdapter, LoraEvolutionError> {
         examples.sort_by_key(|e| e.created_at);
         self.validate_training_examples(&examples, key)?;
-        let golden_examples = examples
+        let training_examples = examples
             .iter()
-            .filter(|example| self.is_golden_training_example(example))
+            .filter(|example| {
+                self.is_golden_training_example(example)
+                    || (objective.requires_preference_pairs()
+                        && example.accepted_output.is_some()
+                        && example.rejected_output.is_some())
+            })
             .cloned()
             .collect::<Vec<_>>();
-        if golden_examples.len() < self.threshold {
+        validate_objective_examples(&objective, &training_examples)?;
+        if !self.trainer.supports_objective(&objective) {
+            return Err(LoraEvolutionError::Training(
+                LoraTrainingError::UnsupportedObjective {
+                    backend: self.trainer.backend_name().into(),
+                    objective,
+                },
+            ));
+        }
+        if training_examples.len() < self.threshold {
             return Err(LoraEvolutionError::ValidationFailed(
                 key.to_string(),
                 format!(
                     "golden dataset contains only {} usable examples below training threshold {}",
-                    golden_examples.len(),
+                    training_examples.len(),
                     self.threshold
                 ),
             ));
         }
 
-        let validation_count = ((golden_examples.len() as f64
+        let validation_count = ((training_examples.len() as f64
             * self.training_config.validation_ratio)
             .ceil() as usize)
             .max(1)
-            .min(golden_examples.len().saturating_sub(1));
-        let split_index = golden_examples.len() - validation_count;
-        let (train_examples, validation_examples) = golden_examples.split_at(split_index);
+            .min(training_examples.len().saturating_sub(1));
+        let split_index = training_examples.len() - validation_count;
+        let (train_examples, validation_examples) = training_examples.split_at(split_index);
 
         let job_id = Ulid::new().to_string();
         let job_repo = self.training_job_repo.clone();
@@ -872,24 +931,30 @@ impl LoraEvolutionServiceImpl {
             let job = TrainingJob {
                 id: job_id.clone(),
                 task_kind: key.to_string(),
-                status: TrainingJobStatus::Running,
+                status: TrainingJobStatus::Queued,
                 started_at: Utc::now().timestamp_millis(),
                 finished_at: None,
                 adapter_id: None,
-                metrics: serde_json::Value::Null,
+                metrics: serde_json::json!({
+                    "objective": objective.as_str(),
+                    "backend": self.trainer.backend_name(),
+                }),
                 error_message: None,
             };
             repo.insert_training_job(&job).await?;
+            let mut running = job.clone();
+            running.status = TrainingJobStatus::Running;
+            repo.update_training_job(&running).await?;
         }
 
         let output_dir = self.adapters_dir.join(key);
+        let mut training_config = self.training_config.clone();
+        training_config.objective = objective.clone();
+        training_config.role = agent_role.clone();
+        training_config.base_model_id = Some(self.base_model.clone());
         let result = match self
             .trainer
-            .train(
-                train_examples.to_vec(),
-                self.training_config.clone(),
-                &output_dir,
-            )
+            .train(train_examples.to_vec(), training_config, &output_dir)
             .await
         {
             Ok(r) => r,
@@ -1004,6 +1069,22 @@ impl LoraEvolutionServiceImpl {
             .or_else(|| existing.first())
             .map(|adapter| adapter.id.clone());
         let mut metrics = serde_json::to_value(&result.metrics).unwrap_or_default();
+        let adapter_metadata = AdapterMetadata {
+            role: result.metadata.role.clone().or(agent_role.clone()),
+            base_model: if result.metadata.base_model == "unknown" {
+                self.base_model.clone()
+            } else {
+                result.metadata.base_model.clone()
+            },
+            objective: result.metadata.objective.clone(),
+            dataset_hash: result.metadata.dataset_hash.clone(),
+        };
+        if let Some(metrics_object) = metrics.as_object_mut() {
+            metrics_object.insert(
+                "adapter_metadata".into(),
+                serde_json::to_value(&adapter_metadata).unwrap_or_default(),
+            );
+        }
 
         if let Some(gate) = &self.benchmark_gate {
             let decision = gate
@@ -1108,7 +1189,7 @@ impl LoraEvolutionServiceImpl {
             let job = TrainingJob {
                 id: job_id.clone(),
                 task_kind: key.to_string(),
-                status: TrainingJobStatus::Succeeded,
+                status: TrainingJobStatus::Promoted,
                 started_at: Utc::now().timestamp_millis(),
                 finished_at: Some(Utc::now().timestamp_millis()),
                 adapter_id: Some(adapter_id.clone()),
@@ -1234,7 +1315,7 @@ impl LoraEvolutionService for LoraEvolutionServiceImpl {
             .training_example_repo
             .list_training_examples_by_kind(task_kind)
             .await?;
-        self.train_and_register_with_examples(examples, task_kind, None)
+        self.train_and_register_with_examples(examples, task_kind, None, LoraTrainingObjective::Sft)
             .await
     }
 
@@ -1254,8 +1335,32 @@ impl LoraEvolutionService for LoraEvolutionServiceImpl {
             .training_example_repo
             .list_training_examples_by_role(role_str)
             .await?;
-        self.train_and_register_with_examples(examples, role_str, Some(role_str.to_string()))
-            .await
+        self.train_and_register_with_examples(
+            examples,
+            role_str,
+            Some(role_str.to_string()),
+            LoraTrainingObjective::Sft,
+        )
+        .await
+    }
+
+    async fn train_and_register_for_role_objective(
+        &self,
+        role: AgentRole,
+        objective: LoraTrainingObjective,
+    ) -> Result<LoraAdapter, LoraEvolutionError> {
+        let role_str = role.as_str();
+        let examples = self
+            .training_example_repo
+            .list_training_examples_by_role(role_str)
+            .await?;
+        self.train_and_register_with_examples(
+            examples,
+            role_str,
+            Some(role_str.to_string()),
+            objective,
+        )
+        .await
     }
 
     async fn select_lora(
@@ -1979,15 +2084,25 @@ mod tests {
 
     #[async_trait]
     impl LoraTrainer for MockTrainer {
+        fn backend_name(&self) -> &'static str {
+            "mock"
+        }
+
+        fn supports_objective(&self, _objective: &LoraTrainingObjective) -> bool {
+            true
+        }
+
         async fn train(
             &self,
             examples: Vec<TrainingExample>,
-            _config: LoraTrainingConfig,
+            config: LoraTrainingConfig,
             output_dir: &Path,
         ) -> Result<LoraTrainingResult, LoraTrainingError> {
+            validate_objective_examples(&config.objective, &examples)?;
             tokio::fs::create_dir_all(output_dir).await?;
             let average_reward =
                 examples.iter().map(|e| e.reward).sum::<f64>() / examples.len() as f64;
+            let metadata = AdapterMetadata::from_examples(&config, &examples);
             let adapter_path = if self.single_file_layout {
                 let adapter_path = output_dir.join("adapter.safetensors");
                 tokio::fs::write(&adapter_path, vec![b'x'; self.adapter_bytes]).await?;
@@ -2012,6 +2127,12 @@ mod tests {
                     vec![b'x'; self.adapter_bytes],
                 )
                 .await?;
+                tokio::fs::write(
+                    adapter_path.join("adapter_metadata.json"),
+                    serde_json::to_vec_pretty(&metadata)
+                        .map_err(|error| LoraTrainingError::Backend(error.to_string()))?,
+                )
+                .await?;
                 adapter_path
             };
             Ok(LoraTrainingResult {
@@ -2022,6 +2143,7 @@ mod tests {
                     validation_loss: self.validation_loss,
                     average_reward,
                 },
+                metadata,
             })
         }
     }
@@ -2044,6 +2166,14 @@ mod tests {
 
     #[async_trait]
     impl LoraTrainer for RecordingTrainer {
+        fn backend_name(&self) -> &'static str {
+            self.inner.backend_name()
+        }
+
+        fn supports_objective(&self, objective: &LoraTrainingObjective) -> bool {
+            self.inner.supports_objective(objective)
+        }
+
         async fn train(
             &self,
             examples: Vec<TrainingExample>,
@@ -2791,6 +2921,7 @@ mod tests {
             base_model_path: Some(base_model_path.clone()),
             tokenizer_path: None,
             target_modules: vec!["q_proj".into(), "v_proj".into()],
+            ..Default::default()
         });
 
         service.train_and_register("codegen").await.unwrap();
@@ -2862,7 +2993,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].status, TrainingJobStatus::Succeeded);
+        assert_eq!(jobs[0].status, TrainingJobStatus::Promoted);
         assert_eq!(jobs[0].adapter_id, Some(adapter.id));
     }
 

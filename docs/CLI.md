@@ -359,7 +359,11 @@ crytex lora dataset build coder-python --preference --json
 crytex lora dataset inspect coder-python
 crytex lora dataset stats coder-python
 crytex prove lora-dataset --report-path reports\lora-dataset-p8-proof.json
-crytex lora train coder-python --objective preference
+crytex lora train coder-python --objective sft
+crytex lora train coder-python --objective dpo --role coder-python
+crytex lora train coder-python --objective orpo --role coder-python
+crytex lora train coder-python --objective kto --role coder-python
+crytex prove lora-training-objectives --report-path reports\lora-training-objectives-p9-proof.json
 crytex lora benchmark coder-python --include-negative
 crytex lora prove-live coder-python
 crytex lora promote coder-python <adapter-id>
@@ -372,7 +376,9 @@ Current development binary:
 cargo run -p crytex-kernel -- lora dataset build coder-python --preference --json
 cargo run -p crytex-kernel -- lora dataset inspect coder-python --json
 cargo run -p crytex-kernel -- lora dataset stats coder-python --json
+cargo run -p crytex-kernel -- lora train coder-python --objective dpo --role coder-python
 cargo run -p crytex-kernel -- prove-lora-dataset --report-path reports\lora-dataset-p8-proof.json
+cargo run -p crytex-kernel -- prove-lora-training-objectives --report-path reports\lora-training-objectives-p9-proof.json
 ```
 
 LoRA dataset rows preserve role, task kind, prompt version, model id, RAG
@@ -383,7 +389,9 @@ is never used as an SFT target.
 Dataset reports include role scoping, chosen/rejected pair counts, failure-type
 balancing targets, leakage diagnostics, and low-information filtering.
 
-See [LORA_DATASET.md](LORA_DATASET.md) for the module contract.
+See [LORA_DATASET.md](LORA_DATASET.md) and
+[LORA_TRAINING_OBJECTIVES.md](LORA_TRAINING_OBJECTIVES.md) for the module
+contracts.
 
 Production LoRA promotion requires:
 

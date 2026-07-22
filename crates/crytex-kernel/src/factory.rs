@@ -442,15 +442,21 @@ mod tests {
 
     #[async_trait]
     impl LoraTrainer for MockTrainer {
+        fn backend_name(&self) -> &'static str {
+            "factory-mock"
+        }
+
         async fn train(
             &self,
-            _examples: Vec<TrainingExample>,
-            _config: LoraTrainingConfig,
+            examples: Vec<TrainingExample>,
+            config: LoraTrainingConfig,
             output_dir: &Path,
         ) -> Result<LoraTrainingResult, LoraTrainingError> {
             tokio::fs::create_dir_all(output_dir).await?;
             let adapter_path = output_dir.join("candidate");
             tokio::fs::create_dir_all(&adapter_path).await?;
+            let metadata =
+                crytex_core::services::AdapterMetadata::from_examples(&config, &examples);
             tokio::fs::write(
                 adapter_path.join("adapter_config.json"),
                 br#"{"peft_type":"LORA","r":8,"lora_alpha":16}"#,
@@ -461,6 +467,12 @@ mod tests {
                 b"small lora adapter",
             )
             .await?;
+            tokio::fs::write(
+                adapter_path.join("adapter_metadata.json"),
+                serde_json::to_vec_pretty(&metadata)
+                    .map_err(|error| LoraTrainingError::Backend(error.to_string()))?,
+            )
+            .await?;
             Ok(LoraTrainingResult {
                 adapter_id: "candidate".into(),
                 adapter_path,
@@ -469,6 +481,7 @@ mod tests {
                     validation_loss: 0.12,
                     average_reward: 5.0,
                 },
+                metadata,
             })
         }
     }

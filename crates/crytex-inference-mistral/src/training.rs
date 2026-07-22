@@ -8,7 +8,8 @@
 use async_trait::async_trait;
 use crytex_core::models::TrainingExample;
 use crytex_core::services::{
-    LoraMetrics, LoraTrainer, LoraTrainingConfig, LoraTrainingError, LoraTrainingResult,
+    AdapterMetadata, LoraMetrics, LoraTrainer, LoraTrainingConfig, LoraTrainingError,
+    LoraTrainingObjective, LoraTrainingResult, validate_objective_examples,
 };
 use safetensors::tensor::{TensorView, serialize_to_file};
 use std::collections::HashMap;
@@ -36,15 +37,24 @@ impl Default for MockLoraTrainer {
 
 #[async_trait]
 impl LoraTrainer for MockLoraTrainer {
+    fn backend_name(&self) -> &'static str {
+        "mistral-mock"
+    }
+
+    fn supports_objective(&self, _objective: &LoraTrainingObjective) -> bool {
+        true
+    }
+
     async fn train(
         &self,
         examples: Vec<TrainingExample>,
-        _config: LoraTrainingConfig,
+        config: LoraTrainingConfig,
         output_dir: &Path,
     ) -> Result<LoraTrainingResult, LoraTrainingError> {
         if examples.is_empty() {
             return Err(LoraTrainingError::NotEnoughExamples(0, 1));
         }
+        validate_objective_examples(&config.objective, &examples)?;
 
         tokio::fs::create_dir_all(output_dir).await?;
 
@@ -52,7 +62,8 @@ impl LoraTrainer for MockLoraTrainer {
         let adapter_id = format!("mock-lora-{}", Ulid::new());
         let adapter_path = output_dir.join(&adapter_id);
         tokio::fs::create_dir_all(&adapter_path).await?;
-        let base_model = _config
+        let metadata = AdapterMetadata::from_examples(&config, &examples);
+        let base_model = config
             .base_model_path
             .as_ref()
             .map(|path| {
@@ -60,8 +71,9 @@ impl LoraTrainer for MockLoraTrainer {
                     .replace('\\', "\\\\")
                     .replace('"', "\\\"")
             })
+            .or(config.base_model_id.clone())
             .unwrap_or_else(|| "unknown".to_string());
-        let target_modules = _config
+        let target_modules = config
             .target_modules
             .iter()
             .map(|module| format!("\"{}\"", module.replace('"', "\\\"")))
@@ -69,17 +81,24 @@ impl LoraTrainer for MockLoraTrainer {
             .join(",");
         let adapter_config = format!(
             "{{\"peft_type\":\"LORA\",\"base_model_name_or_path\":\"{base_model}\",\"r\":{},\"lora_alpha\":{},\"target_modules\":[{target_modules}]}}",
-            _config.rank, _config.alpha
+            config.rank, config.alpha
         );
         tokio::fs::write(adapter_path.join("adapter_config.json"), adapter_config).await?;
+        tokio::fs::write(
+            adapter_path.join("adapter_metadata.json"),
+            serde_json::to_vec_pretty(&metadata)
+                .map_err(|error| LoraTrainingError::Backend(error.to_string()))?,
+        )
+        .await?;
 
         let data: HashMap<String, TensorView> = HashMap::new();
-        let metadata: HashMap<String, String> = [("format".to_string(), "pt".to_string())]
-            .into_iter()
-            .collect();
+        let safetensors_metadata: HashMap<String, String> =
+            [("format".to_string(), "pt".to_string())]
+                .into_iter()
+                .collect();
         serialize_to_file(
             &data,
-            Some(metadata),
+            Some(safetensors_metadata),
             &adapter_path.join("adapter_model.safetensors"),
         )
         .map_err(|e| LoraTrainingError::AdapterSerialization(e.to_string()))?;
@@ -92,6 +111,7 @@ impl LoraTrainer for MockLoraTrainer {
                 validation_loss: 0.2,
                 average_reward,
             },
+            metadata,
         })
     }
 }
@@ -99,7 +119,7 @@ impl LoraTrainer for MockLoraTrainer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crytex_core::services::LoraTrainingConfig;
+    use crytex_core::services::{LoraTrainingConfig, LoraTrainingObjective};
     use std::path::PathBuf;
 
     fn example(kind: &str, reward: f64) -> TrainingExample {
@@ -149,6 +169,7 @@ mod tests {
                 .join("adapter_model.safetensors")
                 .exists()
         );
+        assert!(result.adapter_path.join("adapter_metadata.json").exists());
 
         let _ = tokio::fs::remove_dir_all(&output).await;
     }
@@ -172,6 +193,40 @@ mod tests {
             .unwrap();
 
         assert!((result.metrics.average_reward - 4.5).abs() < 0.001);
+
+        let _ = tokio::fs::remove_dir_all(&output).await;
+    }
+
+    #[tokio::test]
+    async fn mock_training_supports_preference_objective() {
+        let trainer = MockLoraTrainer::new();
+        let output = PathBuf::from(format!(
+            "{}/mock-train-preference",
+            std::env::temp_dir().to_string_lossy()
+        ));
+        let _ = tokio::fs::remove_dir_all(&output).await;
+        let mut first = example("codegen", 4.0);
+        first.agent_role = Some("coder-python".into());
+        first.rejected_output = Some("bad code".into());
+
+        let result = trainer
+            .train(
+                vec![first],
+                LoraTrainingConfig {
+                    objective: LoraTrainingObjective::Dpo,
+                    role: Some("coder-python".into()),
+                    base_model_id: Some("mistral-7b".into()),
+                    ..Default::default()
+                },
+                &output,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.metadata.objective, LoraTrainingObjective::Dpo);
+        assert_eq!(result.metadata.role.as_deref(), Some("coder-python"));
+        assert_eq!(result.metadata.base_model, "mistral-7b");
+        assert!(result.metadata.dataset_hash.starts_with("fnv1a64:"));
 
         let _ = tokio::fs::remove_dir_all(&output).await;
     }

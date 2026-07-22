@@ -1,0 +1,38 @@
+{
+  "passed": true,
+  "supported_objectives": [
+    "sft",
+    "dpo",
+    "orpo",
+    "kto"
+  ],
+  "unsupported": {
+    "backend": "kernel-sft-only",
+    "objective": "dpo",
+    "error": "training objective dpo is unsupported by backend kernel-sft-only"
+  },
+  "adapter_metadata": {
+    "role": "coder-python",
+    "base_model": "mistral-7b",
+    "objective": "dpo",
+    "dataset_hash": "fnv1a64:28a43fdf2c0b4c49"
+  },
+  "job_states": [
+    "queued",
+    "running",
+    "failed",
+    "promoted",
+    "rolled_back"
+  ],
+  "artifact_validation": {
+    "valid_adapter_dir": true,
+    "invalid_adapter_dir_error": "validation failed: adapter artifact is missing adapter_config.json"
+  },
+  "evidence": {
+    "trainer_trait_is_objective_aware": true,
+    "preference_objectives_require_chosen_rejected_pairs": true,
+    "adapter_metadata_contains_role_base_model_objective_dataset_hash": true,
+    "deterministic_mock_preference_trainer": true,
+    "real_candle_trainer_supports_sft_and_typed_unsupported_for_preference": true
+  }
+}

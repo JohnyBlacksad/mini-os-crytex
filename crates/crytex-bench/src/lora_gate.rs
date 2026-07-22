@@ -724,15 +724,21 @@ mod tests {
 
     #[async_trait]
     impl LoraTrainer for DeterministicTrainer {
+        fn backend_name(&self) -> &'static str {
+            "bench-deterministic"
+        }
+
         async fn train(
             &self,
             examples: Vec<TrainingExample>,
-            _config: LoraTrainingConfig,
+            config: LoraTrainingConfig,
             output_dir: &Path,
         ) -> Result<LoraTrainingResult, LoraTrainingError> {
             tokio::fs::create_dir_all(output_dir).await?;
             let adapter_path = output_dir.join("candidate");
             tokio::fs::create_dir_all(&adapter_path).await?;
+            let metadata =
+                crytex_core::services::AdapterMetadata::from_examples(&config, &examples);
             tokio::fs::write(
                 adapter_path.join("adapter_config.json"),
                 serde_json::json!({
@@ -750,6 +756,12 @@ mod tests {
                 b"deterministic adapter",
             )
             .await?;
+            tokio::fs::write(
+                adapter_path.join("adapter_metadata.json"),
+                serde_json::to_vec_pretty(&metadata)
+                    .map_err(|error| LoraTrainingError::Backend(error.to_string()))?,
+            )
+            .await?;
             let average_reward =
                 examples.iter().map(|example| example.reward).sum::<f64>() / examples.len() as f64;
             Ok(LoraTrainingResult {
@@ -760,6 +772,7 @@ mod tests {
                     validation_loss: 0.11,
                     average_reward,
                 },
+                metadata,
             })
         }
     }
@@ -1114,7 +1127,7 @@ mod tests {
                 .any(|run| run.name.starts_with("codegen challenger") && run.pass_rate == 1.0)
         );
         assert_eq!(training_jobs.len(), 1);
-        assert_eq!(training_jobs[0].status, TrainingJobStatus::Succeeded);
+        assert_eq!(training_jobs[0].status, TrainingJobStatus::Promoted);
         assert_eq!(training_jobs[0].adapter_id.as_deref(), Some("codegen-v2"));
         assert_eq!(
             promoted.metrics["benchmark_gate"]["accepted"],

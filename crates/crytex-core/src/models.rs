@@ -256,9 +256,11 @@ pub struct ProjectSnapshot {
 /// Status of a LoRA adapter training job.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TrainingJobStatus {
+    Queued,
     Pending,
     Running,
     Succeeded,
+    Promoted,
     Failed,
     RolledBack,
 }
@@ -266,9 +268,11 @@ pub enum TrainingJobStatus {
 impl TrainingJobStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
+            TrainingJobStatus::Queued => "queued",
             TrainingJobStatus::Pending => "pending",
             TrainingJobStatus::Running => "running",
             TrainingJobStatus::Succeeded => "succeeded",
+            TrainingJobStatus::Promoted => "promoted",
             TrainingJobStatus::Failed => "failed",
             TrainingJobStatus::RolledBack => "rolled_back",
         }
@@ -286,9 +290,11 @@ impl std::str::FromStr for TrainingJobStatus {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
+            "queued" => Ok(TrainingJobStatus::Queued),
             "pending" => Ok(TrainingJobStatus::Pending),
             "running" => Ok(TrainingJobStatus::Running),
             "succeeded" => Ok(TrainingJobStatus::Succeeded),
+            "promoted" => Ok(TrainingJobStatus::Promoted),
             "failed" => Ok(TrainingJobStatus::Failed),
             "rolled_back" => Ok(TrainingJobStatus::RolledBack),
             other => Err(format!("unknown training job status: {other}")),

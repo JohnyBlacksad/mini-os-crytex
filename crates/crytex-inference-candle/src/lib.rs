@@ -15,7 +15,8 @@ use candle_core::{DType, Device, IndexOp, Result as CandleResult, Tensor};
 use candle_nn::{AdamW, Optimizer, ParamsAdamW, VarBuilder, loss};
 use crytex_core::models::TrainingExample;
 use crytex_core::services::{
-    LoraMetrics, LoraTrainer, LoraTrainingConfig, LoraTrainingError, LoraTrainingResult,
+    AdapterMetadata, LoraMetrics, LoraTrainer, LoraTrainingConfig, LoraTrainingError,
+    LoraTrainingObjective, LoraTrainingResult, validate_objective_examples,
 };
 use serde::Serialize;
 use tracing::{debug, info};
@@ -230,6 +231,7 @@ async fn prove_real_model_lora_learning_once(
                 base_model_path: Some(model_dir.to_path_buf()),
                 tokenizer_path: tokenizer_path.is_file().then_some(tokenizer_path),
                 target_modules: vec!["lm_head".into()],
+                ..Default::default()
             },
             &adapter_dir,
         )
@@ -517,12 +519,27 @@ pub struct GgufLoraQualityRequest<'a> {
 
 #[async_trait]
 impl LoraTrainer for CandleLoraTrainer {
+    fn backend_name(&self) -> &'static str {
+        "candle"
+    }
+
+    fn supports_objective(&self, objective: &LoraTrainingObjective) -> bool {
+        objective == &LoraTrainingObjective::Sft
+    }
+
     async fn train(
         &self,
         examples: Vec<TrainingExample>,
         config: LoraTrainingConfig,
         output_dir: &Path,
     ) -> Result<LoraTrainingResult, LoraTrainingError> {
+        validate_objective_examples(&config.objective, &examples)?;
+        if !self.supports_objective(&config.objective) {
+            return Err(LoraTrainingError::UnsupportedObjective {
+                backend: self.backend_name().into(),
+                objective: config.objective,
+            });
+        }
         if examples.len() < MIN_EXAMPLES {
             return Err(LoraTrainingError::NotEnoughExamples(
                 examples.len(),
@@ -675,6 +692,7 @@ impl LoraTrainer for CandleLoraTrainer {
         let adapter_id = format!("candle-lora-{}", Ulid::new());
         let adapter_path = output_dir.join(&adapter_id);
         tokio::fs::create_dir_all(&adapter_path).await?;
+        let metadata = AdapterMetadata::from_examples(&config, &train);
 
         let tensors = adapter_tensors_for_runtime(&model, &base_initialization);
         candle_core::safetensors::save(&tensors, adapter_path.join("adapter_model.safetensors"))
@@ -685,6 +703,12 @@ impl LoraTrainer for CandleLoraTrainer {
             &adapter_config,
             &base_initialization,
             &training_proof,
+        )
+        .await?;
+        tokio::fs::write(
+            adapter_path.join("adapter_metadata.json"),
+            serde_json::to_vec_pretty(&metadata)
+                .map_err(|error| LoraTrainingError::Backend(error.to_string()))?,
         )
         .await?;
 
@@ -698,6 +722,7 @@ impl LoraTrainer for CandleLoraTrainer {
                 validation_loss: val_loss,
                 average_reward,
             },
+            metadata,
         })
     }
 }

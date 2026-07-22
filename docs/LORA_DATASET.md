@@ -77,6 +77,7 @@ cargo run -p crytex-kernel -- lora dataset build coder-python --preference --jso
 cargo run -p crytex-kernel -- lora dataset inspect coder-python --json
 cargo run -p crytex-kernel -- lora dataset stats coder-python --json
 cargo run -p crytex-kernel -- prove-lora-dataset --report-path reports\lora-dataset-p8-proof.json
+cargo run -p crytex-kernel -- prove-lora-training-objectives --report-path reports\lora-training-objectives-p9-proof.json
 ```
 
 ## Proof
@@ -89,3 +90,6 @@ cargo run -p crytex-kernel -- prove-lora-dataset --report-path reports\lora-data
 - failure-type balancing is calculated;
 - leakage is detected;
 - low-information rows are reported.
+
+The dataset is consumed by objective-aware trainers described in
+[LORA_TRAINING_OBJECTIVES.md](LORA_TRAINING_OBJECTIVES.md).

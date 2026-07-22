@@ -23,6 +23,7 @@ pub fn is_proof_command(command: &Commands) -> bool {
             | Commands::ProveRoleQualityContracts { .. }
             | Commands::ProvePromptEvolution { .. }
             | Commands::ProveLoraDataset { .. }
+            | Commands::ProveLoraTrainingObjectives { .. }
             | Commands::BackendAcceptance { .. }
     )
 }
@@ -109,6 +110,13 @@ mod tests {
     #[test]
     fn lora_dataset_is_proof_only() {
         let command = Commands::ProveLoraDataset { report_path: None };
+
+        assert!(is_proof_command(&command));
+    }
+
+    #[test]
+    fn lora_training_objectives_is_proof_only() {
+        let command = Commands::ProveLoraTrainingObjectives { report_path: None };
 
         assert!(is_proof_command(&command));
     }

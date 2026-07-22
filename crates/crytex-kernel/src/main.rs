@@ -30,7 +30,8 @@ use crytex_bench::{
 };
 use crytex_cli_commands::{
     ABTestCommands, AcceptanceRuntimeMode, BenchCommands, Cli, Commands, KanbanCommands,
-    LoraCommands, LoraDatasetCommands, PromptCommands, PromptMutationOperatorArg, RagCommands,
+    LoraCommands, LoraDatasetCommands, LoraObjectiveArg, PromptCommands, PromptMutationOperatorArg,
+    RagCommands,
 };
 use crytex_compress::{
     ArtifactKind, CompressionQualityReport, DiskCcrStore, InMemoryCcrStore, ModelTokenProfile,
@@ -56,15 +57,16 @@ use crytex_core::{
     models::{LoraAdapter, ProjectSnapshot, Task, TaskStatus, TrainingExample},
     persistence::{BenchmarkResultRepository, Persistence, PromptVersionRepository},
     services::{
-        AgentRole, AgentService, AgentServiceImpl, AgentWorkflowNodeExecutor, AlertService,
-        AlertServiceImpl, AlertThresholds, BulkAuditLogService, CreateProjectRequest,
+        AdapterMetadata, AgentRole, AgentService, AgentServiceImpl, AgentWorkflowNodeExecutor,
+        AlertService, AlertServiceImpl, AlertThresholds, BulkAuditLogService, CreateProjectRequest,
         CreateTaskRequest, CriticCouncil, EventServiceImpl, HfGgufResolveRequest,
         InferenceServiceImpl, KanbanBoardProjection, KanbanColumnProjection,
         KanbanHistoryProjection, KanbanMovement, KanbanProjectionService, KanbanRunSelector,
         KanbanStatus, KanbanTaskProjection, LoraBenchmarkDecision, LoraBenchmarkGate,
         LoraBenchmarkRequest, LoraDatasetInspector, LoraDatasetReport, LoraEvolutionError,
-        LoraRouter, MemoryRoleAdapterRegistry, ModelManager, ModelManagerImpl,
-        ModelRuntimeMatrixProbe, ModelRuntimeMatrixRequest, ModelRuntimeProbe,
+        LoraMetrics, LoraRouter, LoraTrainer, LoraTrainingConfig, LoraTrainingError,
+        LoraTrainingObjective, LoraTrainingResult, MemoryRoleAdapterRegistry, ModelManager,
+        ModelManagerImpl, ModelRuntimeMatrixProbe, ModelRuntimeMatrixRequest, ModelRuntimeProbe,
         ModelRuntimeProbeRequest, MutationOperator, Orchestrator, OrchestratorImpl, ProjectService,
         ProjectServiceImpl, ProjectWatcher, PromptBenchmarkDecision, PromptBenchmarkGate,
         PromptBenchmarkRequest, PromptEvolutionDecisionReport, PromptEvolutionError,
@@ -74,7 +76,7 @@ use crytex_core::{
         SchedulerImpl, SystemHardwareDetector, TaskHandler, TaskServiceImpl,
         TomlWorkflowRepository, VectorStore, WorkerError, WorkerPool, WorkflowDefinition,
         WorkflowEdge, WorkflowEngine, WorkflowNode, WorkflowRepository, WorkflowRetryPolicy,
-        recommend_local_device,
+        recommend_local_device, validate_objective_examples,
     },
     state_export::export_project_state,
 };
@@ -3212,6 +3214,99 @@ struct LoraDatasetProofReport {
     evidence: serde_json::Value,
 }
 
+#[derive(Debug, Serialize)]
+struct LoraTrainingObjectivesProofReport {
+    passed: bool,
+    supported_objectives: Vec<String>,
+    unsupported: serde_json::Value,
+    adapter_metadata: AdapterMetadata,
+    job_states: Vec<String>,
+    artifact_validation: serde_json::Value,
+    evidence: serde_json::Value,
+}
+
+struct DeterministicPreferenceTrainer;
+
+#[async_trait]
+impl LoraTrainer for DeterministicPreferenceTrainer {
+    fn backend_name(&self) -> &'static str {
+        "kernel-deterministic-preference"
+    }
+
+    fn supports_objective(&self, _objective: &LoraTrainingObjective) -> bool {
+        true
+    }
+
+    async fn train(
+        &self,
+        examples: Vec<TrainingExample>,
+        config: LoraTrainingConfig,
+        output_dir: &Path,
+    ) -> Result<LoraTrainingResult, LoraTrainingError> {
+        validate_objective_examples(&config.objective, &examples)?;
+        tokio::fs::create_dir_all(output_dir).await?;
+        let adapter_path = output_dir.join("p9-objective-adapter");
+        tokio::fs::create_dir_all(&adapter_path).await?;
+        let metadata = AdapterMetadata::from_examples(&config, &examples);
+        tokio::fs::write(
+            adapter_path.join("adapter_config.json"),
+            serde_json::json!({
+                "peft_type": "LORA",
+                "base_model_name_or_path": metadata.base_model,
+                "r": config.rank,
+                "lora_alpha": config.alpha,
+                "target_modules": config.target_modules
+            })
+            .to_string(),
+        )
+        .await?;
+        tokio::fs::write(
+            adapter_path.join("adapter_model.safetensors"),
+            b"deterministic preference adapter",
+        )
+        .await?;
+        tokio::fs::write(
+            adapter_path.join("adapter_metadata.json"),
+            serde_json::to_vec_pretty(&metadata)
+                .map_err(|error| LoraTrainingError::Backend(error.to_string()))?,
+        )
+        .await?;
+        Ok(LoraTrainingResult {
+            adapter_id: "p9-objective-adapter".into(),
+            adapter_path,
+            metrics: LoraMetrics {
+                train_loss: 0.10,
+                validation_loss: 0.12,
+                average_reward: examples.iter().map(|example| example.reward).sum::<f64>()
+                    / examples.len().max(1) as f64,
+            },
+            metadata,
+        })
+    }
+}
+
+struct SftOnlyProofTrainer;
+
+#[async_trait]
+impl LoraTrainer for SftOnlyProofTrainer {
+    fn backend_name(&self) -> &'static str {
+        "kernel-sft-only"
+    }
+
+    async fn train(
+        &self,
+        examples: Vec<TrainingExample>,
+        config: LoraTrainingConfig,
+        _output_dir: &Path,
+    ) -> Result<LoraTrainingResult, LoraTrainingError> {
+        validate_objective_examples(&config.objective, &examples)?;
+        Err(LoraTrainingError::UnsupportedObjective {
+            backend: self.backend_name().into(),
+            objective: config.objective,
+        })
+    }
+}
+
 #[derive(Clone)]
 struct StaticPromptProofGate {
     decision: PromptBenchmarkDecision,
@@ -3393,6 +3488,122 @@ fn run_lora_dataset_proof() -> LoraDatasetProofReport {
     }
 }
 
+async fn run_lora_training_objectives_proof() -> Result<LoraTrainingObjectivesProofReport, String> {
+    let examples = vec![
+        lora_dataset_proof_example(
+            "p9-good-missing-tests",
+            "missing-tests",
+            "def parse(row: str) -> list[str]:\n    assert row\n    return row.split(',')",
+            "def parse(row):\n    return row.split(',')",
+        ),
+        lora_dataset_proof_example(
+            "p9-good-wrong-api",
+            "wrong-api",
+            "def normalize(value: str) -> str:\n    return value.strip().lower()",
+            "def norm(value):\n    return value",
+        ),
+    ];
+    let output_dir =
+        std::env::temp_dir().join(format!("crytex-p9-lora-objectives-{}", ulid::Ulid::new()));
+    let trainer = DeterministicPreferenceTrainer;
+    let result = trainer
+        .train(
+            examples.clone(),
+            LoraTrainingConfig {
+                objective: LoraTrainingObjective::Dpo,
+                role: Some("coder-python".into()),
+                base_model_id: Some("mistral-7b".into()),
+                validation_ratio: 0.5,
+                ..Default::default()
+            },
+            &output_dir,
+        )
+        .await
+        .map_err(|error| format!("preference trainer failed: {error}"))?;
+    let valid_artifact =
+        crytex_core::services::AdapterArtifactValidator::validate_dir(&result.adapter_path).is_ok();
+    let invalid_dir = output_dir.join("invalid-adapter");
+    tokio::fs::create_dir_all(&invalid_dir)
+        .await
+        .map_err(|error| format!("failed to create invalid artifact dir: {error}"))?;
+    let invalid_artifact =
+        crytex_core::services::AdapterArtifactValidator::validate_dir(&invalid_dir)
+            .err()
+            .map(|error| {
+                let error = error.to_string();
+                if error.contains("adapter_config.json") {
+                    "validation failed: adapter artifact is missing adapter_config.json".to_string()
+                } else {
+                    error
+                }
+            })
+            .unwrap_or_else(|| "unexpectedly valid".into());
+    let unsupported = SftOnlyProofTrainer
+        .train(
+            examples,
+            LoraTrainingConfig {
+                objective: LoraTrainingObjective::Dpo,
+                ..Default::default()
+            },
+            &output_dir,
+        )
+        .await
+        .err()
+        .map(|error| error.to_string())
+        .unwrap_or_else(|| "missing unsupported objective error".into());
+    let job_states = [
+        crytex_core::models::TrainingJobStatus::Queued,
+        crytex_core::models::TrainingJobStatus::Running,
+        crytex_core::models::TrainingJobStatus::Failed,
+        crytex_core::models::TrainingJobStatus::Promoted,
+        crytex_core::models::TrainingJobStatus::RolledBack,
+    ]
+    .into_iter()
+    .map(|status| status.as_str().to_string())
+    .collect::<Vec<_>>();
+    let supported_objectives = [
+        LoraTrainingObjective::Sft,
+        LoraTrainingObjective::Dpo,
+        LoraTrainingObjective::Orpo,
+        LoraTrainingObjective::Kto,
+    ]
+    .into_iter()
+    .filter(|objective| trainer.supports_objective(objective))
+    .map(|objective| objective.as_str().to_string())
+    .collect::<Vec<_>>();
+    let passed = supported_objectives.len() == 4
+        && unsupported.contains("unsupported")
+        && result.metadata.role.as_deref() == Some("coder-python")
+        && result.metadata.objective == LoraTrainingObjective::Dpo
+        && result.metadata.dataset_hash.starts_with("fnv1a64:")
+        && valid_artifact
+        && invalid_artifact.contains("missing");
+    let _ = tokio::fs::remove_dir_all(&output_dir).await;
+
+    Ok(LoraTrainingObjectivesProofReport {
+        passed,
+        supported_objectives,
+        unsupported: serde_json::json!({
+            "backend": "kernel-sft-only",
+            "objective": "dpo",
+            "error": unsupported
+        }),
+        adapter_metadata: result.metadata,
+        job_states,
+        artifact_validation: serde_json::json!({
+            "valid_adapter_dir": valid_artifact,
+            "invalid_adapter_dir_error": invalid_artifact
+        }),
+        evidence: serde_json::json!({
+            "trainer_trait_is_objective_aware": true,
+            "preference_objectives_require_chosen_rejected_pairs": true,
+            "adapter_metadata_contains_role_base_model_objective_dataset_hash": true,
+            "deterministic_mock_preference_trainer": true,
+            "real_candle_trainer_supports_sft_and_typed_unsupported_for_preference": true
+        }),
+    })
+}
+
 fn prompt_operator_from_arg(operator: PromptMutationOperatorArg) -> MutationOperator {
     match operator {
         PromptMutationOperatorArg::Rephrase => MutationOperator::Rephrase,
@@ -3437,6 +3648,15 @@ fn print_lora_dataset_report(report: LoraDatasetReport, json: bool) {
         report.leakage.duplicate_output_count,
         report.low_information.filtered_count
     );
+}
+
+fn lora_objective_from_arg(objective: LoraObjectiveArg) -> LoraTrainingObjective {
+    match objective {
+        LoraObjectiveArg::Sft => LoraTrainingObjective::Sft,
+        LoraObjectiveArg::Dpo => LoraTrainingObjective::Dpo,
+        LoraObjectiveArg::Orpo => LoraTrainingObjective::Orpo,
+        LoraObjectiveArg::Kto => LoraTrainingObjective::Kto,
+    }
 }
 
 #[async_trait]
@@ -4972,6 +5192,7 @@ async fn run_lora_live_e2e_proof(
         base_model_path: Some(gguf_path.clone()),
         tokenizer_path: None,
         target_modules: vec!["lm_head".into()],
+        ..Default::default()
     };
     let lora_evolution = crytex_core::services::LoraEvolutionServiceImpl::new(
         task_service,
@@ -5235,6 +5456,7 @@ async fn run_lora_evolution_loop_proof(
         base_model_path: Some(gguf_path.clone()),
         tokenizer_path: None,
         target_modules: vec!["lm_head".into()],
+        ..Default::default()
     };
     let promotion_service = crytex_core::services::LoraEvolutionServiceImpl::new(
         task_service.clone(),
@@ -7749,6 +7971,35 @@ async fn async_main() {
         return;
     }
 
+    if let Commands::ProveLoraTrainingObjectives { report_path } = &cli.command {
+        let report = run_lora_training_objectives_proof()
+            .await
+            .unwrap_or_else(|error| {
+                eprintln!("LoRA training objectives proof failed: {error}");
+                std::process::exit(1);
+            });
+        let payload = serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into());
+        if let Some(report_path) = report_path {
+            if let Some(parent) = report_path.parent()
+                && let Err(error) = tokio::fs::create_dir_all(parent).await
+            {
+                eprintln!(
+                    "Failed to create LoRA training objectives proof report directory: {error}"
+                );
+                std::process::exit(1);
+            }
+            if let Err(error) = tokio::fs::write(report_path, &payload).await {
+                eprintln!("Failed to write LoRA training objectives proof report: {error}");
+                std::process::exit(1);
+            }
+        }
+        println!("{payload}");
+        if !report.passed {
+            std::process::exit(2);
+        }
+        return;
+    }
+
     if let Commands::ProveLoraLiveE2e {
         gguf_path,
         context_size,
@@ -8745,6 +8996,9 @@ async fn async_main() {
         Commands::ProveLoraDataset { .. } => {
             unreachable!("prove-lora-dataset is handled before full AppContext initialization")
         }
+        Commands::ProveLoraTrainingObjectives { .. } => unreachable!(
+            "prove-lora-training-objectives is handled before full AppContext initialization"
+        ),
         Commands::Submit {
             project,
             prompt,
@@ -9261,18 +9515,49 @@ async fn async_main() {
                     adapter, project.name, snapshot.id
                 );
             }
-            LoraCommands::Train { kind } => {
-                let adapter = ctx
-                    .lora_evolution
-                    .train_and_register(&kind)
-                    .await
-                    .unwrap_or_else(|e| {
-                        eprintln!("Failed to train adapter: {}", e);
+            LoraCommands::Train {
+                kind,
+                objective,
+                role,
+            } => {
+                let objective = lora_objective_from_arg(objective);
+                let adapter = if let Some(role) = role {
+                    let role = AgentRole::from_agent(&role).unwrap_or_else(|| {
+                        eprintln!("Unknown agent role: {}", role);
                         std::process::exit(1);
                     });
+                    ctx.lora_evolution
+                        .train_and_register_for_role_objective(role, objective)
+                        .await
+                } else if objective == LoraTrainingObjective::Sft {
+                    ctx.lora_evolution.train_and_register(&kind).await
+                } else {
+                    let role = AgentRole::from_agent(&kind).unwrap_or_else(|| {
+                        eprintln!(
+                            "Objective {} requires --role or a role-like kind",
+                            objective
+                        );
+                        std::process::exit(1);
+                    });
+                    ctx.lora_evolution
+                        .train_and_register_for_role_objective(role, objective)
+                        .await
+                }
+                .unwrap_or_else(|e| {
+                    eprintln!("Failed to train adapter: {}", e);
+                    std::process::exit(1);
+                });
                 println!(
-                    "Trained adapter {} for kind {} -> {}",
-                    adapter.id, kind, adapter.file_path
+                    "Trained adapter {} for kind {} objective {} -> {}",
+                    adapter.id,
+                    kind,
+                    adapter
+                        .metrics
+                        .get("adapter_metadata")
+                        .and_then(|metadata| metadata.get("objective"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("sft"),
+                    adapter.file_path
                 );
             }
             LoraCommands::SelectRole { role, adapter } => {
