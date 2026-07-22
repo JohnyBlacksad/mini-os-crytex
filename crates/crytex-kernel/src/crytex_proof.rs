@@ -21,6 +21,7 @@ pub fn is_proof_command(command: &Commands) -> bool {
             | Commands::ProveKanbanProjection { .. }
             | Commands::ProveTokenEconomy { .. }
             | Commands::ProveRoleQualityContracts { .. }
+            | Commands::ProvePromptEvolution { .. }
             | Commands::BackendAcceptance { .. }
     )
 }
@@ -93,6 +94,13 @@ mod tests {
     #[test]
     fn role_quality_contracts_is_proof_only() {
         let command = Commands::ProveRoleQualityContracts { report_path: None };
+
+        assert!(is_proof_command(&command));
+    }
+
+    #[test]
+    fn prompt_evolution_is_proof_only() {
+        let command = Commands::ProvePromptEvolution { report_path: None };
 
         assert!(is_proof_command(&command));
     }

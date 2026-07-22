@@ -8,6 +8,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::Utc;
 use rand::RngCore;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 use ulid::Ulid;
@@ -28,6 +29,8 @@ pub enum PromptEvolutionError {
     NoActiveBaseline(String),
     #[error("prompt benchmark failed: {0}")]
     BenchmarkFailed(String),
+    #[error("prompt benchmark rejected: {0}")]
+    BenchmarkRejected(String),
 }
 
 /// Input passed to a held-out prompt benchmark gate.
@@ -46,6 +49,88 @@ pub struct PromptBenchmarkDecision {
     pub baseline_score: f64,
     pub challenger_score: f64,
     pub metadata: Value,
+}
+
+/// Stable status of a prompt version in the evolution lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptDecisionKind {
+    Proposed,
+    Promoted,
+    Rejected,
+    RolledBack,
+}
+
+impl PromptDecisionKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Proposed => "proposed",
+            Self::Promoted => "promoted",
+            Self::Rejected => "rejected",
+            Self::RolledBack => "rolled_back",
+        }
+    }
+}
+
+/// Structured proposal returned by `crytex prompts propose`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PromptProposal {
+    pub agent: String,
+    pub baseline_version_id: String,
+    pub challenger: PromptVersion,
+    pub operator: String,
+    pub diagnostics: Value,
+}
+
+/// Auditable benchmark/promotion decision.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PromptEvolutionDecisionReport {
+    pub agent: String,
+    pub baseline_version_id: Option<String>,
+    pub challenger_version_id: String,
+    pub decision_kind: PromptDecisionKind,
+    pub accepted: bool,
+    pub reason: String,
+    pub baseline_score: Option<f64>,
+    pub challenger_score: Option<f64>,
+    pub regression_passed: bool,
+    pub diagnostics: Value,
+}
+
+/// Typed failure classes used before deciding whether prompts or LoRA should improve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptFailureKind {
+    Schema,
+    Format,
+    Quality,
+    Safety,
+    ToolUse,
+    Other,
+}
+
+/// First remediation owner for a failed task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureRoute {
+    PromptEvolution,
+    Lora,
+    Critic,
+}
+
+/// Routes failures to the module that can improve them first.
+pub struct PromptFailureRouter;
+
+impl PromptFailureRouter {
+    pub fn route(kind: PromptFailureKind) -> FailureRoute {
+        match kind {
+            PromptFailureKind::Schema | PromptFailureKind::Format => FailureRoute::PromptEvolution,
+            PromptFailureKind::Quality => FailureRoute::Lora,
+            PromptFailureKind::Safety | PromptFailureKind::ToolUse | PromptFailureKind::Other => {
+                FailureRoute::Critic
+            }
+        }
+    }
 }
 
 /// Evaluates a baseline prompt against a challenger on a held-out benchmark.
@@ -97,6 +182,15 @@ impl MutationOperator {
                 prompt
             ),
             MutationOperator::ChangeTone => format!("[Tone: precise and concise]\n\n{}", prompt),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Rephrase => "rephrase",
+            Self::AddConstraint => "add-constraint",
+            Self::InjectExample => "inject-example",
+            Self::ChangeTone => "change-tone",
         }
     }
 }
@@ -169,6 +263,48 @@ where
 
         self.prompt_repo.insert_prompt_version(&child).await?;
         Ok(child)
+    }
+
+    /// Create a challenger from the active prompt. The challenger is never activated here.
+    pub async fn propose(
+        &self,
+        agent: &str,
+        operator: MutationOperator,
+    ) -> Result<PromptProposal, PromptEvolutionError> {
+        let baseline = self
+            .prompt_repo
+            .get_active_prompt_version(agent)
+            .await?
+            .ok_or_else(|| PromptEvolutionError::NoActiveBaseline(agent.to_string()))?;
+        let mut challenger = self.mutate(&baseline.id, operator).await?;
+        let diagnostics = prompt_decision_diagnostics(
+            PromptDecisionKind::Proposed,
+            agent,
+            Some(&baseline.id),
+            &challenger.id,
+            "challenger created; active baseline retained",
+            None,
+        );
+        challenger.metrics = merge_prompt_metrics(
+            challenger.metrics,
+            prompt_decision_metrics(
+                PromptDecisionKind::Proposed,
+                Some(&baseline.id),
+                &challenger.id,
+                false,
+                "challenger",
+                diagnostics.clone(),
+            ),
+        );
+        self.prompt_repo.update_prompt_version(&challenger).await?;
+
+        Ok(PromptProposal {
+            agent: agent.to_string(),
+            baseline_version_id: baseline.id,
+            challenger,
+            operator: operator.as_str().to_string(),
+            diagnostics,
+        })
     }
 
     /// Run one evolution step: tournament select, mutate, persist.
@@ -263,6 +399,22 @@ where
         challenger_id: &str,
         gate: &dyn PromptBenchmarkGate,
     ) -> Result<PromptBenchmarkDecision, PromptEvolutionError> {
+        let report = self.benchmark_challenger(challenger_id, gate).await?;
+        Ok(PromptBenchmarkDecision {
+            accepted: report.accepted,
+            reason: report.reason,
+            baseline_score: report.baseline_score.unwrap_or_default(),
+            challenger_score: report.challenger_score.unwrap_or_default(),
+            metadata: report.diagnostics,
+        })
+    }
+
+    /// Evaluate a challenger and activate it only if held-out and regression gates pass.
+    pub async fn benchmark_challenger(
+        &self,
+        challenger_id: &str,
+        gate: &dyn PromptBenchmarkGate,
+    ) -> Result<PromptEvolutionDecisionReport, PromptEvolutionError> {
         let challenger = self
             .prompt_repo
             .get_prompt_version(challenger_id)
@@ -282,12 +434,39 @@ where
                 challenger_prompt_version_id: challenger.id.clone(),
             })
             .await?;
-        let decision = enforce_improvement_policy(gate_decision);
+        let decision = enforce_regression_policy(enforce_improvement_policy(gate_decision));
+        let kind = if decision.accepted {
+            PromptDecisionKind::Promoted
+        } else {
+            PromptDecisionKind::Rejected
+        };
+        let regression_passed = regression_passed(&decision.metadata);
+        let diagnostics = prompt_decision_diagnostics(
+            kind,
+            &challenger.agent,
+            Some(&baseline.id),
+            &challenger.id,
+            &decision.reason,
+            Some(&decision.metadata),
+        );
 
         let mut evaluated_challenger = challenger;
         evaluated_challenger.fitness = Some(decision.challenger_score);
         evaluated_challenger.active = false;
-        evaluated_challenger.metrics = prompt_benchmark_metrics(&decision);
+        evaluated_challenger.metrics = merge_prompt_metrics(
+            evaluated_challenger.metrics,
+            merge_prompt_metrics(
+                prompt_benchmark_metrics(&decision),
+                prompt_decision_metrics(
+                    kind,
+                    Some(&baseline.id),
+                    &evaluated_challenger.id,
+                    regression_passed,
+                    kind.as_str(),
+                    diagnostics.clone(),
+                ),
+            ),
+        );
         self.prompt_repo
             .update_prompt_version(&evaluated_challenger)
             .await?;
@@ -302,7 +481,127 @@ where
                 .await?;
         }
 
-        Ok(decision)
+        Ok(PromptEvolutionDecisionReport {
+            agent: evaluated_challenger.agent,
+            baseline_version_id: Some(baseline.id),
+            challenger_version_id: evaluated_challenger.id,
+            decision_kind: kind,
+            accepted: decision.accepted,
+            reason: decision.reason,
+            baseline_score: Some(decision.baseline_score),
+            challenger_score: Some(decision.challenger_score),
+            regression_passed,
+            diagnostics,
+        })
+    }
+
+    /// Promote a version only if a previous benchmark decision accepted it.
+    pub async fn promote(
+        &self,
+        agent: &str,
+        version_id: &str,
+    ) -> Result<PromptEvolutionDecisionReport, PromptEvolutionError> {
+        let version = self
+            .prompt_repo
+            .get_prompt_version(version_id)
+            .await?
+            .ok_or_else(|| PromptEvolutionError::VersionNotFound(version_id.to_string()))?;
+        if version.agent != agent {
+            return Err(PromptEvolutionError::BenchmarkRejected(format!(
+                "prompt {version_id} belongs to agent {}, not {agent}",
+                version.agent
+            )));
+        }
+        if version.metrics["prompt_decision"]["decision"] != "promoted" {
+            return Err(PromptEvolutionError::BenchmarkRejected(
+                "promotion requires an accepted benchmark decision".into(),
+            ));
+        }
+        self.prompt_repo
+            .set_active_prompt_version(version_id, agent)
+            .await?;
+        Ok(PromptEvolutionDecisionReport {
+            agent: agent.to_string(),
+            baseline_version_id: version
+                .metrics
+                .get("prompt_decision")
+                .and_then(|v| v.get("baseline_version_id"))
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+            challenger_version_id: version_id.to_string(),
+            decision_kind: PromptDecisionKind::Promoted,
+            accepted: true,
+            reason: "previous benchmark decision accepted this prompt".into(),
+            baseline_score: version
+                .metrics
+                .get("prompt_benchmark_gate")
+                .and_then(|v| v.get("baseline_score"))
+                .and_then(Value::as_f64),
+            challenger_score: version
+                .metrics
+                .get("prompt_benchmark_gate")
+                .and_then(|v| v.get("challenger_score"))
+                .and_then(Value::as_f64),
+            regression_passed: version.metrics["prompt_decision"]["regression_passed"]
+                .as_bool()
+                .unwrap_or(false),
+            diagnostics: version.metrics["prompt_decision"].clone(),
+        })
+    }
+
+    /// Roll back an agent to an earlier prompt version.
+    pub async fn rollback(
+        &self,
+        agent: &str,
+        target_version_id: &str,
+    ) -> Result<PromptEvolutionDecisionReport, PromptEvolutionError> {
+        let previous = self.prompt_repo.get_active_prompt_version(agent).await?;
+        let mut target = self
+            .prompt_repo
+            .get_prompt_version(target_version_id)
+            .await?
+            .ok_or_else(|| PromptEvolutionError::VersionNotFound(target_version_id.to_string()))?;
+        if target.agent != agent {
+            return Err(PromptEvolutionError::VersionNotFound(format!(
+                "{target_version_id} for agent {agent}"
+            )));
+        }
+        let mut diagnostics = prompt_decision_diagnostics(
+            PromptDecisionKind::RolledBack,
+            agent,
+            previous.as_ref().map(|version| version.id.as_str()),
+            target_version_id,
+            "active prompt rolled back by operator",
+            None,
+        );
+        diagnostics["regression_passed"] = Value::Bool(true);
+        target.metrics = merge_prompt_metrics(
+            target.metrics,
+            prompt_decision_metrics(
+                PromptDecisionKind::RolledBack,
+                previous.as_ref().map(|version| version.id.as_str()),
+                target_version_id,
+                true,
+                PromptDecisionKind::RolledBack.as_str(),
+                diagnostics.clone(),
+            ),
+        );
+        self.prompt_repo.update_prompt_version(&target).await?;
+        self.prompt_repo
+            .set_active_prompt_version(target_version_id, agent)
+            .await?;
+        Ok(PromptEvolutionDecisionReport {
+            agent: agent.to_string(),
+            baseline_version_id: previous.map(|version| version.id),
+            challenger_version_id: target_version_id.to_string(),
+            decision_kind: PromptDecisionKind::RolledBack,
+            accepted: true,
+            reason: "active prompt rolled back by operator".into(),
+            baseline_score: None,
+            challenger_score: target.fitness,
+            regression_passed: true,
+            diagnostics,
+        })
     }
 
     /// Return the active version for an agent, if any.
@@ -352,6 +651,29 @@ fn enforce_improvement_policy(decision: PromptBenchmarkDecision) -> PromptBenchm
     }
 }
 
+fn enforce_regression_policy(decision: PromptBenchmarkDecision) -> PromptBenchmarkDecision {
+    if regression_passed(&decision.metadata) {
+        return decision;
+    }
+
+    PromptBenchmarkDecision {
+        accepted: false,
+        reason: format!(
+            "{}; regression benchmark is required and must pass",
+            decision.reason
+        ),
+        ..decision
+    }
+}
+
+fn regression_passed(metadata: &Value) -> bool {
+    metadata
+        .get("regression")
+        .and_then(|value| value.get("passed"))
+        .and_then(Value::as_bool)
+        == Some(true)
+}
+
 fn prompt_benchmark_metrics(decision: &PromptBenchmarkDecision) -> Value {
     let mut metadata = match decision.metadata.clone() {
         Value::Object(map) => map,
@@ -368,6 +690,58 @@ fn prompt_benchmark_metrics(decision: &PromptBenchmarkDecision) -> Value {
         Value::from(decision.challenger_score),
     );
     serde_json::json!({ "prompt_benchmark_gate": Value::Object(metadata) })
+}
+
+fn prompt_decision_metrics(
+    kind: PromptDecisionKind,
+    baseline_version_id: Option<&str>,
+    challenger_version_id: &str,
+    regression_passed: bool,
+    stage: &str,
+    diagnostics: Value,
+) -> Value {
+    serde_json::json!({
+        "prompt_decision": {
+            "decision": kind.as_str(),
+            "stage": stage,
+            "baseline_version_id": baseline_version_id,
+            "challenger_version_id": challenger_version_id,
+            "regression_passed": regression_passed,
+            "diagnostics": diagnostics
+        }
+    })
+}
+
+fn prompt_decision_diagnostics(
+    kind: PromptDecisionKind,
+    agent: &str,
+    baseline_version_id: Option<&str>,
+    challenger_version_id: &str,
+    reason: &str,
+    gate_metadata: Option<&Value>,
+) -> Value {
+    serde_json::json!({
+        "kind": "prompt_evolution_decision",
+        "decision": kind.as_str(),
+        "agent": agent,
+        "baseline_version_id": baseline_version_id,
+        "challenger_version_id": challenger_version_id,
+        "reason": reason,
+        "regression_passed": gate_metadata.map(regression_passed).unwrap_or(false),
+        "gate_metadata": gate_metadata.cloned().unwrap_or(Value::Null),
+        "timestamp": Utc::now().timestamp_millis()
+    })
+}
+
+fn merge_prompt_metrics(left: Value, right: Value) -> Value {
+    let mut merged = match left {
+        Value::Object(map) => map,
+        _ => serde_json::Map::new(),
+    };
+    if let Value::Object(map) = right {
+        merged.extend(map);
+    }
+    Value::Object(merged)
 }
 
 #[cfg(test)]
@@ -543,6 +917,22 @@ mod tests {
         }
     }
 
+    fn prompt_decision_with_regression(
+        accepted: bool,
+        baseline_score: f64,
+        challenger_score: f64,
+        regression_passed: bool,
+    ) -> PromptBenchmarkDecision {
+        let mut decision = prompt_decision(accepted, baseline_score, challenger_score);
+        decision.metadata["regression"] = serde_json::json!({
+            "suite_id": "prompt-regression-suite",
+            "passed": regression_passed,
+            "required": true,
+            "case_count": 4
+        });
+        decision
+    }
+
     #[tokio::test]
     async fn seed_creates_initial_active_version() {
         let service = make_service();
@@ -685,7 +1075,7 @@ mod tests {
             .await
             .unwrap();
         let gate = StaticPromptGate {
-            decision: prompt_decision(true, 0.40, 0.75),
+            decision: prompt_decision_with_regression(true, 0.40, 0.75, true),
         };
 
         let decision = service
@@ -718,7 +1108,7 @@ mod tests {
             .await
             .unwrap();
         let gate = StaticPromptGate {
-            decision: prompt_decision(false, 0.80, 0.25),
+            decision: prompt_decision_with_regression(false, 0.80, 0.25, true),
         };
 
         let decision = service
@@ -751,7 +1141,7 @@ mod tests {
             .await
             .unwrap();
         let gate = StaticPromptGate {
-            decision: prompt_decision(true, 0.70, 0.70),
+            decision: prompt_decision_with_regression(true, 0.70, 0.70, true),
         };
 
         let decision = service
@@ -763,5 +1153,142 @@ mod tests {
         assert!(!decision.accepted);
         assert_eq!(active.id, baseline.id);
         assert!(decision.reason.contains("no held-out improvement"));
+    }
+
+    #[tokio::test]
+    async fn propose_creates_inactive_challenger_from_active_prompt() {
+        let service = make_service();
+        let baseline = service.seed_agent("coder", "base prompt").await.unwrap();
+
+        let proposal = service
+            .propose("coder", MutationOperator::AddConstraint)
+            .await
+            .unwrap();
+        let active = service.active_version("coder").await.unwrap().unwrap();
+
+        assert_eq!(proposal.baseline_version_id, baseline.id);
+        assert_eq!(proposal.challenger.agent, "coder");
+        assert_eq!(proposal.challenger.parent_id, Some(baseline.id.clone()));
+        assert!(!proposal.challenger.active);
+        assert_eq!(active.id, baseline.id);
+        assert_eq!(
+            proposal.challenger.metrics["prompt_decision"]["stage"],
+            "challenger"
+        );
+    }
+
+    #[tokio::test]
+    async fn benchmark_rejects_challenger_when_regression_suite_is_missing() {
+        let service = make_service();
+        let baseline = service.seed_agent("coder", "base").await.unwrap();
+        let challenger = service
+            .mutate(&baseline.id, MutationOperator::Rephrase)
+            .await
+            .unwrap();
+        let gate = StaticPromptGate {
+            decision: prompt_decision(true, 0.40, 0.90),
+        };
+
+        let decision = service
+            .benchmark_challenger(&challenger.id, &gate)
+            .await
+            .unwrap();
+        let active = service.active_version("coder").await.unwrap().unwrap();
+
+        assert!(!decision.accepted);
+        assert_eq!(active.id, baseline.id);
+        assert_eq!(decision.decision_kind, PromptDecisionKind::Rejected);
+        assert!(decision.reason.contains("regression benchmark is required"));
+    }
+
+    #[tokio::test]
+    async fn benchmark_promotes_only_after_regression_gate_passes_and_records_diagnostics() {
+        let service = make_service();
+        let baseline = service.seed_agent("coder", "base").await.unwrap();
+        let challenger = service
+            .mutate(&baseline.id, MutationOperator::InjectExample)
+            .await
+            .unwrap();
+        let gate = StaticPromptGate {
+            decision: prompt_decision_with_regression(true, 0.40, 0.85, true),
+        };
+
+        let decision = service
+            .benchmark_challenger(&challenger.id, &gate)
+            .await
+            .unwrap();
+        let active = service.active_version("coder").await.unwrap().unwrap();
+        let stored = service
+            .prompt_repo
+            .get_prompt_version(&challenger.id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(decision.accepted);
+        assert_eq!(active.id, challenger.id);
+        assert_eq!(decision.decision_kind, PromptDecisionKind::Promoted);
+        assert_eq!(decision.diagnostics["decision"], "promoted");
+        assert_eq!(
+            stored.metrics["prompt_decision"]["baseline_version_id"],
+            baseline.id
+        );
+        assert_eq!(
+            stored.metrics["prompt_decision"]["regression_passed"],
+            serde_json::Value::Bool(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn rollback_reactivates_target_baseline_and_records_decision() {
+        let service = make_service();
+        let baseline = service.seed_agent("coder", "base").await.unwrap();
+        let challenger = service
+            .mutate(&baseline.id, MutationOperator::ChangeTone)
+            .await
+            .unwrap();
+        let gate = StaticPromptGate {
+            decision: prompt_decision_with_regression(true, 0.40, 0.85, true),
+        };
+        service
+            .benchmark_challenger(&challenger.id, &gate)
+            .await
+            .unwrap();
+
+        let decision = service.rollback("coder", &baseline.id).await.unwrap();
+        let active = service.active_version("coder").await.unwrap().unwrap();
+        let stored_baseline = service
+            .prompt_repo
+            .get_prompt_version(&baseline.id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(active.id, baseline.id);
+        assert_eq!(decision.decision_kind, PromptDecisionKind::RolledBack);
+        assert_eq!(
+            decision.diagnostics["regression_passed"],
+            serde_json::Value::Bool(true)
+        );
+        assert_eq!(
+            stored_baseline.metrics["prompt_decision"]["decision"],
+            "rolled_back"
+        );
+    }
+
+    #[test]
+    fn schema_and_format_failures_route_to_prompt_evolution_before_lora() {
+        assert_eq!(
+            PromptFailureRouter::route(PromptFailureKind::Schema),
+            FailureRoute::PromptEvolution
+        );
+        assert_eq!(
+            PromptFailureRouter::route(PromptFailureKind::Format),
+            FailureRoute::PromptEvolution
+        );
+        assert_eq!(
+            PromptFailureRouter::route(PromptFailureKind::Quality),
+            FailureRoute::Lora
+        );
     }
 }

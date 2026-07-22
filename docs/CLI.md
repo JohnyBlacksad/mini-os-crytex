@@ -319,14 +319,35 @@ state, and unsupported capability reasons.
 Manage role prompts and Prompt Evolution.
 
 ```powershell
-crytex prompts status coder-python --json
-crytex prompts propose coder-python
-crytex prompts benchmark coder-python
-crytex prompts promote coder-python <version-id>
-crytex prompts rollback coder-python
+crytex prompts status --agent coder-python --json
+crytex prompts propose --agent coder-python --operator inject-example --json
+crytex prompts benchmark --agent coder-python --challenger <version-id> --regression-suite fixtures\prompt-regression.jsonl --json
+crytex prompts promote --agent coder-python --version <version-id> --json
+crytex prompts rollback --agent coder-python --to <version-id> --json
+crytex prove prompt-evolution --report-path reports\prompt-evolution-p7-proof.json
 ```
 
-A prompt challenger cannot become active without benchmark evidence.
+A prompt mutation creates an inactive challenger, never a new active prompt.
+Promotion requires an accepted benchmark decision and a passing regression suite.
+Schema and format failures are routed to Prompt Evolution before LoRA because
+they usually mean the role prompt or output contract is wrong, not that the
+adapter needs new weights.
+
+Current development binary:
+
+```powershell
+cargo run -p crytex-kernel -- prompts status --agent coder-python --json
+cargo run -p crytex-kernel -- prompts propose --agent coder-python --operator inject-example --json
+cargo run -p crytex-kernel -- prompts benchmark --agent coder-python --challenger <version-id> --regression-suite fixtures\prompt-regression.jsonl --json
+cargo run -p crytex-kernel -- prompts promote --agent coder-python --version <version-id> --json
+cargo run -p crytex-kernel -- prompts rollback --agent coder-python --to <version-id> --json
+cargo run -p crytex-kernel -- prove-prompt-evolution --report-path reports\prompt-evolution-p7-proof.json
+```
+
+JSON decision output includes `decision_kind`, `accepted`, `reason`,
+`baseline_score`, `challenger_score`, `regression_passed`, and `diagnostics`.
+
+See [PROMPT_EVOLUTION.md](PROMPT_EVOLUTION.md) for the module contract.
 
 ## `lora`
 

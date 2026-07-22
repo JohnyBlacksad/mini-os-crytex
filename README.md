@@ -121,6 +121,9 @@ shared context, CCR artifact offload, token metrics, and quality-loss gates.
 See [docs/ROLE_QUALITY.md](docs/ROLE_QUALITY.md) for per-role prompts,
 artifact contracts, metrics, failure taxonomies, critic feedback, clean-session
 handoff, and role-specific LoRA routing.
+See [docs/PROMPT_EVOLUTION.md](docs/PROMPT_EVOLUTION.md) for prompt challenger
+creation, benchmark-gated promotion, regression requirements, rollback,
+diagnostics, and schema/format failure routing.
 
 Every production command follows these rules:
 
@@ -144,6 +147,7 @@ Token economy now has a deterministic proof command in the development binary:
 ```powershell
 cargo run -p crytex-kernel -- prove-token-economy --report-path reports\token-economy-p4.json
 cargo run -p crytex-kernel -- prove-role-quality-contracts --report-path reports\role-quality-p6-proof.json
+cargo run -p crytex-kernel -- prove-prompt-evolution --report-path reports\prompt-evolution-p7-proof.json
 ```
 
 The token-economy report proves model headroom reservation, shared RAG-context reuse, CCR
@@ -154,6 +158,11 @@ The role-quality report proves every production role has a system prompt,
 output schema, artifact contract, metrics, failure taxonomy, benchmark fixture,
 mocked smoke evidence, structured critic feedback, and role-specific LoRA
 hot-swap handoff evidence.
+
+The prompt-evolution report proves mutation creates an inactive challenger,
+promotion is benchmark-gated, regression benchmark metadata is mandatory,
+prompt decisions are written to diagnostics, rollback restores a previous
+baseline, and schema/format failures route to Prompt Evolution before LoRA.
 
 The production CLI contract is now fixed in code at
 `crates/crytex-kernel/src/cli_contract.rs`. Existing legacy command handlers are

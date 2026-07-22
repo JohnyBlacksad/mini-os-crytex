@@ -112,8 +112,10 @@ pub use orchestrator::{Orchestrator, OrchestratorError, OrchestratorImpl};
 pub use project_service::{CreateProjectRequest, ProjectError, ProjectService, ProjectServiceImpl};
 pub use project_watcher::{ProjectWatcher, WatcherError};
 pub use prompt_evolution::{
-    MutationOperator, PromptBenchmarkDecision, PromptBenchmarkGate, PromptBenchmarkRequest,
-    PromptEvolutionError, PromptEvolutionService,
+    FailureRoute, MutationOperator, PromptBenchmarkDecision, PromptBenchmarkGate,
+    PromptBenchmarkRequest, PromptDecisionKind, PromptEvolutionDecisionReport,
+    PromptEvolutionError, PromptEvolutionService, PromptFailureKind, PromptFailureRouter,
+    PromptProposal,
 };
 pub use rate_limit::{RetryPolicy, RetryRateLimitBackend, TokenBucket};
 pub use reranker::{RerankPassage, RerankResult, Reranker, RerankerError};

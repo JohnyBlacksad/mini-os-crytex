@@ -1,0 +1,101 @@
+{
+  "passed": true,
+  "baseline_version_id": "01KY5PNV4AG5WT8MNVTCCW5C3S",
+  "challenger_version_id": "01KY5PNV4BAY5EFXDHARC86ESK",
+  "rejected_without_regression": {
+    "agent": "coder-python",
+    "baseline_version_id": "01KY5PNV4AG5WT8MNVTCCW5C3S",
+    "challenger_version_id": "01KY5PNV4BAY5EFXDHARC86ESK",
+    "decision_kind": "rejected",
+    "accepted": false,
+    "reason": "deterministic prompt proof challenger improves held-out regression; regression benchmark is required and must pass",
+    "baseline_score": 0.5,
+    "challenger_score": 0.9,
+    "regression_passed": false,
+    "diagnostics": {
+      "kind": "prompt_evolution_decision",
+      "decision": "rejected",
+      "agent": "coder-python",
+      "baseline_version_id": "01KY5PNV4AG5WT8MNVTCCW5C3S",
+      "challenger_version_id": "01KY5PNV4BAY5EFXDHARC86ESK",
+      "reason": "deterministic prompt proof challenger improves held-out regression; regression benchmark is required and must pass",
+      "regression_passed": false,
+      "gate_metadata": {
+        "held_out": true,
+        "baseline_run_id": "prompt-proof-baseline",
+        "challenger_run_id": "prompt-proof-challenger",
+        "regression": {
+          "required": true,
+          "passed": false,
+          "suite_id": "prompt-evolution-p7-proof"
+        }
+      },
+      "timestamp": 1784750468235
+    }
+  },
+  "promoted_with_regression": {
+    "agent": "coder-python",
+    "baseline_version_id": "01KY5PNV4AG5WT8MNVTCCW5C3S",
+    "challenger_version_id": "01KY5PNV4BAY5EFXDHARC86ESK",
+    "decision_kind": "promoted",
+    "accepted": true,
+    "reason": "deterministic prompt proof challenger improves held-out regression",
+    "baseline_score": 0.5,
+    "challenger_score": 0.9,
+    "regression_passed": true,
+    "diagnostics": {
+      "kind": "prompt_evolution_decision",
+      "decision": "promoted",
+      "agent": "coder-python",
+      "baseline_version_id": "01KY5PNV4AG5WT8MNVTCCW5C3S",
+      "challenger_version_id": "01KY5PNV4BAY5EFXDHARC86ESK",
+      "reason": "deterministic prompt proof challenger improves held-out regression",
+      "regression_passed": true,
+      "gate_metadata": {
+        "held_out": true,
+        "baseline_run_id": "prompt-proof-baseline",
+        "challenger_run_id": "prompt-proof-challenger",
+        "regression": {
+          "required": true,
+          "passed": true,
+          "suite_id": "prompt-evolution-p7-proof"
+        }
+      },
+      "timestamp": 1784750468235
+    }
+  },
+  "rollback_decision": {
+    "agent": "coder-python",
+    "baseline_version_id": "01KY5PNV4BAY5EFXDHARC86ESK",
+    "challenger_version_id": "01KY5PNV4AG5WT8MNVTCCW5C3S",
+    "decision_kind": "rolled_back",
+    "accepted": true,
+    "reason": "active prompt rolled back by operator",
+    "baseline_score": null,
+    "challenger_score": null,
+    "regression_passed": true,
+    "diagnostics": {
+      "kind": "prompt_evolution_decision",
+      "decision": "rolled_back",
+      "agent": "coder-python",
+      "baseline_version_id": "01KY5PNV4BAY5EFXDHARC86ESK",
+      "challenger_version_id": "01KY5PNV4AG5WT8MNVTCCW5C3S",
+      "reason": "active prompt rolled back by operator",
+      "regression_passed": true,
+      "gate_metadata": null,
+      "timestamp": 1784750468235
+    }
+  },
+  "failure_routing": {
+    "schema": "prompt_evolution",
+    "format": "prompt_evolution",
+    "quality": "lora"
+  },
+  "evidence": {
+    "mutation_creates_challenger_not_active": true,
+    "benchmark_gate_decides_promotion": true,
+    "regression_benchmark_required": true,
+    "diagnostics_include_prompt_decision": true,
+    "prompt_version_id_must_be_persisted_on_tasks": true
+  }
+}

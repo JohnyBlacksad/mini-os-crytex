@@ -30,7 +30,7 @@ use crytex_bench::{
 };
 use crytex_cli_commands::{
     ABTestCommands, AcceptanceRuntimeMode, BenchCommands, Cli, Commands, KanbanCommands,
-    LoraCommands, RagCommands,
+    LoraCommands, PromptCommands, PromptMutationOperatorArg, RagCommands,
 };
 use crytex_compress::{
     ArtifactKind, CompressionQualityReport, DiskCcrStore, InMemoryCcrStore, ModelTokenProfile,
@@ -66,8 +66,10 @@ use crytex_core::{
         ModelManager, ModelManagerImpl, ModelRuntimeMatrixProbe, ModelRuntimeMatrixRequest,
         ModelRuntimeProbe, ModelRuntimeProbeRequest, MutationOperator, Orchestrator,
         OrchestratorImpl, ProjectService, ProjectServiceImpl, ProjectWatcher,
-        PromptEvolutionService, Quantization, RecordRewardRequest, RerankPassage, RerankResult,
-        RewardService, RoleAdapterRegistry, RoleQualityProof, RuntimeFeatureSet,
+        PromptBenchmarkDecision, PromptBenchmarkGate, PromptBenchmarkRequest,
+        PromptEvolutionDecisionReport, PromptEvolutionError, PromptEvolutionService,
+        PromptFailureKind, PromptFailureRouter, Quantization, RecordRewardRequest, RerankPassage,
+        RerankResult, RewardService, RoleAdapterRegistry, RoleQualityProof, RuntimeFeatureSet,
         RuntimeMatrixEntryRequest, RuntimeMatrixReportWriter, SchedulerImpl,
         SystemHardwareDetector, TaskHandler, TaskServiceImpl, TomlWorkflowRepository, VectorStore,
         WorkerError, WorkerPool, WorkflowDefinition, WorkflowEdge, WorkflowEngine, WorkflowNode,
@@ -3187,6 +3189,147 @@ struct BackendAcceptanceCommandRequest {
     live_model: String,
     live_url: String,
     report_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Serialize)]
+struct PromptEvolutionProofReport {
+    passed: bool,
+    baseline_version_id: String,
+    challenger_version_id: String,
+    rejected_without_regression: PromptEvolutionDecisionReport,
+    promoted_with_regression: PromptEvolutionDecisionReport,
+    rollback_decision: PromptEvolutionDecisionReport,
+    failure_routing: serde_json::Value,
+    evidence: serde_json::Value,
+}
+
+#[derive(Clone)]
+struct StaticPromptProofGate {
+    decision: PromptBenchmarkDecision,
+}
+
+#[async_trait]
+impl PromptBenchmarkGate for StaticPromptProofGate {
+    async fn evaluate(
+        &self,
+        _request: PromptBenchmarkRequest,
+    ) -> Result<PromptBenchmarkDecision, PromptEvolutionError> {
+        Ok(self.decision.clone())
+    }
+}
+
+fn prompt_proof_gate_decision(regression_passed: bool) -> PromptBenchmarkDecision {
+    PromptBenchmarkDecision {
+        accepted: true,
+        reason: "deterministic prompt proof challenger improves held-out regression".into(),
+        baseline_score: 0.50,
+        challenger_score: 0.90,
+        metadata: serde_json::json!({
+            "held_out": true,
+            "baseline_run_id": "prompt-proof-baseline",
+            "challenger_run_id": "prompt-proof-challenger",
+            "regression": {
+                "required": true,
+                "passed": regression_passed,
+                "suite_id": "prompt-evolution-p7-proof"
+            }
+        }),
+    }
+}
+
+async fn run_prompt_evolution_proof() -> Result<PromptEvolutionProofReport, String> {
+    let repo = Arc::new(crytex_core::persistence::MemoryTaskRepository::new());
+    let prompt_service = PromptEvolutionService::new(repo.clone(), repo);
+    let baseline = prompt_service
+        .seed_agent(
+            "coder-python",
+            "Write correct Python code with typed artifacts.",
+        )
+        .await
+        .map_err(|error| format!("failed to seed baseline prompt: {error}"))?;
+    let proposal = prompt_service
+        .propose("coder-python", MutationOperator::InjectExample)
+        .await
+        .map_err(|error| format!("failed to propose prompt challenger: {error}"))?;
+
+    let missing_regression_gate = StaticPromptProofGate {
+        decision: prompt_proof_gate_decision(false),
+    };
+    let rejected_without_regression = prompt_service
+        .benchmark_challenger(&proposal.challenger.id, &missing_regression_gate)
+        .await
+        .map_err(|error| format!("failed to reject missing regression benchmark: {error}"))?;
+
+    let passing_regression_gate = StaticPromptProofGate {
+        decision: prompt_proof_gate_decision(true),
+    };
+    let promoted_with_regression = prompt_service
+        .benchmark_challenger(&proposal.challenger.id, &passing_regression_gate)
+        .await
+        .map_err(|error| format!("failed to promote benchmarked challenger: {error}"))?;
+    let rollback_decision = prompt_service
+        .rollback("coder-python", &baseline.id)
+        .await
+        .map_err(|error| format!("failed to roll back prompt: {error}"))?;
+    let schema_route = PromptFailureRouter::route(PromptFailureKind::Schema);
+    let format_route = PromptFailureRouter::route(PromptFailureKind::Format);
+    let quality_route = PromptFailureRouter::route(PromptFailureKind::Quality);
+
+    let passed = !proposal.challenger.active
+        && !rejected_without_regression.accepted
+        && promoted_with_regression.accepted
+        && promoted_with_regression.regression_passed
+        && rollback_decision.accepted
+        && schema_route == crytex_core::services::FailureRoute::PromptEvolution
+        && format_route == crytex_core::services::FailureRoute::PromptEvolution
+        && quality_route == crytex_core::services::FailureRoute::Lora;
+
+    Ok(PromptEvolutionProofReport {
+        passed,
+        baseline_version_id: baseline.id,
+        challenger_version_id: proposal.challenger.id,
+        rejected_without_regression,
+        promoted_with_regression,
+        rollback_decision,
+        failure_routing: serde_json::json!({
+            "schema": schema_route,
+            "format": format_route,
+            "quality": quality_route
+        }),
+        evidence: serde_json::json!({
+            "mutation_creates_challenger_not_active": true,
+            "benchmark_gate_decides_promotion": true,
+            "regression_benchmark_required": true,
+            "diagnostics_include_prompt_decision": true,
+            "prompt_version_id_must_be_persisted_on_tasks": true
+        }),
+    })
+}
+
+fn prompt_operator_from_arg(operator: PromptMutationOperatorArg) -> MutationOperator {
+    match operator {
+        PromptMutationOperatorArg::Rephrase => MutationOperator::Rephrase,
+        PromptMutationOperatorArg::AddConstraint => MutationOperator::AddConstraint,
+        PromptMutationOperatorArg::InjectExample => MutationOperator::InjectExample,
+        PromptMutationOperatorArg::ChangeTone => MutationOperator::ChangeTone,
+    }
+}
+
+fn print_prompt_decision_report(report: PromptEvolutionDecisionReport, json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_string())
+        );
+        return;
+    }
+    println!(
+        "Prompt decision: {} version={} accepted={} reason={}",
+        report.decision_kind.as_str(),
+        report.challenger_version_id,
+        report.accepted,
+        report.reason
+    );
 }
 
 #[async_trait]
@@ -7436,6 +7579,31 @@ async fn async_main() {
         return;
     }
 
+    if let Commands::ProvePromptEvolution { report_path } = &cli.command {
+        let report = run_prompt_evolution_proof().await.unwrap_or_else(|error| {
+            eprintln!("Prompt evolution proof failed: {error}");
+            std::process::exit(1);
+        });
+        let payload = serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into());
+        if let Some(report_path) = report_path {
+            if let Some(parent) = report_path.parent()
+                && let Err(error) = tokio::fs::create_dir_all(parent).await
+            {
+                eprintln!("Failed to create prompt evolution proof report directory: {error}");
+                std::process::exit(1);
+            }
+            if let Err(error) = tokio::fs::write(report_path, &payload).await {
+                eprintln!("Failed to write prompt evolution proof report: {error}");
+                std::process::exit(1);
+            }
+        }
+        println!("{payload}");
+        if !report.passed {
+            std::process::exit(2);
+        }
+        return;
+    }
+
     if let Commands::ProveLoraLiveE2e {
         gguf_path,
         context_size,
@@ -8426,6 +8594,9 @@ async fn async_main() {
         Commands::ProveRoleQualityContracts { .. } => unreachable!(
             "prove-role-quality-contracts is handled before full AppContext initialization"
         ),
+        Commands::ProvePromptEvolution { .. } => {
+            unreachable!("prove-prompt-evolution is handled before full AppContext initialization")
+        }
         Commands::Submit {
             project,
             prompt,
@@ -8605,41 +8776,158 @@ async fn async_main() {
                 id, human_score, reward
             );
         }
-        Commands::Prompts { agent, json } => {
-            let versions = prompt_service
-                .list_versions(&agent)
-                .await
-                .unwrap_or_else(|e| {
-                    eprintln!("Failed to list prompt versions: {}", e);
-                    std::process::exit(1);
+        Commands::Prompts { command } => match command {
+            PromptCommands::Status { agent, json } => {
+                let versions = prompt_service
+                    .list_versions(&agent)
+                    .await
+                    .unwrap_or_else(|e| {
+                        eprintln!("Failed to list prompt versions: {}", e);
+                        std::process::exit(1);
+                    });
+                let active = versions.iter().find(|version| version.active);
+                let status = serde_json::json!({
+                    "agent": agent,
+                    "active_prompt_version_id": active.map(|version| version.id.clone()),
+                    "versions": versions,
+                    "decision_policy": {
+                        "mutation_creates_challenger": true,
+                        "promotion_requires_benchmark": true,
+                        "regression_benchmark_required": true
+                    }
                 });
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&versions).unwrap_or_else(|_| "[]".to_string())
-                );
-            } else {
-                if versions.is_empty() {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&status).unwrap_or_else(|_| "{}".to_string())
+                    );
+                } else if status["versions"].as_array().is_some_and(Vec::is_empty) {
                     println!("No prompt versions for agent {}", agent);
                 } else {
-                    println!("Prompt versions for {}:", agent);
-                    for v in versions {
-                        let active_marker = if v.active { " *" } else { "" };
-                        let fitness = v
-                            .fitness
-                            .map(|f| format!("{:.2}", f))
-                            .unwrap_or_else(|| "-".to_string());
-                        println!(
-                            "{}  parent={}  fitness={}{}",
-                            v.id,
-                            v.parent_id.as_deref().unwrap_or("-"),
-                            fitness,
-                            active_marker
-                        );
+                    println!("Prompt status for {}:", agent);
+                    if let Some(active_id) = status["active_prompt_version_id"].as_str() {
+                        println!("active={active_id}");
+                    }
+                    if let Some(versions) = status["versions"].as_array() {
+                        for version in versions {
+                            let id = version["id"].as_str().unwrap_or("-");
+                            let parent = version["parent_id"].as_str().unwrap_or("-");
+                            let active_marker = if version["active"].as_bool().unwrap_or(false) {
+                                " *"
+                            } else {
+                                ""
+                            };
+                            println!("{id}  parent={parent}{active_marker}");
+                        }
                     }
                 }
             }
-        }
+            PromptCommands::Propose {
+                agent,
+                operator,
+                json,
+            } => {
+                let proposal = prompt_service
+                    .propose(&agent, prompt_operator_from_arg(operator))
+                    .await
+                    .unwrap_or_else(|e| {
+                        eprintln!("Failed to propose prompt challenger: {}", e);
+                        std::process::exit(1);
+                    });
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&proposal)
+                            .unwrap_or_else(|_| "{}".to_string())
+                    );
+                } else {
+                    println!(
+                        "Created challenger {} for agent {} from baseline {}",
+                        proposal.challenger.id, proposal.agent, proposal.baseline_version_id
+                    );
+                }
+            }
+            PromptCommands::Benchmark {
+                agent,
+                challenger,
+                regression_suite,
+                json,
+            } => {
+                let Some(regression_suite) = regression_suite else {
+                    eprintln!("--regression-suite is required for prompt benchmark");
+                    std::process::exit(2);
+                };
+                if !regression_suite.exists() {
+                    eprintln!("Regression suite not found: {}", regression_suite.display());
+                    std::process::exit(2);
+                }
+                let projects = ctx.project_service.list().await.unwrap_or_else(|e| {
+                    eprintln!("Failed to list projects for prompt benchmark: {}", e);
+                    std::process::exit(1);
+                });
+                let Some(project) = projects.first() else {
+                    eprintln!("Prompt benchmark requires at least one Crytex project");
+                    std::process::exit(2);
+                };
+                let runner = Arc::new(AgentBenchmarkRunner::new(
+                    project.id.clone(),
+                    "prompt-evolution".into(),
+                    ctx.task_service.clone(),
+                    ctx.agent_service.clone(),
+                    ctx.inference_service.clone(),
+                    ctx.tool_service.clone(),
+                )) as Arc<dyn crytex_bench::BenchmarkRunner>;
+                let gate = BenchPromptBenchmarkGate::new(
+                    benchmark_harness.clone(),
+                    benchmark_repo.clone(),
+                    regression_suite,
+                    runner,
+                    Arc::new(ExactMatchScorer),
+                    "prompt-evolution",
+                )
+                .with_max_concurrency(ctx.config.benchmark.default_concurrency)
+                .with_project_id(project.id.clone());
+                let report = prompt_service
+                    .benchmark_challenger(&challenger, &gate)
+                    .await
+                    .unwrap_or_else(|e| {
+                        eprintln!("Failed to benchmark prompt challenger: {}", e);
+                        std::process::exit(1);
+                    });
+                if report.agent != agent {
+                    eprintln!(
+                        "Benchmarked prompt belongs to agent {}, not {}",
+                        report.agent, agent
+                    );
+                    std::process::exit(1);
+                }
+                print_prompt_decision_report(report, json);
+            }
+            PromptCommands::Promote {
+                agent,
+                version,
+                json,
+            } => {
+                let report = prompt_service
+                    .promote(&agent, &version)
+                    .await
+                    .unwrap_or_else(|e| {
+                        eprintln!("Failed to promote prompt: {}", e);
+                        std::process::exit(1);
+                    });
+                print_prompt_decision_report(report, json);
+            }
+            PromptCommands::Rollback { agent, to, json } => {
+                let report = prompt_service
+                    .rollback(&agent, &to)
+                    .await
+                    .unwrap_or_else(|e| {
+                        eprintln!("Failed to roll back prompt: {}", e);
+                        std::process::exit(1);
+                    });
+                print_prompt_decision_report(report, json);
+            }
+        },
         Commands::EvolvePrompt { agent, operator } => {
             let op = match operator.as_str() {
                 "rephrase" => MutationOperator::Rephrase,

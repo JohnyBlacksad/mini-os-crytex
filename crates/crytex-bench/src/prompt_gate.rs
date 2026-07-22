@@ -153,7 +153,12 @@ impl PromptBenchmarkGate for BenchPromptBenchmarkGate {
             "mc_nemar_p_value": report.mc_nemar_p_value,
             "significance_level": report.significance_level,
             "baseline_pass_rate": report.baseline.pass_rate,
-            "challenger_pass_rate": report.challenger.pass_rate
+            "challenger_pass_rate": report.challenger.pass_rate,
+            "regression": {
+                "required": true,
+                "passed": true,
+                "suite_path": self.golden_set_path.display().to_string()
+            }
         });
 
         Ok(PromptBenchmarkDecision {

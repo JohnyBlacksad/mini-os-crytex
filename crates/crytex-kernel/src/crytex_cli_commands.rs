@@ -307,6 +307,11 @@ pub enum Commands {
         #[arg(long)]
         report_path: Option<PathBuf>,
     },
+    /// Prove autonomous prompt evolution with challenger, regression gate, diagnostics, and rollback
+    ProvePromptEvolution {
+        #[arg(long)]
+        report_path: Option<PathBuf>,
+    },
     /// Add or update a managed HuggingFace/local model entry
     AddModel {
         #[arg(short, long)]
@@ -446,12 +451,10 @@ pub enum Commands {
         #[arg(long)]
         comment: Option<String>,
     },
-    /// List prompt versions for an agent
+    /// Manage prompt versions through benchmark-gated evolution
     Prompts {
-        #[arg(short, long)]
-        agent: String,
-        #[arg(long)]
-        json: bool,
+        #[command(subcommand)]
+        command: PromptCommands,
     },
     /// Evolve the active prompt for an agent
     EvolvePrompt {
@@ -503,6 +506,63 @@ pub enum LoraCommands {
     SelectRole { role: String, adapter: String },
     /// List role -> adapter bindings
     ListRoles,
+}
+
+#[derive(Subcommand)]
+pub enum PromptCommands {
+    /// Show active/challenger prompt status for an agent.
+    Status {
+        #[arg(short, long)]
+        agent: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create an inactive challenger prompt from the active baseline.
+    Propose {
+        #[arg(short, long)]
+        agent: String,
+        #[arg(short, long, value_enum, default_value_t = PromptMutationOperatorArg::Rephrase)]
+        operator: PromptMutationOperatorArg,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run the benchmark gate for a challenger. A regression suite is mandatory.
+    Benchmark {
+        #[arg(short, long)]
+        agent: String,
+        #[arg(long)]
+        challenger: String,
+        #[arg(long)]
+        regression_suite: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Activate a prompt only when it already has an accepted benchmark decision.
+    Promote {
+        #[arg(short, long)]
+        agent: String,
+        #[arg(long)]
+        version: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Roll back an agent to an earlier prompt version.
+    Rollback {
+        #[arg(short, long)]
+        agent: String,
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum PromptMutationOperatorArg {
+    Rephrase,
+    AddConstraint,
+    InjectExample,
+    ChangeTone,
 }
 
 #[derive(Subcommand)]
@@ -870,6 +930,126 @@ mod tests {
         assert_eq!(
             report_path,
             Some(PathBuf::from("reports/role-quality-p6.json"))
+        );
+    }
+
+    #[test]
+    fn prompts_group_parses_status_propose_benchmark_promote_and_rollback() {
+        let status = Cli::parse_from([
+            "crytex-kernel",
+            "prompts",
+            "status",
+            "--agent",
+            "coder",
+            "--json",
+        ]);
+        assert!(matches!(
+            status.command,
+            Commands::Prompts {
+                command: PromptCommands::Status { json: true, .. }
+            }
+        ));
+
+        let propose = Cli::parse_from([
+            "crytex-kernel",
+            "prompts",
+            "propose",
+            "--agent",
+            "coder",
+            "--operator",
+            "inject-example",
+            "--json",
+        ]);
+        assert!(matches!(
+            propose.command,
+            Commands::Prompts {
+                command: PromptCommands::Propose {
+                    operator: PromptMutationOperatorArg::InjectExample,
+                    json: true,
+                    ..
+                }
+            }
+        ));
+
+        let benchmark = Cli::parse_from([
+            "crytex-kernel",
+            "prompts",
+            "benchmark",
+            "--agent",
+            "coder",
+            "--challenger",
+            "prompt-v2",
+            "--regression-suite",
+            "fixtures/prompt-regression.jsonl",
+            "--json",
+        ]);
+        assert!(matches!(
+            benchmark.command,
+            Commands::Prompts {
+                command: PromptCommands::Benchmark {
+                    challenger,
+                    regression_suite: Some(_),
+                    json: true,
+                    ..
+                }
+            } if challenger == "prompt-v2"
+        ));
+
+        let promote = Cli::parse_from([
+            "crytex-kernel",
+            "prompts",
+            "promote",
+            "--agent",
+            "coder",
+            "--version",
+            "prompt-v2",
+            "--json",
+        ]);
+        assert!(matches!(
+            promote.command,
+            Commands::Prompts {
+                command: PromptCommands::Promote {
+                    version,
+                    json: true,
+                    ..
+                }
+            } if version == "prompt-v2"
+        ));
+
+        let rollback = Cli::parse_from([
+            "crytex-kernel",
+            "prompts",
+            "rollback",
+            "--agent",
+            "coder",
+            "--to",
+            "prompt-v1",
+            "--json",
+        ]);
+        assert!(matches!(
+            rollback.command,
+            Commands::Prompts {
+                command: PromptCommands::Rollback { to, json: true, .. }
+            } if to == "prompt-v1"
+        ));
+    }
+
+    #[test]
+    fn prompt_evolution_proof_command_parses_report_path() {
+        let cli = Cli::parse_from([
+            "crytex-kernel",
+            "prove-prompt-evolution",
+            "--report-path",
+            "reports/prompt-evolution-p7.json",
+        ]);
+
+        let Commands::ProvePromptEvolution { report_path } = cli.command else {
+            panic!("expected prompt evolution proof command");
+        };
+
+        assert_eq!(
+            report_path,
+            Some(PathBuf::from("reports/prompt-evolution-p7.json"))
         );
     }
 }
