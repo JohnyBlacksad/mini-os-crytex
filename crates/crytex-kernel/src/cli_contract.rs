@@ -83,6 +83,11 @@ pub enum ProductCommand {
         #[command(subcommand)]
         command: ModelsCommand,
     },
+    /// Prove security controls for malicious project and tool inputs.
+    Security {
+        #[command(subcommand)]
+        command: SecurityCommand,
+    },
     /// Manage prompt versions and prompt evolution.
     Prompts {
         #[command(subcommand)]
@@ -280,7 +285,7 @@ pub enum DiagCommand {
         #[arg(long)]
         out: Option<std::path::PathBuf>,
     },
-    RuntimeMatrix {
+    ProbeRuntimeMatrix {
         #[arg(long)]
         model: Option<String>,
     },
@@ -395,8 +400,22 @@ pub enum BenchCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum SandboxCommand {
-    Doctor,
-    Prove,
+    Doctor {
+        #[arg(long)]
+        json: bool,
+    },
+    Prove {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SecurityCommand {
+    Prove {
+        #[arg(long)]
+        malicious_rag_fixture: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -510,6 +529,7 @@ mod tests {
             "review",
             "diag",
             "models",
+            "security",
             "prompts",
             "lora",
             "evolution",
@@ -649,6 +669,7 @@ mod tests {
             "review",
             "diag",
             "models",
+            "security",
             "prompts",
             "lora",
             "evolution",

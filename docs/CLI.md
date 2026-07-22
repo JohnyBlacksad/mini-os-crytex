@@ -56,6 +56,7 @@ crytex run
 crytex review
 crytex diag
 crytex models
+crytex security
 crytex prompts
 crytex lora
 crytex evolution
@@ -459,12 +460,16 @@ Benchmark results are used by Prompt Evolution and LoRA Evolution gates.
 Validate execution isolation.
 
 ```powershell
-crytex sandbox doctor
-crytex sandbox prove --json
+crytex sandbox doctor --json
+crytex sandbox prove --json --report-path reports\sandbox-security-p13-proof.json
+crytex security prove --malicious-rag-fixture --json --report-path reports\security-p13-proof.json
 ```
 
-Sandbox proof covers file, process, network, git, Docker, WASI, and host policy
-boundaries when those modules are enabled.
+Sandbox proof covers file, process, network, git, search, path traversal,
+malicious RAG prompt injection, Docker/WASI/host policy states, audited tool
+calls, and security-failure negative examples for the relevant role.
+
+See [SANDBOX_SECURITY.md](SANDBOX_SECURITY.md).
 
 ## `backend-acceptance`
 

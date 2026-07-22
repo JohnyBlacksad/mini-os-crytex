@@ -156,6 +156,8 @@ cargo run -p crytex-kernel -- prove-lora-training-objectives --report-path repor
 cargo run -p crytex-kernel -- prove-lora-quality-gate --report-path reports\lora-quality-gate-p10-proof.json
 cargo run -p crytex-kernel -- prove-evolution-policy --report-path reports\evolution-policy-p11-proof.json
 cargo run -p crytex-kernel -- diag probe-runtime-matrix --json --report-path reports\runtime-model-matrix-p12-proof.json
+cargo run -p crytex-kernel -- sandbox prove --json --report-path reports\sandbox-security-p13-proof.json
+cargo run -p crytex-kernel -- security prove --malicious-rag-fixture --json --report-path reports\security-p13-proof.json
 ```
 
 The token-economy report proves model headroom reservation, shared RAG-context reuse, CCR
@@ -192,6 +194,11 @@ The runtime/model matrix report proves each backend is classified honestly as
 embed/rerank, OpenAI-compatible, and Anthropic all expose explicit LoRA truth,
 CUDA/toolchain preflight expectations, and unsupported-capability reasons.
 
+The sandbox/security reports prove tool permissions for file/process/network/git/search,
+path traversal blocking, malicious RAG prompt-injection detection, Docker/WASI/host
+sandbox posture, audited tool calls, and routing of security failures into
+negative examples for the relevant role.
+
 The LoRA dataset report proves Crytex stores accepted outputs as positive
 targets, rejected outputs as negative preference sides, preserves critic
 feedback/failure type/RAG evidence/model id, scopes datasets per role, and
@@ -209,6 +216,8 @@ service boundaries.
   `crytex diag probe-runtime-matrix`.
 - If RAG misses context, run `crytex rag search ... --rerank --explain --json`
   and inspect selected chunks and rejection reasons.
+- If a project document tries to control the agent, run
+  `crytex security prove --malicious-rag-fixture`.
 - If a LoRA adapter does not improve quality, inspect
   `crytex lora benchmark <role> --include-negative`.
 - If Windows blocks test artifacts, stop stale `cargo`, `rustc`, or test

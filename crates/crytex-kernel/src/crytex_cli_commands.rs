@@ -53,6 +53,16 @@ pub enum Commands {
         #[command(subcommand)]
         command: DiagCommands,
     },
+    /// Inspect and prove sandbox isolation policy
+    Sandbox {
+        #[command(subcommand)]
+        command: SandboxCommands,
+    },
+    /// Prove security controls against malicious project inputs
+    Security {
+        #[command(subcommand)]
+        command: SecurityCommands,
+    },
     /// List models available from a backend or from the model manager
     ListModels {
         #[arg(short, long)]
@@ -719,6 +729,35 @@ pub enum ModelCommands {
 pub enum DiagCommands {
     /// Probe and explain backend/model support matrix.
     ProbeRuntimeMatrix {
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        report_path: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SandboxCommands {
+    /// Report Docker/WASI/host sandbox backend availability and isolation posture.
+    Doctor {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Prove sandbox permissions, path isolation, and audit coverage.
+    Prove {
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        report_path: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SecurityCommands {
+    /// Prove malicious RAG and tool-use inputs are blocked and routed to learning signals.
+    Prove {
+        #[arg(long)]
+        malicious_rag_fixture: bool,
         #[arg(long)]
         json: bool,
         #[arg(long)]
@@ -1486,6 +1525,59 @@ mod tests {
             cli.command,
             Commands::Diag {
                 command: DiagCommands::ProbeRuntimeMatrix {
+                    json: true,
+                    report_path: Some(_)
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn sandbox_group_parses_doctor_and_prove_contract() {
+        let doctor = Cli::parse_from(["crytex-kernel", "sandbox", "doctor", "--json"]);
+        assert!(matches!(
+            doctor.command,
+            Commands::Sandbox {
+                command: SandboxCommands::Doctor { json: true }
+            }
+        ));
+
+        let prove = Cli::parse_from([
+            "crytex-kernel",
+            "sandbox",
+            "prove",
+            "--json",
+            "--report-path",
+            "reports/sandbox-security-p13-proof.json",
+        ]);
+        assert!(matches!(
+            prove.command,
+            Commands::Sandbox {
+                command: SandboxCommands::Prove {
+                    json: true,
+                    report_path: Some(_)
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn security_prove_parses_malicious_rag_fixture_contract() {
+        let cli = Cli::parse_from([
+            "crytex-kernel",
+            "security",
+            "prove",
+            "--malicious-rag-fixture",
+            "--json",
+            "--report-path",
+            "reports/security-p13-proof.json",
+        ]);
+
+        assert!(matches!(
+            cli.command,
+            Commands::Security {
+                command: SecurityCommands::Prove {
+                    malicious_rag_fixture: true,
                     json: true,
                     report_path: Some(_)
                 }
