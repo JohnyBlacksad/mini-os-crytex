@@ -63,6 +63,7 @@ crytex plan show
 crytex plan approve
 crytex run start
 crytex kanban watch
+crytex kanban show --json
 crytex diag export --run latest --out reports\latest-run.json
 crytex backend-acceptance --full --json --deterministic --report-path reports\backend-acceptance.json
 ```
@@ -113,6 +114,8 @@ backend acceptance harness, runtime modes, JSON artifact, and test profiles.
 See [docs/RAG.md](docs/RAG.md) for the project-brain RAG pipeline, supported
 formats, diagnostics, prompt-injection scanning, incremental reindex, and
 crash-safe rebuild.
+See [docs/KANBAN.md](docs/KANBAN.md) for the backend Kanban projection, canonical
+statuses, task-card schema, movement diagnostics, watch stream, and history.
 See [docs/TOKEN_ECONOMY.md](docs/TOKEN_ECONOMY.md) for headroom planning,
 shared context, CCR artifact offload, token metrics, and quality-loss gates.
 

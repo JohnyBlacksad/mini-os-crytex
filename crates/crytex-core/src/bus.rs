@@ -15,6 +15,14 @@ pub enum Event {
         status: String,
         message: String,
     },
+    TaskMoved {
+        task_id: String,
+        project_id: String,
+        from: Option<String>,
+        to: String,
+        trace_id: String,
+        timestamp: i64,
+    },
     TaskReview {
         task_id: String,
     },

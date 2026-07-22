@@ -519,7 +519,10 @@ CREATE INDEX IF NOT EXISTS idx_ab_test_challenger ON ab_test_reports(challenger_
                     [status.as_str(), &now.to_string(), id],
                 )?;
             }
-            TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled => {
+            TaskStatus::Completed
+            | TaskStatus::Done
+            | TaskStatus::Failed
+            | TaskStatus::Cancelled => {
                 conn.execute(
                     "UPDATE tasks SET status = ?1, finished_at = ?2, result = ?3 WHERE id = ?4",
                     [
@@ -540,7 +543,11 @@ CREATE INDEX IF NOT EXISTS idx_ab_test_challenger ON ab_test_reports(challenger_
                     ],
                 )?;
             }
-            TaskStatus::Backlog | TaskStatus::Pending => {
+            TaskStatus::Backlog
+            | TaskStatus::Ready
+            | TaskStatus::Pending
+            | TaskStatus::Remediation
+            | TaskStatus::Blocked => {
                 conn.execute(
                     "UPDATE tasks SET status = ?1, started_at = NULL, finished_at = NULL, result = NULL WHERE id = ?2",
                     [status.as_str(), id],
@@ -579,7 +586,7 @@ CREATE INDEX IF NOT EXISTS idx_ab_test_challenger ON ab_test_reports(challenger_
         let pending = {
             let conn = self.conn.lock().await;
             let mut stmt = conn.prepare(
-                "SELECT id, project_id, parent_id, title, description, kind, status, assigned_agent, priority, created_at, started_at, finished_at, payload, result, iteration_count, priority_score, critic_score, human_score, prompt_version_id, lora_adapter_id, trace_id FROM tasks WHERE status = 'pending'",
+                "SELECT id, project_id, parent_id, title, description, kind, status, assigned_agent, priority, created_at, started_at, finished_at, payload, result, iteration_count, priority_score, critic_score, human_score, prompt_version_id, lora_adapter_id, trace_id FROM tasks WHERE status IN ('pending', 'ready')",
             )?;
             let mut rows = stmt.query([])?;
             let mut tasks = Vec::new();

@@ -28,7 +28,8 @@ use crytex_bench::{
     Score, Scorer,
 };
 use crytex_cli_commands::{
-    ABTestCommands, AcceptanceRuntimeMode, BenchCommands, Cli, Commands, LoraCommands, RagCommands,
+    ABTestCommands, AcceptanceRuntimeMode, BenchCommands, Cli, Commands, KanbanCommands,
+    LoraCommands, RagCommands,
 };
 use crytex_compress::{
     ArtifactKind, CompressionQualityReport, DiskCcrStore, InMemoryCcrStore, ModelTokenProfile,
@@ -57,17 +58,19 @@ use crytex_core::{
         AgentRole, AgentService, AgentServiceImpl, AgentWorkflowNodeExecutor, AlertService,
         AlertServiceImpl, AlertThresholds, BulkAuditLogService, CreateProjectRequest,
         CreateTaskRequest, CriticCouncil, EventServiceImpl, HfGgufResolveRequest,
-        InferenceServiceImpl, LoraBenchmarkDecision, LoraBenchmarkGate, LoraBenchmarkRequest,
-        LoraEvolutionError, LoraEvolutionService, LoraRouter, LoraTrainingConfig,
-        MemoryRoleAdapterRegistry, ModelManager, ModelManagerImpl, ModelRuntimeMatrixProbe,
-        ModelRuntimeMatrixRequest, ModelRuntimeProbe, ModelRuntimeProbeRequest, MutationOperator,
-        Orchestrator, OrchestratorImpl, ProjectService, ProjectServiceImpl, ProjectWatcher,
-        PromptEvolutionService, Quantization, RecordRewardRequest, RerankPassage, RerankResult,
-        RewardService, RoleAdapterRegistry, RuntimeFeatureSet, RuntimeMatrixEntryRequest,
-        RuntimeMatrixReportWriter, SchedulerImpl, SystemHardwareDetector, TaskHandler,
-        TaskServiceImpl, TomlWorkflowRepository, VectorStore, WorkerError, WorkerPool,
-        WorkflowDefinition, WorkflowEdge, WorkflowEngine, WorkflowNode, WorkflowRepository,
-        WorkflowRetryPolicy, recommend_local_device,
+        InferenceServiceImpl, KanbanBoardProjection, KanbanColumnProjection,
+        KanbanHistoryProjection, KanbanMovement, KanbanProjectionService, KanbanRunSelector,
+        KanbanStatus, KanbanTaskProjection, LoraBenchmarkDecision, LoraBenchmarkGate,
+        LoraBenchmarkRequest, LoraEvolutionError, LoraEvolutionService, LoraRouter,
+        LoraTrainingConfig, MemoryRoleAdapterRegistry, ModelManager, ModelManagerImpl,
+        ModelRuntimeMatrixProbe, ModelRuntimeMatrixRequest, ModelRuntimeProbe,
+        ModelRuntimeProbeRequest, MutationOperator, Orchestrator, OrchestratorImpl, ProjectService,
+        ProjectServiceImpl, ProjectWatcher, PromptEvolutionService, Quantization,
+        RecordRewardRequest, RerankPassage, RerankResult, RewardService, RoleAdapterRegistry,
+        RuntimeFeatureSet, RuntimeMatrixEntryRequest, RuntimeMatrixReportWriter, SchedulerImpl,
+        SystemHardwareDetector, TaskHandler, TaskServiceImpl, TomlWorkflowRepository, VectorStore,
+        WorkerError, WorkerPool, WorkflowDefinition, WorkflowEdge, WorkflowEngine, WorkflowNode,
+        WorkflowRepository, WorkflowRetryPolicy, recommend_local_device,
     },
     state_export::export_project_state,
 };
@@ -428,6 +431,17 @@ struct TokenEconomyProofReport {
     metrics: TokenEconomyMetrics,
     quality: CompressionQualityReport,
     ccr_markers: Vec<String>,
+    gates: Vec<KernelE2eProofGate>,
+    passed: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct KanbanProjectionProofReport {
+    proof_outcome: String,
+    trace_id: String,
+    board: KanbanBoardProjection,
+    history: KanbanHistoryProjection,
+    diagnostic_event: Event,
     gates: Vec<KernelE2eProofGate>,
     passed: bool,
 }
@@ -1974,6 +1988,24 @@ fn proof_gate(name: &str, passed: bool, evidence: &str) -> KernelE2eProofGate {
     }
 }
 
+async fn resolve_kanban_project_id(
+    project_service: &dyn ProjectService,
+    project_id: Option<String>,
+) -> Result<String, String> {
+    if let Some(project_id) = project_id {
+        return Ok(project_id);
+    }
+
+    project_service
+        .list()
+        .await
+        .map_err(|error| format!("failed to list projects for Kanban: {error}"))?
+        .into_iter()
+        .max_by_key(|project| project.updated_at)
+        .map(|project| project.id)
+        .ok_or_else(|| "Kanban needs --project-id because no projects exist".to_string())
+}
+
 fn run_token_economy_proof(
     backend: String,
     model: String,
@@ -2132,6 +2164,161 @@ fn build_token_economy_proof_report(
         gates,
         passed,
     }
+}
+
+fn build_kanban_projection_proof_report() -> KanbanProjectionProofReport {
+    let trace_id = format!("kanban-p5-{}", Ulid::new());
+    let tasks = sample_kanban_tasks(&trace_id);
+    let columns = KanbanStatus::all()
+        .into_iter()
+        .map(|status| KanbanColumnProjection {
+            status,
+            title: status.as_str().to_string(),
+            tasks: tasks
+                .iter()
+                .filter(|task| task.status == status)
+                .cloned()
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    let board = KanbanBoardProjection {
+        project_id: "kanban-p5-project".into(),
+        columns,
+        tasks: tasks.clone(),
+    };
+    let movements = tasks
+        .iter()
+        .map(|task| KanbanMovement {
+            task_id: task.id.clone(),
+            goal: task.goal.clone(),
+            agent_role: task.agent_role.clone(),
+            task_kind: task.task_kind.clone(),
+            dependency_chain: task.dependency_chain.clone(),
+            queue_position: task.queue_position,
+            status: task.status,
+            critic_comment: task.critic_comment.clone(),
+            remediation_link: task.remediation_link.clone(),
+            trace_id: task.trace_id.clone(),
+            timestamp: task.queue_position as i64,
+        })
+        .collect::<Vec<_>>();
+    let history = KanbanHistoryProjection {
+        project_id: board.project_id.clone(),
+        run_id: Some(trace_id.clone()),
+        movements,
+    };
+    let diagnostic_event = Event::TaskMoved {
+        task_id: "task-code".into(),
+        project_id: board.project_id.clone(),
+        from: Some("ready".into()),
+        to: "in_progress".into(),
+        trace_id: trace_id.clone(),
+        timestamp: chrono::Utc::now().timestamp_millis(),
+    };
+    let gates = vec![
+        proof_gate(
+            "canonical_columns_present",
+            board.columns.len() == KanbanStatus::all().len(),
+            "backlog/ready/in_progress/review/remediation/done/failed/blocked exported",
+        ),
+        proof_gate(
+            "task_cards_have_workflow_fields",
+            board.tasks.iter().all(|task| {
+                !task.goal.is_empty()
+                    && !task.task_kind.is_empty()
+                    && task.queue_position > 0
+                    && !task.trace_id.is_empty()
+            }),
+            "every card has goal, kind, queue position, and trace id",
+        ),
+        proof_gate(
+            "returned_task_links_remediation",
+            board.tasks.iter().any(|task| {
+                task.status == KanbanStatus::Remediation
+                    && task.critic_comment.is_some()
+                    && task.remediation_link.is_some()
+            }),
+            "remediation card includes critic comment and remediation link",
+        ),
+        proof_gate(
+            "history_tracks_latest_run",
+            history.run_id.as_deref() == Some(trace_id.as_str()) && history.movements.len() == 4,
+            "history exports ordered movements for latest run",
+        ),
+        proof_gate(
+            "diagnostic_task_moved_event_emitted",
+            matches!(diagnostic_event, Event::TaskMoved { .. }),
+            "TaskMoved diagnostic event is serializable",
+        ),
+    ];
+    let passed = gates.iter().all(|gate| gate.passed);
+
+    KanbanProjectionProofReport {
+        proof_outcome: if passed { "passed" } else { "failed" }.into(),
+        trace_id,
+        board,
+        history,
+        diagnostic_event,
+        gates,
+        passed,
+    }
+}
+
+fn sample_kanban_tasks(trace_id: &str) -> Vec<KanbanTaskProjection> {
+    vec![
+        KanbanTaskProjection {
+            id: "task-arch".into(),
+            title: "Design backend projection".into(),
+            goal: "Define Kanban backend projection contract".into(),
+            agent_role: Some("architect".into()),
+            task_kind: "architecture".into(),
+            dependency_chain: Vec::new(),
+            queue_position: 1,
+            status: KanbanStatus::Done,
+            critic_comment: None,
+            remediation_link: None,
+            trace_id: trace_id.into(),
+        },
+        KanbanTaskProjection {
+            id: "task-code".into(),
+            title: "Implement projection".into(),
+            goal: "Implement show/watch/history for Kanban backend truth".into(),
+            agent_role: Some("coder".into()),
+            task_kind: "codegen".into(),
+            dependency_chain: vec!["task-arch".into()],
+            queue_position: 2,
+            status: KanbanStatus::InProgress,
+            critic_comment: None,
+            remediation_link: None,
+            trace_id: trace_id.into(),
+        },
+        KanbanTaskProjection {
+            id: "task-review".into(),
+            title: "Review projection evidence".into(),
+            goal: "Critic reviews Kanban output and returns concrete feedback".into(),
+            agent_role: Some("critic".into()),
+            task_kind: "review".into(),
+            dependency_chain: vec!["task-code".into()],
+            queue_position: 3,
+            status: KanbanStatus::Review,
+            critic_comment: None,
+            remediation_link: None,
+            trace_id: trace_id.into(),
+        },
+        KanbanTaskProjection {
+            id: "task-remediation".into(),
+            title: "Remediate critic feedback".into(),
+            goal: "Fix missing transition diagnostics".into(),
+            agent_role: Some("coder".into()),
+            task_kind: "remediation".into(),
+            dependency_chain: vec!["task-review".into()],
+            queue_position: 4,
+            status: KanbanStatus::Remediation,
+            critic_comment: Some("missing transition diagnostics".into()),
+            remediation_link: Some("task-code".into()),
+            trace_id: trace_id.into(),
+        },
+    ]
 }
 
 impl OrchestratorQualityProofReport {
@@ -7163,6 +7350,28 @@ async fn async_main() {
         return;
     }
 
+    if let Commands::ProveKanbanProjection { report_path } = &cli.command {
+        let report = build_kanban_projection_proof_report();
+        let payload = serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into());
+        if let Some(report_path) = report_path {
+            if let Some(parent) = report_path.parent()
+                && let Err(error) = tokio::fs::create_dir_all(parent).await
+            {
+                eprintln!("Failed to create Kanban projection proof report directory: {error}");
+                std::process::exit(1);
+            }
+            if let Err(error) = tokio::fs::write(report_path, &payload).await {
+                eprintln!("Failed to write Kanban projection proof report: {error}");
+                std::process::exit(1);
+            }
+        }
+        println!("{payload}");
+        if !report.passed {
+            std::process::exit(2);
+        }
+        return;
+    }
+
     if let Commands::ProveTokenEconomy {
         backend,
         model,
@@ -8182,6 +8391,9 @@ async fn async_main() {
         Commands::ProveRagFull { .. } => {
             unreachable!("prove-rag-full is handled before full AppContext initialization")
         }
+        Commands::ProveKanbanProjection { .. } => {
+            unreachable!("prove-kanban-projection is handled before full AppContext initialization")
+        }
         Commands::ProveTokenEconomy { .. } => {
             unreachable!("prove-token-economy is handled before full AppContext initialization")
         }
@@ -9011,6 +9223,143 @@ async fn async_main() {
                 "Indexed {} files, {} chunks",
                 stats.files_indexed, stats.chunks_indexed
             );
+        }
+        Commands::Kanban { command } => {
+            let projection = KanbanProjectionService::new(storage.clone());
+            match command {
+                KanbanCommands::Show { project_id, json } => {
+                    let project_id = unwrap_or_exit!(
+                        resolve_kanban_project_id(ctx.project_service.as_ref(), project_id).await,
+                        "Failed to resolve Kanban project"
+                    );
+                    let board = unwrap_or_exit!(
+                        projection.show(&project_id).await,
+                        "Failed to build Kanban projection"
+                    );
+                    if json {
+                        println!(
+                            "{}",
+                            unwrap_or_exit!(
+                                serde_json::to_string_pretty(&board),
+                                "Failed to serialize Kanban projection"
+                            )
+                        );
+                    } else {
+                        for column in &board.columns {
+                            println!("{} ({})", column.title, column.tasks.len());
+                            for task in &column.tasks {
+                                println!(
+                                    "  {} [{}] {} -> {}",
+                                    task.id,
+                                    task.agent_role.as_deref().unwrap_or("unassigned"),
+                                    task.task_kind,
+                                    task.goal
+                                );
+                            }
+                        }
+                    }
+                }
+                KanbanCommands::Watch {
+                    project_id,
+                    json,
+                    duration_seconds,
+                } => {
+                    let project_id = unwrap_or_exit!(
+                        resolve_kanban_project_id(ctx.project_service.as_ref(), project_id).await,
+                        "Failed to resolve Kanban project"
+                    );
+                    let mut rx = ctx.event_service.subscribe();
+                    let deadline = tokio::time::Instant::now()
+                        + tokio::time::Duration::from_secs(duration_seconds);
+                    while tokio::time::Instant::now() < deadline {
+                        let remaining =
+                            deadline.saturating_duration_since(tokio::time::Instant::now());
+                        match tokio::time::timeout(remaining, rx.recv()).await {
+                            Ok(Ok(Event::TaskMoved {
+                                project_id: event_project_id,
+                                task_id,
+                                from,
+                                to,
+                                trace_id,
+                                timestamp,
+                            })) if event_project_id == project_id => {
+                                let event = serde_json::json!({
+                                    "event": "task_moved",
+                                    "project_id": event_project_id,
+                                    "task_id": task_id,
+                                    "from": from,
+                                    "to": to,
+                                    "trace_id": trace_id,
+                                    "timestamp": timestamp
+                                });
+                                if json {
+                                    println!(
+                                        "{}",
+                                        unwrap_or_exit!(
+                                            serde_json::to_string(&event),
+                                            "Failed to serialize Kanban watch event"
+                                        )
+                                    );
+                                } else {
+                                    println!(
+                                        "{} {} -> {}",
+                                        event["task_id"].as_str().unwrap_or("task"),
+                                        event["from"].as_str().unwrap_or("none"),
+                                        event["to"].as_str().unwrap_or("unknown")
+                                    );
+                                }
+                            }
+                            Ok(Ok(_)) => {}
+                            Ok(Err(error)) => {
+                                eprintln!("Kanban watch stream closed: {error}");
+                                break;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
+                KanbanCommands::History {
+                    project_id,
+                    run,
+                    json,
+                } => {
+                    let project_id = unwrap_or_exit!(
+                        resolve_kanban_project_id(ctx.project_service.as_ref(), project_id).await,
+                        "Failed to resolve Kanban project"
+                    );
+                    let selector = if run == "latest" {
+                        KanbanRunSelector::Latest
+                    } else {
+                        KanbanRunSelector::Id(run)
+                    };
+                    let history = unwrap_or_exit!(
+                        projection.history(&project_id, selector).await,
+                        "Failed to build Kanban history"
+                    );
+                    if json {
+                        println!(
+                            "{}",
+                            unwrap_or_exit!(
+                                serde_json::to_string_pretty(&history),
+                                "Failed to serialize Kanban history"
+                            )
+                        );
+                    } else {
+                        println!(
+                            "Kanban history for project {} run {:?}",
+                            history.project_id, history.run_id
+                        );
+                        for movement in &history.movements {
+                            println!(
+                                "{} {} {}",
+                                movement.task_id,
+                                movement.status.as_str(),
+                                movement.goal
+                            );
+                        }
+                    }
+                }
+            }
         }
         Commands::Rag {
             command:

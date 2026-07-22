@@ -284,6 +284,11 @@ pub enum Commands {
         #[arg(long)]
         report_path: Option<PathBuf>,
     },
+    /// Prove backend Kanban projection, history, and task movement diagnostics
+    ProveKanbanProjection {
+        #[arg(long)]
+        report_path: Option<PathBuf>,
+    },
     /// Prove token headroom, shared context, CCR offload, and required-fact preservation
     ProveTokenEconomy {
         #[arg(long, default_value = "ollama")]
@@ -397,6 +402,11 @@ pub enum Commands {
         project_id: String,
         #[arg(short, long)]
         path: PathBuf,
+    },
+    /// Show, watch, and inspect backend Kanban task projections
+    Kanban {
+        #[command(subcommand)]
+        command: KanbanCommands,
     },
     /// Search or prove the project RAG brain.
     Rag {
@@ -548,6 +558,35 @@ pub enum ABTestCommands {
         challenger: String,
         #[arg(long, default_value = "0.05")]
         alpha: f64,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum KanbanCommands {
+    /// Show the canonical backend Kanban projection.
+    Show {
+        #[arg(long)]
+        project_id: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stream backend task movement diagnostics as they happen.
+    Watch {
+        #[arg(long)]
+        project_id: Option<String>,
+        #[arg(long)]
+        json: bool,
+        #[arg(long, default_value = "30")]
+        duration_seconds: u64,
+    },
+    /// Show Kanban movement history for a run.
+    History {
+        #[arg(long)]
+        project_id: Option<String>,
+        #[arg(long, default_value = "latest")]
+        run: String,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -709,6 +748,57 @@ mod tests {
     }
 
     #[test]
+    fn kanban_show_watch_and_history_parse_json_contract() {
+        let show = Cli::parse_from(["crytex-kernel", "kanban", "show", "--json"]);
+        assert!(matches!(
+            show.command,
+            Commands::Kanban {
+                command: KanbanCommands::Show { json: true, .. }
+            }
+        ));
+
+        let watch = Cli::parse_from([
+            "crytex-kernel",
+            "kanban",
+            "watch",
+            "--project-id",
+            "project-1",
+            "--json",
+            "--duration-seconds",
+            "1",
+        ]);
+        assert!(matches!(
+            watch.command,
+            Commands::Kanban {
+                command: KanbanCommands::Watch {
+                    json: true,
+                    duration_seconds: 1,
+                    ..
+                }
+            }
+        ));
+
+        let history = Cli::parse_from([
+            "crytex-kernel",
+            "kanban",
+            "history",
+            "--run",
+            "latest",
+            "--json",
+        ]);
+        assert!(matches!(
+            history.command,
+            Commands::Kanban {
+                command: KanbanCommands::History {
+                    run,
+                    json: true,
+                    ..
+                }
+            } if run == "latest"
+        ));
+    }
+
+    #[test]
     fn token_economy_proof_command_parses_backend_model_and_report_path() {
         let cli = Cli::parse_from([
             "crytex-kernel",
@@ -741,5 +831,21 @@ mod tests {
             report_path,
             Some(PathBuf::from("reports/token-economy.json"))
         );
+    }
+
+    #[test]
+    fn kanban_projection_proof_command_parses_report_path() {
+        let cli = Cli::parse_from([
+            "crytex-kernel",
+            "prove-kanban-projection",
+            "--report-path",
+            "reports/kanban-p5.json",
+        ]);
+
+        let Commands::ProveKanbanProjection { report_path } = cli.command else {
+            panic!("expected kanban projection proof command");
+        };
+
+        assert_eq!(report_path, Some(PathBuf::from("reports/kanban-p5.json")));
     }
 }

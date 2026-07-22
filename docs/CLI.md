@@ -211,8 +211,25 @@ crytex kanban watch --status remediation
 crytex kanban history --run latest --status done
 ```
 
+Current development binary:
+
+```powershell
+cargo run -p crytex-kernel -- kanban show --project-id my-project --json
+cargo run -p crytex-kernel -- kanban watch --project-id my-project --json --duration-seconds 30
+cargo run -p crytex-kernel -- kanban history --project-id my-project --run latest --json
+cargo run -p crytex-kernel -- prove-kanban-projection --report-path reports\kanban-p5-proof.json
+```
+
 Each task row includes id, title, goal, assigned role, task kind, dependency
 chain, queue position, current status, critic feedback, and remediation link.
+
+Kanban statuses are fixed as `backlog`, `ready`, `in_progress`, `review`,
+`remediation`, `done`, `failed`, and `blocked`. Legacy persisted `pending`,
+`completed`, and `cancelled` statuses are projected as `ready`, `done`, and
+`blocked`.
+
+See [KANBAN.md](KANBAN.md) for the projection schema, transition diagnostics,
+and CLI watch/history behavior.
 
 ## `run`
 
@@ -378,6 +395,7 @@ crytex prove kernel-e2e --full
 crytex prove hf-model <id> --repo owner/model
 crytex prove hf-runtime-matrix
 crytex prove rag-full
+crytex prove kanban-projection
 crytex prove token-economy
 crytex prove orchestrator-quality
 crytex prove agent-swarm-lora-routing
@@ -479,6 +497,7 @@ crytex prove kernel-e2e
 crytex prove hf-model
 crytex prove hf-runtime-matrix
 crytex prove rag-full
+crytex prove kanban-projection
 crytex prove token-economy
 crytex prove orchestrator-quality
 crytex prove agent-swarm-lora-routing

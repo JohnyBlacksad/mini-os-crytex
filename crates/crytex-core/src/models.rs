@@ -3,11 +3,15 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TaskStatus {
     Backlog,
+    Ready,
     Pending,
     InProgress,
     Review,
+    Remediation,
+    Done,
     Completed,
     Failed,
+    Blocked,
     Cancelled,
 }
 
@@ -15,12 +19,25 @@ impl TaskStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
             TaskStatus::Backlog => "backlog",
+            TaskStatus::Ready => "ready",
             TaskStatus::Pending => "pending",
             TaskStatus::InProgress => "in_progress",
             TaskStatus::Review => "review",
+            TaskStatus::Remediation => "remediation",
+            TaskStatus::Done => "done",
             TaskStatus::Completed => "completed",
             TaskStatus::Failed => "failed",
+            TaskStatus::Blocked => "blocked",
             TaskStatus::Cancelled => "cancelled",
+        }
+    }
+
+    pub fn kanban_status(&self) -> &'static str {
+        match self {
+            TaskStatus::Pending | TaskStatus::Ready => "ready",
+            TaskStatus::Completed | TaskStatus::Done => "done",
+            TaskStatus::Cancelled | TaskStatus::Blocked => "blocked",
+            other => other.as_str(),
         }
     }
 
@@ -28,7 +45,7 @@ impl TaskStatus {
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
-            TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
+            TaskStatus::Completed | TaskStatus::Done | TaskStatus::Failed | TaskStatus::Cancelled
         )
     }
 }
@@ -45,11 +62,16 @@ impl std::str::FromStr for TaskStatus {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "backlog" => Ok(TaskStatus::Backlog),
+            "ready" => Ok(TaskStatus::Ready),
             "pending" => Ok(TaskStatus::Pending),
             "in_progress" => Ok(TaskStatus::InProgress),
+            "in-progress" => Ok(TaskStatus::InProgress),
             "review" => Ok(TaskStatus::Review),
+            "remediation" => Ok(TaskStatus::Remediation),
+            "done" => Ok(TaskStatus::Done),
             "completed" => Ok(TaskStatus::Completed),
             "failed" => Ok(TaskStatus::Failed),
+            "blocked" => Ok(TaskStatus::Blocked),
             "cancelled" => Ok(TaskStatus::Cancelled),
             other => Err(format!("unknown task status: {other}")),
         }

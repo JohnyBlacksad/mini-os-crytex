@@ -16,6 +16,7 @@ pub mod event_service;
 pub mod hardware;
 pub mod hybrid;
 pub mod inference_service;
+pub mod kanban_projection;
 pub mod lora_evolution;
 pub mod lora_router;
 pub mod lora_trainer;
@@ -71,6 +72,11 @@ pub use hybrid::{
     build_fusion_strategy,
 };
 pub use inference_service::{InferenceService, InferenceServiceError, InferenceServiceImpl};
+pub use kanban_projection::{
+    KanbanBoardProjection, KanbanColumnProjection, KanbanHistoryProjection, KanbanMovement,
+    KanbanProjectionError, KanbanProjectionService, KanbanRunSelector, KanbanStatus,
+    KanbanTaskProjection,
+};
 pub use lora_evolution::{
     LoraBenchmarkDecision, LoraBenchmarkGate, LoraBenchmarkRequest, LoraEvolutionError,
     LoraEvolutionService, LoraEvolutionServiceImpl,

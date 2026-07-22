@@ -18,6 +18,7 @@ pub fn is_proof_command(command: &Commands) -> bool {
             | Commands::ProveAgentSwarmLoraRouting { .. }
             | Commands::ProveOrchestratorQualityGate { .. }
             | Commands::ProveRagFull { .. }
+            | Commands::ProveKanbanProjection { .. }
             | Commands::ProveTokenEconomy { .. }
             | Commands::BackendAcceptance { .. }
     )
@@ -77,6 +78,13 @@ mod tests {
             expected_completion_tokens: 512,
             report_path: None,
         };
+
+        assert!(is_proof_command(&command));
+    }
+
+    #[test]
+    fn kanban_projection_is_proof_only() {
+        let command = Commands::ProveKanbanProjection { report_path: None };
 
         assert!(is_proof_command(&command));
     }

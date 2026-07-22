@@ -145,29 +145,63 @@ impl<R> TaskServiceImpl<R> {
         use TaskStatus::*;
         match (from, to) {
             // Backlog is the intake column.
+            (Backlog, Ready) => true,
             (Backlog, Pending) => true,
+            (Backlog, Blocked) => true,
             (Backlog, Cancelled) => true,
 
             // Pending task may start, fail fast, or be cancelled.
+            (Ready, InProgress) => true,
+            (Ready, Backlog) => true,
+            (Ready, Done) => true,
+            (Ready, Completed) => true,
+            (Ready, Failed) => true,
+            (Ready, Blocked) => true,
+            (Ready, Cancelled) => true,
             (Pending, InProgress) => true,
+            (Pending, Ready) => true,
             (Pending, Backlog) => true, // hold generated plan tasks until human approval
+            (Pending, Done) => true,
             (Pending, Completed) => true, // allow immediate completion for trivial tasks
-            (Pending, Failed) => true,  // allow immediate failure for invalid tasks
+            (Pending, Failed) => true,    // allow immediate failure for invalid tasks
+            (Pending, Blocked) => true,
             (Pending, Cancelled) => true,
 
             // Running task can finish, go to review, fail, or be cancelled.
             (InProgress, Review) => true,
+            (InProgress, Done) => true,
             (InProgress, Completed) => true,
+            (InProgress, Remediation) => true,
             (InProgress, Failed) => true,
+            (InProgress, Blocked) => true,
             (InProgress, Cancelled) => true,
 
             // Review can approve, reject (back to pending for retry), or fail.
+            (Review, Done) => true,
             (Review, Completed) => true,
+            (Review, Remediation) => true,
+            (Review, Ready) => true,
             (Review, Pending) => true, // retry after review rejection
             (Review, Failed) => true,
+            (Review, Blocked) => true,
             (Review, Cancelled) => true,
 
+            (Remediation, Ready) => true,
+            (Remediation, Pending) => true,
+            (Remediation, InProgress) => true,
+            (Remediation, Review) => true,
+            (Remediation, Done) => true,
+            (Remediation, Failed) => true,
+            (Remediation, Blocked) => true,
+            (Remediation, Cancelled) => true,
+
+            (Blocked, Ready) => true,
+            (Blocked, Pending) => true,
+            (Blocked, Failed) => true,
+            (Blocked, Cancelled) => true,
+
             // Failed tasks can be retried.
+            (Failed, Ready) => true,
             (Failed, Pending) => true,
             (Failed, Cancelled) => true,
 
@@ -193,12 +227,23 @@ impl<R> TaskServiceImpl<R> {
             })?;
             if !tasks
                 .get(parent_id)
-                .is_none_or(|t| matches!(t.status, TaskStatus::Completed))
+                .is_none_or(|t| matches!(t.status, TaskStatus::Completed | TaskStatus::Done))
             {
                 return Ok(false);
             }
         }
         Ok(true)
+    }
+
+    fn publish_task_moved(&self, task: &Task, from: Option<&TaskStatus>, to: &TaskStatus) {
+        self.event_service.publish(Event::TaskMoved {
+            task_id: task.id.clone(),
+            project_id: task.project_id.clone(),
+            from: from.map(TaskStatus::kanban_status).map(str::to_string),
+            to: to.kanban_status().to_string(),
+            trace_id: task.trace_id.clone(),
+            timestamp: chrono::Utc::now().timestamp_millis(),
+        });
     }
 }
 
@@ -331,7 +376,7 @@ where
 
         let mut ready = Vec::new();
         for (id, task) in tasks.iter() {
-            if !matches!(task.status, TaskStatus::Pending) {
+            if !matches!(task.status, TaskStatus::Pending | TaskStatus::Ready) {
                 continue;
             }
             if Self::all_parents_completed(&graph, &tasks, &node_map, id)? {
@@ -358,15 +403,24 @@ where
             });
         }
 
+        let previous_status = task.status.clone();
         task.status = status.clone();
         match status {
             TaskStatus::InProgress => {
                 task.started_at = Some(chrono::Utc::now().timestamp_millis());
             }
-            TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled => {
+            TaskStatus::Completed
+            | TaskStatus::Done
+            | TaskStatus::Failed
+            | TaskStatus::Cancelled => {
                 task.finished_at = Some(chrono::Utc::now().timestamp_millis());
             }
-            TaskStatus::Backlog | TaskStatus::Pending | TaskStatus::Review => {
+            TaskStatus::Backlog
+            | TaskStatus::Ready
+            | TaskStatus::Pending
+            | TaskStatus::Review
+            | TaskStatus::Remediation
+            | TaskStatus::Blocked => {
                 // Non-terminal statuses do not record a finish time.
             }
         }
@@ -390,7 +444,7 @@ where
                     task_id: id.to_string(),
                 });
             }
-            TaskStatus::Completed => {
+            TaskStatus::Completed | TaskStatus::Done => {
                 self.event_service.publish(Event::TaskCompleted {
                     task_id: id.to_string(),
                     result: result.clone().unwrap_or(Value::Null),
@@ -407,14 +461,19 @@ where
                     task_id: id.to_string(),
                 });
             }
-            TaskStatus::Backlog | TaskStatus::Pending => {
+            TaskStatus::Backlog
+            | TaskStatus::Ready
+            | TaskStatus::Pending
+            | TaskStatus::Remediation
+            | TaskStatus::Blocked => {
                 self.event_service.publish(Event::TaskProgress {
                     task_id: id.to_string(),
-                    status: status.as_str().to_string(),
+                    status: status.kanban_status().to_string(),
                     message: format!("Task moved to {status}"),
                 });
             }
         }
+        self.publish_task_moved(&updated, Some(&previous_status), &status);
 
         let _ = self
             .audit
@@ -495,6 +554,7 @@ where
             .get(id)
             .await?
             .ok_or_else(|| TaskError::NotFound(id.to_string()))?;
+        self.publish_task_moved(&task, Some(&TaskStatus::InProgress), &TaskStatus::Completed);
 
         let _ = self
             .audit
@@ -620,9 +680,10 @@ where
 
         self.event_service.publish(Event::TaskProgress {
             task_id: id.to_string(),
-            status: TaskStatus::Pending.as_str().to_string(),
+            status: TaskStatus::Pending.kanban_status().to_string(),
             message: "retry after feedback".to_string(),
         });
+        self.publish_task_moved(&task, Some(&TaskStatus::Review), &TaskStatus::Pending);
 
         let _ = self
             .audit
@@ -975,6 +1036,7 @@ mod tests {
         assert!(updated.finished_at.is_some());
         let _ = rx.try_recv(); // TaskCreated
         let _ = rx.try_recv(); // TaskStarted
+        assert!(matches!(rx.try_recv(), Ok(Event::TaskMoved { .. })));
         assert!(matches!(rx.try_recv(), Ok(Event::TaskCompleted { .. })));
     }
 
@@ -992,6 +1054,62 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, TaskError::InvalidStatusTransition { .. }));
+    }
+
+    #[tokio::test]
+    async fn canonical_kanban_transitions_emit_task_moved_diagnostics() {
+        let (svc, event_service) = service();
+        let mut rx = event_service.subscribe();
+        let task = svc
+            .submit(CreateTaskRequest {
+                project_id: "p".into(),
+                parent_id: None,
+                title: "kanban".into(),
+                description: Some("goal".into()),
+                kind: "codegen".into(),
+                assigned_agent: Some("coder".into()),
+                priority: 1,
+                payload: serde_json::json!({}),
+                trace_id: Some("run-1".into()),
+            })
+            .await
+            .unwrap();
+
+        svc.set_status(&task.id, TaskStatus::InProgress)
+            .await
+            .unwrap();
+        svc.set_status(&task.id, TaskStatus::Review).await.unwrap();
+        svc.set_status(&task.id, TaskStatus::Remediation)
+            .await
+            .unwrap();
+        svc.set_status(&task.id, TaskStatus::Ready).await.unwrap();
+        svc.set_status(&task.id, TaskStatus::Blocked).await.unwrap();
+        svc.set_status(&task.id, TaskStatus::Ready).await.unwrap();
+        svc.set_status(&task.id, TaskStatus::Done).await.unwrap();
+
+        let mut moved = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let Event::TaskMoved {
+                task_id,
+                from,
+                to,
+                trace_id,
+                ..
+            } = event
+            {
+                moved.push((task_id, from, to, trace_id));
+            }
+        }
+
+        assert!(
+            moved.iter().any(|(_, from, to, _)| {
+                from.as_deref() == Some("ready") && to == "in_progress"
+            })
+        );
+        assert!(moved.iter().any(|(_, _, to, _)| to == "remediation"));
+        assert!(moved.iter().any(|(_, _, to, _)| to == "blocked"));
+        assert!(moved.iter().any(|(_, _, to, _)| to == "done"));
+        assert!(moved.iter().all(|(_, _, _, trace_id)| trace_id == "run-1"));
     }
 
     #[tokio::test]
