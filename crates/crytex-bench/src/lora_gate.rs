@@ -772,8 +772,16 @@ mod tests {
             prompt_version_id: None,
             task_kind: "codegen".into(),
             agent_role: None,
+            model_id: None,
+            rag_evidence_ids: Vec::new(),
             input_text: format!("Implement deterministic parsing behavior for approved case {idx}"),
             output_text: format!("Correct parser implementation and tests for approved case {idx}"),
+            accepted_output: Some(format!(
+                "Correct parser implementation and tests for approved case {idx}"
+            )),
+            rejected_output: None,
+            critic_feedback: None,
+            failure_type: None,
             reward: 5.0,
             created_at: idx,
         }

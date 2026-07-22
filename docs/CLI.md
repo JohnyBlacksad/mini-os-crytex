@@ -358,12 +358,32 @@ crytex lora status coder-python
 crytex lora dataset build coder-python --preference --json
 crytex lora dataset inspect coder-python
 crytex lora dataset stats coder-python
+crytex prove lora-dataset --report-path reports\lora-dataset-p8-proof.json
 crytex lora train coder-python --objective preference
 crytex lora benchmark coder-python --include-negative
 crytex lora prove-live coder-python
 crytex lora promote coder-python <adapter-id>
 crytex lora rollback coder-python
 ```
+
+Current development binary:
+
+```powershell
+cargo run -p crytex-kernel -- lora dataset build coder-python --preference --json
+cargo run -p crytex-kernel -- lora dataset inspect coder-python --json
+cargo run -p crytex-kernel -- lora dataset stats coder-python --json
+cargo run -p crytex-kernel -- prove-lora-dataset --report-path reports\lora-dataset-p8-proof.json
+```
+
+LoRA dataset rows preserve role, task kind, prompt version, model id, RAG
+evidence ids, accepted output, rejected output, critic feedback, failure type,
+and reward. Rejected output is stored only as the negative preference side; it
+is never used as an SFT target.
+
+Dataset reports include role scoping, chosen/rejected pair counts, failure-type
+balancing targets, leakage diagnostics, and low-information filtering.
+
+See [LORA_DATASET.md](LORA_DATASET.md) for the module contract.
 
 Production LoRA promotion requires:
 

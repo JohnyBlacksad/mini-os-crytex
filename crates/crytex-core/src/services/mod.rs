@@ -79,8 +79,9 @@ pub use kanban_projection::{
     KanbanTaskProjection,
 };
 pub use lora_evolution::{
-    LoraBenchmarkDecision, LoraBenchmarkGate, LoraBenchmarkRequest, LoraEvolutionError,
-    LoraEvolutionService, LoraEvolutionServiceImpl,
+    LoraBenchmarkDecision, LoraBenchmarkGate, LoraBenchmarkRequest, LoraDatasetBalancingReport,
+    LoraDatasetInspector, LoraDatasetLeakageReport, LoraDatasetLowInformationReport,
+    LoraDatasetReport, LoraEvolutionError, LoraEvolutionService, LoraEvolutionServiceImpl,
 };
 pub use lora_router::{
     LoraRouter, LoraRouterError, LoraRouterImpl, LoraSelection, MemoryRoleAdapterRegistry,

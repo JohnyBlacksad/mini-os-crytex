@@ -1,0 +1,47 @@
+{
+  "passed": true,
+  "dataset": {
+    "role": "coder-python",
+    "total_examples": 3,
+    "positive_examples": 3,
+    "negative_examples": 3,
+    "preference_pairs": 3,
+    "failure_type_counts": {
+      "missing-tests": 2,
+      "wrong-api": 1
+    },
+    "leakage": {
+      "duplicate_task_count": 0,
+      "duplicate_output_count": 0
+    },
+    "low_information": {
+      "filtered_count": 1,
+      "example_ids": [
+        "low-info-negative"
+      ]
+    },
+    "balancing": {
+      "target_per_failure_type": {
+        "missing-tests": 1,
+        "wrong-api": 1
+      },
+      "selected_example_ids": [
+        "good-missing-tests",
+        "good-wrong-api"
+      ]
+    }
+  },
+  "example_ids": [
+    "good-missing-tests",
+    "good-wrong-api",
+    "low-info-negative"
+  ],
+  "evidence": {
+    "accepted_output_is_sft_target": true,
+    "rejected_output_is_negative_side_only": true,
+    "datasets_are_role_scoped": "coder-python",
+    "failure_type_balancing": true,
+    "leakage_detection": true,
+    "low_information_filtering": true
+  }
+}

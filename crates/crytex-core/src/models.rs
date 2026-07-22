@@ -183,8 +183,26 @@ pub struct TrainingExample {
     pub task_kind: String,
     /// Optional agent role associated with this example.
     pub agent_role: Option<String>,
+    /// Optional model id used when the example was produced.
+    #[serde(default)]
+    pub model_id: Option<String>,
+    /// RAG evidence ids used by the agent while producing the answer.
+    #[serde(default)]
+    pub rag_evidence_ids: Vec<String>,
     pub input_text: String,
     pub output_text: String,
+    /// Positive side of a preference pair. For SFT-only rows this mirrors `output_text`.
+    #[serde(default)]
+    pub accepted_output: Option<String>,
+    /// Negative side of a preference pair. This must never be used as an SFT target.
+    #[serde(default)]
+    pub rejected_output: Option<String>,
+    /// Structured or textual critic feedback explaining why the negative side is bad.
+    #[serde(default)]
+    pub critic_feedback: Option<String>,
+    /// Stable failure taxonomy label used for dataset balancing.
+    #[serde(default)]
+    pub failure_type: Option<String>,
     pub reward: f64,
     pub created_at: i64,
 }

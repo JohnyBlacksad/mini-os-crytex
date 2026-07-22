@@ -600,12 +600,20 @@ mod tests {
                 prompt_version_id: None,
                 task_kind: kind.into(),
                 agent_role: None,
+                model_id: None,
+                rag_evidence_ids: Vec::new(),
                 input_text: format!(
                     "Implement robust parser branch for realistic held-out example {idx}"
                 ),
                 output_text: format!(
                     "Parser branch implementation with validation and test coverage {idx}"
                 ),
+                accepted_output: Some(format!(
+                    "Parser branch implementation with validation and test coverage {idx}"
+                )),
+                rejected_output: None,
+                critic_feedback: None,
+                failure_type: None,
                 reward: 5.0,
                 created_at: idx,
             })

@@ -124,6 +124,9 @@ handoff, and role-specific LoRA routing.
 See [docs/PROMPT_EVOLUTION.md](docs/PROMPT_EVOLUTION.md) for prompt challenger
 creation, benchmark-gated promotion, regression requirements, rollback,
 diagnostics, and schema/format failure routing.
+See [docs/LORA_DATASET.md](docs/LORA_DATASET.md) for positive/negative LoRA
+dataset rows, chosen/rejected remediation pairs, role scoping, balancing,
+leakage detection, and low-information filtering.
 
 Every production command follows these rules:
 
@@ -148,6 +151,7 @@ Token economy now has a deterministic proof command in the development binary:
 cargo run -p crytex-kernel -- prove-token-economy --report-path reports\token-economy-p4.json
 cargo run -p crytex-kernel -- prove-role-quality-contracts --report-path reports\role-quality-p6-proof.json
 cargo run -p crytex-kernel -- prove-prompt-evolution --report-path reports\prompt-evolution-p7-proof.json
+cargo run -p crytex-kernel -- prove-lora-dataset --report-path reports\lora-dataset-p8-proof.json
 ```
 
 The token-economy report proves model headroom reservation, shared RAG-context reuse, CCR
@@ -163,6 +167,11 @@ The prompt-evolution report proves mutation creates an inactive challenger,
 promotion is benchmark-gated, regression benchmark metadata is mandatory,
 prompt decisions are written to diagnostics, rollback restores a previous
 baseline, and schema/format failures route to Prompt Evolution before LoRA.
+
+The LoRA dataset report proves Crytex stores accepted outputs as positive
+targets, rejected outputs as negative preference sides, preserves critic
+feedback/failure type/RAG evidence/model id, scopes datasets per role, and
+reports balancing, leakage, and low-information diagnostics.
 
 The production CLI contract is now fixed in code at
 `crates/crytex-kernel/src/cli_contract.rs`. Existing legacy command handlers are

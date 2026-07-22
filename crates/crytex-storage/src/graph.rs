@@ -157,6 +157,45 @@ impl GraphStore {
         Ok(())
     }
 
+    async fn migrate_training_example_dataset_fields(conn: &Connection) -> Result<(), Error> {
+        for (column, ddl) in [
+            (
+                "model_id",
+                "ALTER TABLE training_examples ADD COLUMN model_id TEXT",
+            ),
+            (
+                "rag_evidence_ids",
+                "ALTER TABLE training_examples ADD COLUMN rag_evidence_ids TEXT DEFAULT '[]'",
+            ),
+            (
+                "accepted_output",
+                "ALTER TABLE training_examples ADD COLUMN accepted_output TEXT",
+            ),
+            (
+                "rejected_output",
+                "ALTER TABLE training_examples ADD COLUMN rejected_output TEXT",
+            ),
+            (
+                "critic_feedback",
+                "ALTER TABLE training_examples ADD COLUMN critic_feedback TEXT",
+            ),
+            (
+                "failure_type",
+                "ALTER TABLE training_examples ADD COLUMN failure_type TEXT",
+            ),
+        ] {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('training_examples') WHERE name = ?1",
+                [column],
+                |row| row.get(0),
+            )?;
+            if count == 0 {
+                conn.execute(ddl, [])?;
+            }
+        }
+        Ok(())
+    }
+
     async fn migrate_prompt_version_metrics(conn: &Connection) -> Result<(), Error> {
         let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM pragma_table_info('prompt_versions') WHERE name = 'metrics'",
@@ -302,7 +341,13 @@ CREATE TABLE IF NOT EXISTS training_examples (
     output_text       TEXT NOT NULL,
     reward            REAL NOT NULL,
     created_at        INTEGER NOT NULL,
-    agent_role        TEXT
+    agent_role        TEXT,
+    model_id          TEXT,
+    rag_evidence_ids  TEXT DEFAULT '[]',
+    accepted_output   TEXT,
+    rejected_output   TEXT,
+    critic_feedback   TEXT,
+    failure_type      TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_training_examples_kind ON training_examples(task_kind);
 CREATE INDEX IF NOT EXISTS idx_training_examples_project ON training_examples(project_id);
@@ -396,6 +441,7 @@ CREATE INDEX IF NOT EXISTS idx_ab_test_challenger ON ab_test_reports(challenger_
         Self::migrate_lora_task_kind(&conn).await?;
         Self::migrate_lora_agent_role(&conn).await?;
         Self::migrate_training_example_agent_role(&conn).await?;
+        Self::migrate_training_example_dataset_fields(&conn).await?;
         Self::migrate_prompt_version_metrics(&conn).await?;
         Ok(())
     }
@@ -1091,8 +1137,8 @@ CREATE INDEX IF NOT EXISTS idx_ab_test_challenger ON ab_test_reports(challenger_
     pub async fn insert_training_example(&self, example: &TrainingExample) -> Result<(), Error> {
         let conn = self.conn.lock().await;
         conn.execute(
-            "INSERT INTO training_examples (id, task_id, project_id, prompt_version_id, task_kind, input_text, output_text, reward, created_at, agent_role)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            "INSERT INTO training_examples (id, task_id, project_id, prompt_version_id, task_kind, input_text, output_text, reward, created_at, agent_role, model_id, rag_evidence_ids, accepted_output, rejected_output, critic_feedback, failure_type)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
              ON CONFLICT(id) DO UPDATE SET
                 task_id = excluded.task_id,
                 project_id = excluded.project_id,
@@ -1102,7 +1148,13 @@ CREATE INDEX IF NOT EXISTS idx_ab_test_challenger ON ab_test_reports(challenger_
                 output_text = excluded.output_text,
                 reward = excluded.reward,
                 created_at = excluded.created_at,
-                agent_role = excluded.agent_role",
+                agent_role = excluded.agent_role,
+                model_id = excluded.model_id,
+                rag_evidence_ids = excluded.rag_evidence_ids,
+                accepted_output = excluded.accepted_output,
+                rejected_output = excluded.rejected_output,
+                critic_feedback = excluded.critic_feedback,
+                failure_type = excluded.failure_type",
             rusqlite::params![
                 &example.id,
                 &example.task_id,
@@ -1114,6 +1166,12 @@ CREATE INDEX IF NOT EXISTS idx_ab_test_challenger ON ab_test_reports(challenger_
                 example.reward,
                 example.created_at,
                 example.agent_role.as_deref().unwrap_or(""),
+                example.model_id.as_deref().unwrap_or(""),
+                serde_json::to_string(&example.rag_evidence_ids)?,
+                example.accepted_output.as_deref().unwrap_or(""),
+                example.rejected_output.as_deref().unwrap_or(""),
+                example.critic_feedback.as_deref().unwrap_or(""),
+                example.failure_type.as_deref().unwrap_or(""),
             ],
         )?;
         Ok(())
@@ -1125,7 +1183,7 @@ CREATE INDEX IF NOT EXISTS idx_ab_test_challenger ON ab_test_reports(challenger_
     ) -> Result<Vec<TrainingExample>, Error> {
         let conn = self.conn.lock().await;
         let mut stmt = conn.prepare(
-            "SELECT id, task_id, project_id, prompt_version_id, task_kind, input_text, output_text, reward, created_at, agent_role
+            "SELECT id, task_id, project_id, prompt_version_id, task_kind, input_text, output_text, reward, created_at, agent_role, model_id, rag_evidence_ids, accepted_output, rejected_output, critic_feedback, failure_type
              FROM training_examples WHERE task_kind = ?1 ORDER BY created_at",
         )?;
         let mut rows = stmt.query([task_kind])?;
@@ -1152,7 +1210,7 @@ CREATE INDEX IF NOT EXISTS idx_ab_test_challenger ON ab_test_reports(challenger_
     ) -> Result<Vec<TrainingExample>, Error> {
         let conn = self.conn.lock().await;
         let mut stmt = conn.prepare(
-            "SELECT id, task_id, project_id, prompt_version_id, task_kind, input_text, output_text, reward, created_at, agent_role
+            "SELECT id, task_id, project_id, prompt_version_id, task_kind, input_text, output_text, reward, created_at, agent_role, model_id, rag_evidence_ids, accepted_output, rejected_output, critic_feedback, failure_type
              FROM training_examples WHERE project_id = ?1 ORDER BY created_at",
         )?;
         let mut rows = stmt.query([project_id])?;
@@ -1169,7 +1227,7 @@ CREATE INDEX IF NOT EXISTS idx_ab_test_challenger ON ab_test_reports(challenger_
     ) -> Result<Vec<TrainingExample>, Error> {
         let conn = self.conn.lock().await;
         let mut stmt = conn.prepare(
-            "SELECT id, task_id, project_id, prompt_version_id, task_kind, input_text, output_text, reward, created_at, agent_role
+            "SELECT id, task_id, project_id, prompt_version_id, task_kind, input_text, output_text, reward, created_at, agent_role, model_id, rag_evidence_ids, accepted_output, rejected_output, critic_feedback, failure_type
              FROM training_examples WHERE agent_role = ?1 ORDER BY created_at",
         )?;
         let mut rows = stmt.query([agent_role])?;
@@ -1336,6 +1394,12 @@ fn map_experience_row(row: &rusqlite::Row<'_>) -> Result<Experience, Error> {
 
 fn map_training_example_row(row: &rusqlite::Row<'_>) -> Result<TrainingExample, Error> {
     let agent_role: Option<String> = row.get(9)?;
+    let rag_evidence_ids = row
+        .get::<_, Option<String>>(11)?
+        .filter(|value| !value.is_empty())
+        .map(|value| serde_json::from_str(&value))
+        .transpose()?
+        .unwrap_or_default();
     Ok(TrainingExample {
         id: row.get(0)?,
         task_id: row.get(1)?,
@@ -1343,8 +1407,14 @@ fn map_training_example_row(row: &rusqlite::Row<'_>) -> Result<TrainingExample, 
         prompt_version_id: as_optional_string(row.get(3)?),
         task_kind: row.get(4)?,
         agent_role: agent_role.filter(|s| !s.is_empty()),
+        model_id: as_optional_string(row.get(10)?),
+        rag_evidence_ids,
         input_text: row.get(5)?,
         output_text: row.get(6)?,
+        accepted_output: as_optional_string(row.get(12)?),
+        rejected_output: as_optional_string(row.get(13)?),
+        critic_feedback: as_optional_string(row.get(14)?),
+        failure_type: as_optional_string(row.get(15)?),
         reward: row.get(7)?,
         created_at: row.get(8)?,
     })
@@ -1895,8 +1965,14 @@ mod tests {
             prompt_version_id: Some("pv-1".into()),
             task_kind: "codegen".into(),
             agent_role: Some("coder".into()),
+            model_id: Some("qwen3.5:9b".into()),
+            rag_evidence_ids: vec!["chunk-a".into(), "chunk-b".into()],
             input_text: "system prompt\n\nImplement X".into(),
             output_text: "fn x() {}".into(),
+            accepted_output: Some("fn x() {}".into()),
+            rejected_output: Some("fn bad() {}".into()),
+            critic_feedback: Some("missing tests".into()),
+            failure_type: Some("missing-tests".into()),
             reward: 4.5,
             created_at: Utc::now().timestamp(),
         };

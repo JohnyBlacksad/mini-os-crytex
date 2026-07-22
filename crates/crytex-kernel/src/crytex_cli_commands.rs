@@ -312,6 +312,11 @@ pub enum Commands {
         #[arg(long)]
         report_path: Option<PathBuf>,
     },
+    /// Prove LoRA positive/negative dataset construction, filtering, balancing, and leakage checks
+    ProveLoraDataset {
+        #[arg(long)]
+        report_path: Option<PathBuf>,
+    },
     /// Add or update a managed HuggingFace/local model entry
     AddModel {
         #[arg(short, long)]
@@ -482,6 +487,11 @@ pub enum Commands {
 
 #[derive(Subcommand)]
 pub enum LoraCommands {
+    /// Build, inspect, and summarize role-specific LoRA datasets
+    Dataset {
+        #[command(subcommand)]
+        command: LoraDatasetCommands,
+    },
     /// List registered adapters
     List {
         #[arg(short, long)]
@@ -506,6 +516,30 @@ pub enum LoraCommands {
     SelectRole { role: String, adapter: String },
     /// List role -> adapter bindings
     ListRoles,
+}
+
+#[derive(Subcommand)]
+pub enum LoraDatasetCommands {
+    /// Build or refresh a role-specific positive/negative dataset.
+    Build {
+        role: String,
+        #[arg(long)]
+        preference: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect role-specific dataset rows and diagnostics.
+    Inspect {
+        role: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show dataset stats, balancing, leakage, and low-information filtering.
+    Stats {
+        role: String,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1050,6 +1084,84 @@ mod tests {
         assert_eq!(
             report_path,
             Some(PathBuf::from("reports/prompt-evolution-p7.json"))
+        );
+    }
+
+    #[test]
+    fn lora_dataset_commands_parse_build_inspect_and_stats() {
+        let build = Cli::parse_from([
+            "crytex-kernel",
+            "lora",
+            "dataset",
+            "build",
+            "coder-python",
+            "--preference",
+            "--json",
+        ]);
+        assert!(matches!(
+            build.command,
+            Commands::Lora {
+                command: LoraCommands::Dataset {
+                    command: LoraDatasetCommands::Build {
+                        role,
+                        preference: true,
+                        json: true
+                    }
+                }
+            } if role == "coder-python"
+        ));
+
+        let inspect = Cli::parse_from([
+            "crytex-kernel",
+            "lora",
+            "dataset",
+            "inspect",
+            "qa",
+            "--json",
+        ]);
+        assert!(matches!(
+            inspect.command,
+            Commands::Lora {
+                command: LoraCommands::Dataset {
+                    command: LoraDatasetCommands::Inspect { role, json: true }
+                }
+            } if role == "qa"
+        ));
+
+        let stats = Cli::parse_from([
+            "crytex-kernel",
+            "lora",
+            "dataset",
+            "stats",
+            "orchestrator",
+            "--json",
+        ]);
+        assert!(matches!(
+            stats.command,
+            Commands::Lora {
+                command: LoraCommands::Dataset {
+                    command: LoraDatasetCommands::Stats { role, json: true }
+                }
+            } if role == "orchestrator"
+        ));
+    }
+
+    #[test]
+    fn lora_dataset_proof_command_parses_report_path() {
+        let cli = Cli::parse_from([
+            "crytex-kernel",
+            "prove-lora-dataset",
+            "--report-path",
+            "reports/lora-dataset-p8.json",
+        ]);
+
+        let Commands::ProveLoraDataset { report_path } = cli.command else {
+            panic!("expected lora dataset proof command");
+        };
+
+        assert_eq!(
+            report_path,
+            Some(PathBuf::from("reports/lora-dataset-p8.json"))
         );
     }
 }

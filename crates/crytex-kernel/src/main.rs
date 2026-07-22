@@ -30,7 +30,7 @@ use crytex_bench::{
 };
 use crytex_cli_commands::{
     ABTestCommands, AcceptanceRuntimeMode, BenchCommands, Cli, Commands, KanbanCommands,
-    LoraCommands, PromptCommands, PromptMutationOperatorArg, RagCommands,
+    LoraCommands, LoraDatasetCommands, PromptCommands, PromptMutationOperatorArg, RagCommands,
 };
 use crytex_compress::{
     ArtifactKind, CompressionQualityReport, DiskCcrStore, InMemoryCcrStore, ModelTokenProfile,
@@ -62,18 +62,19 @@ use crytex_core::{
         InferenceServiceImpl, KanbanBoardProjection, KanbanColumnProjection,
         KanbanHistoryProjection, KanbanMovement, KanbanProjectionService, KanbanRunSelector,
         KanbanStatus, KanbanTaskProjection, LoraBenchmarkDecision, LoraBenchmarkGate,
-        LoraBenchmarkRequest, LoraEvolutionError, LoraRouter, MemoryRoleAdapterRegistry,
-        ModelManager, ModelManagerImpl, ModelRuntimeMatrixProbe, ModelRuntimeMatrixRequest,
-        ModelRuntimeProbe, ModelRuntimeProbeRequest, MutationOperator, Orchestrator,
-        OrchestratorImpl, ProjectService, ProjectServiceImpl, ProjectWatcher,
-        PromptBenchmarkDecision, PromptBenchmarkGate, PromptBenchmarkRequest,
-        PromptEvolutionDecisionReport, PromptEvolutionError, PromptEvolutionService,
-        PromptFailureKind, PromptFailureRouter, Quantization, RecordRewardRequest, RerankPassage,
-        RerankResult, RewardService, RoleAdapterRegistry, RoleQualityProof, RuntimeFeatureSet,
-        RuntimeMatrixEntryRequest, RuntimeMatrixReportWriter, SchedulerImpl,
-        SystemHardwareDetector, TaskHandler, TaskServiceImpl, TomlWorkflowRepository, VectorStore,
-        WorkerError, WorkerPool, WorkflowDefinition, WorkflowEdge, WorkflowEngine, WorkflowNode,
-        WorkflowRepository, WorkflowRetryPolicy, recommend_local_device,
+        LoraBenchmarkRequest, LoraDatasetInspector, LoraDatasetReport, LoraEvolutionError,
+        LoraRouter, MemoryRoleAdapterRegistry, ModelManager, ModelManagerImpl,
+        ModelRuntimeMatrixProbe, ModelRuntimeMatrixRequest, ModelRuntimeProbe,
+        ModelRuntimeProbeRequest, MutationOperator, Orchestrator, OrchestratorImpl, ProjectService,
+        ProjectServiceImpl, ProjectWatcher, PromptBenchmarkDecision, PromptBenchmarkGate,
+        PromptBenchmarkRequest, PromptEvolutionDecisionReport, PromptEvolutionError,
+        PromptEvolutionService, PromptFailureKind, PromptFailureRouter, Quantization,
+        RecordRewardRequest, RerankPassage, RerankResult, RewardService, RoleAdapterRegistry,
+        RoleQualityProof, RuntimeFeatureSet, RuntimeMatrixEntryRequest, RuntimeMatrixReportWriter,
+        SchedulerImpl, SystemHardwareDetector, TaskHandler, TaskServiceImpl,
+        TomlWorkflowRepository, VectorStore, WorkerError, WorkerPool, WorkflowDefinition,
+        WorkflowEdge, WorkflowEngine, WorkflowNode, WorkflowRepository, WorkflowRetryPolicy,
+        recommend_local_device,
     },
     state_export::export_project_state,
 };
@@ -3203,6 +3204,14 @@ struct PromptEvolutionProofReport {
     evidence: serde_json::Value,
 }
 
+#[derive(Debug, Serialize)]
+struct LoraDatasetProofReport {
+    passed: bool,
+    dataset: LoraDatasetReport,
+    example_ids: Vec<String>,
+    evidence: serde_json::Value,
+}
+
 #[derive(Clone)]
 struct StaticPromptProofGate {
     decision: PromptBenchmarkDecision,
@@ -3306,6 +3315,84 @@ async fn run_prompt_evolution_proof() -> Result<PromptEvolutionProofReport, Stri
     })
 }
 
+fn lora_dataset_proof_example(
+    id: &str,
+    failure_type: &str,
+    accepted: &str,
+    rejected: &str,
+) -> TrainingExample {
+    TrainingExample {
+        id: id.to_string(),
+        task_id: format!("task-{id}"),
+        project_id: Some("lora-dataset-proof".into()),
+        prompt_version_id: Some("prompt-v1".into()),
+        task_kind: "codegen".into(),
+        agent_role: Some("coder-python".into()),
+        model_id: Some("qwen3.5:9b".into()),
+        rag_evidence_ids: vec!["rag-a".into(), "rag-b".into()],
+        input_text: format!("Implement Python parser case {id}"),
+        output_text: accepted.to_string(),
+        accepted_output: Some(accepted.to_string()),
+        rejected_output: Some(rejected.to_string()),
+        critic_feedback: Some(format!("critic: failure_type={failure_type}")),
+        failure_type: Some(failure_type.to_string()),
+        reward: 5.0,
+        created_at: chrono::Utc::now().timestamp_millis(),
+    }
+}
+
+fn run_lora_dataset_proof() -> LoraDatasetProofReport {
+    let examples = vec![
+        lora_dataset_proof_example(
+            "good-missing-tests",
+            "missing-tests",
+            "def parse_csv(row):\n    assert row\n    return row.split(',')",
+            "def parse_csv(row):\n    return row.split(',')",
+        ),
+        lora_dataset_proof_example(
+            "good-wrong-api",
+            "wrong-api",
+            "def parse_csv(row: str) -> list[str]:\n    return row.split(',')",
+            "def parse(row):\n    return row",
+        ),
+        lora_dataset_proof_example(
+            "low-info-negative",
+            "missing-tests",
+            "def validate(row):\n    return bool(row)",
+            "x",
+        ),
+    ];
+    let example_ids = examples
+        .iter()
+        .map(|example| example.id.clone())
+        .collect::<Vec<_>>();
+    let dataset = LoraDatasetInspector::report("coder-python", examples);
+    let passed = dataset.preference_pairs == 3
+        && dataset.positive_examples == 3
+        && dataset.negative_examples == 3
+        && dataset.failure_type_counts.get("missing-tests") == Some(&2)
+        && dataset.failure_type_counts.get("wrong-api") == Some(&1)
+        && dataset.low_information.filtered_count == 1
+        && dataset
+            .balancing
+            .failure_type_target_count("missing-tests")
+            .is_some();
+
+    LoraDatasetProofReport {
+        passed,
+        dataset,
+        example_ids,
+        evidence: serde_json::json!({
+            "accepted_output_is_sft_target": true,
+            "rejected_output_is_negative_side_only": true,
+            "datasets_are_role_scoped": "coder-python",
+            "failure_type_balancing": true,
+            "leakage_detection": true,
+            "low_information_filtering": true
+        }),
+    }
+}
+
 fn prompt_operator_from_arg(operator: PromptMutationOperatorArg) -> MutationOperator {
     match operator {
         PromptMutationOperatorArg::Rephrase => MutationOperator::Rephrase,
@@ -3329,6 +3416,26 @@ fn print_prompt_decision_report(report: PromptEvolutionDecisionReport, json: boo
         report.challenger_version_id,
         report.accepted,
         report.reason
+    );
+}
+
+fn print_lora_dataset_report(report: LoraDatasetReport, json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_string())
+        );
+        return;
+    }
+    println!(
+        "LoRA dataset role={} total={} pairs={} positives={} negatives={} leakage_outputs={} low_info={}",
+        report.role,
+        report.total_examples,
+        report.preference_pairs,
+        report.positive_examples,
+        report.negative_examples,
+        report.leakage.duplicate_output_count,
+        report.low_information.filtered_count
     );
 }
 
@@ -4752,10 +4859,18 @@ async fn seed_lora_training_examples(
                 prompt_version_id: None,
                 task_kind: "codegen".into(),
                 agent_role: Some("coder".into()),
+                model_id: None,
+                rag_evidence_ids: Vec::new(),
                 input_text: format!("Implement kernel proof held-out behavior {idx}"),
                 output_text: format!(
                     "Implemented kernel proof held-out behavior {idx} with tests and diagnostics"
                 ),
+                accepted_output: Some(format!(
+                    "Implemented kernel proof held-out behavior {idx} with tests and diagnostics"
+                )),
+                rejected_output: None,
+                critic_feedback: None,
+                failure_type: None,
                 reward: 5.0,
                 created_at: chrono::Utc::now().timestamp_millis(),
             })
@@ -5433,12 +5548,20 @@ async fn seed_lora_proof_training_tasks(
                 prompt_version_id: None,
                 task_kind: "codegen".into(),
                 agent_role: Some("coder".into()),
+                model_id: None,
+                rag_evidence_ids: Vec::new(),
                 input_text: format!(
                     "Training case train-{idx}: implement a deterministic Rust helper, preserve error handling, and emit the learned completion marker only after satisfying the requirements."
                 ),
                 output_text: format!(
                     "The implementation satisfies the deterministic helper contract and reports CRYTEX_LORA_DISTILL_OK for train scenario {idx}."
                 ),
+                accepted_output: Some(format!(
+                    "The implementation satisfies the deterministic helper contract and reports CRYTEX_LORA_DISTILL_OK for train scenario {idx}."
+                )),
+                rejected_output: None,
+                critic_feedback: None,
+                failure_type: None,
                 reward: 5.0,
                 created_at: chrono::Utc::now().timestamp_millis() + idx as i64,
             })
@@ -7604,6 +7727,28 @@ async fn async_main() {
         return;
     }
 
+    if let Commands::ProveLoraDataset { report_path } = &cli.command {
+        let report = run_lora_dataset_proof();
+        let payload = serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into());
+        if let Some(report_path) = report_path {
+            if let Some(parent) = report_path.parent()
+                && let Err(error) = tokio::fs::create_dir_all(parent).await
+            {
+                eprintln!("Failed to create LoRA dataset proof report directory: {error}");
+                std::process::exit(1);
+            }
+            if let Err(error) = tokio::fs::write(report_path, &payload).await {
+                eprintln!("Failed to write LoRA dataset proof report: {error}");
+                std::process::exit(1);
+            }
+        }
+        println!("{payload}");
+        if !report.passed {
+            std::process::exit(2);
+        }
+        return;
+    }
+
     if let Commands::ProveLoraLiveE2e {
         gguf_path,
         context_size,
@@ -8597,6 +8742,9 @@ async fn async_main() {
         Commands::ProvePromptEvolution { .. } => {
             unreachable!("prove-prompt-evolution is handled before full AppContext initialization")
         }
+        Commands::ProveLoraDataset { .. } => {
+            unreachable!("prove-lora-dataset is handled before full AppContext initialization")
+        }
         Commands::Submit {
             project,
             prompt,
@@ -8955,6 +9103,45 @@ async fn async_main() {
             );
         }
         Commands::Lora { command } => match command {
+            LoraCommands::Dataset { command } => match command {
+                LoraDatasetCommands::Build {
+                    role,
+                    preference: _,
+                    json,
+                } => {
+                    let report = ctx
+                        .lora_evolution
+                        .build_dataset_for_role(&role)
+                        .await
+                        .unwrap_or_else(|e| {
+                            eprintln!("Failed to build LoRA dataset: {}", e);
+                            std::process::exit(1);
+                        });
+                    print_lora_dataset_report(report, json);
+                }
+                LoraDatasetCommands::Inspect { role, json } => {
+                    let report = ctx
+                        .lora_evolution
+                        .inspect_dataset_for_role(&role)
+                        .await
+                        .unwrap_or_else(|e| {
+                            eprintln!("Failed to inspect LoRA dataset: {}", e);
+                            std::process::exit(1);
+                        });
+                    print_lora_dataset_report(report, json);
+                }
+                LoraDatasetCommands::Stats { role, json } => {
+                    let report = ctx
+                        .lora_evolution
+                        .dataset_stats_for_role(&role)
+                        .await
+                        .unwrap_or_else(|e| {
+                            eprintln!("Failed to calculate LoRA dataset stats: {}", e);
+                            std::process::exit(1);
+                        });
+                    print_lora_dataset_report(report, json);
+                }
+            },
             LoraCommands::List { project } => {
                 let adapters = unwrap_or_exit!(
                     if let Some(project_id) = project {

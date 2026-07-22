@@ -6,8 +6,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::Utc;
 use crytex_inference::LoRAAdapter as InferenceLoRAAdapter;
+use serde::{Deserialize, Serialize};
 use serde_json;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -70,6 +71,110 @@ pub struct LoraBenchmarkDecision {
     pub accepted: bool,
     pub reason: String,
     pub metadata: serde_json::Value,
+}
+
+/// Leakage diagnostics for a role dataset.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoraDatasetLeakageReport {
+    pub duplicate_task_count: usize,
+    pub duplicate_output_count: usize,
+}
+
+/// Low-information filtering diagnostics for a role dataset.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoraDatasetLowInformationReport {
+    pub filtered_count: usize,
+    pub example_ids: Vec<String>,
+}
+
+/// Failure-type balancing plan for a role dataset.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoraDatasetBalancingReport {
+    pub target_per_failure_type: BTreeMap<String, usize>,
+    pub selected_example_ids: Vec<String>,
+}
+
+impl LoraDatasetBalancingReport {
+    pub fn failure_type_target_count(&self, failure_type: &str) -> Option<usize> {
+        self.target_per_failure_type.get(failure_type).copied()
+    }
+}
+
+/// Inspectable dataset report used by CLI and proofs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoraDatasetReport {
+    pub role: String,
+    pub total_examples: usize,
+    pub positive_examples: usize,
+    pub negative_examples: usize,
+    pub preference_pairs: usize,
+    pub failure_type_counts: BTreeMap<String, usize>,
+    pub leakage: LoraDatasetLeakageReport,
+    pub low_information: LoraDatasetLowInformationReport,
+    pub balancing: LoraDatasetBalancingReport,
+}
+
+impl LoraDatasetReport {
+    pub fn empty(role: &str) -> Self {
+        Self {
+            role: role.to_string(),
+            total_examples: 0,
+            positive_examples: 0,
+            negative_examples: 0,
+            preference_pairs: 0,
+            failure_type_counts: BTreeMap::new(),
+            leakage: LoraDatasetLeakageReport {
+                duplicate_task_count: 0,
+                duplicate_output_count: 0,
+            },
+            low_information: LoraDatasetLowInformationReport {
+                filtered_count: 0,
+                example_ids: Vec::new(),
+            },
+            balancing: LoraDatasetBalancingReport {
+                target_per_failure_type: BTreeMap::new(),
+                selected_example_ids: Vec::new(),
+            },
+        }
+    }
+}
+
+/// Pure dataset inspector used by services, CLI proofs, and tests.
+pub struct LoraDatasetInspector;
+
+impl LoraDatasetInspector {
+    pub fn report(role: &str, examples: Vec<TrainingExample>) -> LoraDatasetReport {
+        let failure_type_counts = failure_type_counts(&examples);
+        let low_information = low_information_report(&examples);
+        let leakage = leakage_report(&examples);
+        let balancing = balancing_report(&examples, &failure_type_counts);
+        let positive_examples = examples
+            .iter()
+            .filter(|example| example.accepted_output.is_some() || example.reward > 0.0)
+            .count();
+        let negative_examples = examples
+            .iter()
+            .filter(|example| example.rejected_output.is_some() || example.reward <= 0.0)
+            .count();
+        let preference_pairs = examples
+            .iter()
+            .filter(|example| {
+                example.accepted_output.is_some() && example.rejected_output.is_some()
+            })
+            .count();
+
+        LoraDatasetReport {
+            role: role.to_string(),
+            total_examples: examples.len(),
+            positive_examples,
+            negative_examples,
+            preference_pairs,
+            failure_type_counts,
+            leakage,
+            low_information,
+            balancing,
+        }
+    }
 }
 
 impl LoraBenchmarkDecision {
@@ -136,6 +241,30 @@ pub trait LoraEvolutionService: Send + Sync {
         role: AgentRole,
         _project_id: &str,
     ) -> Result<Option<String>, LoraEvolutionError>;
+
+    /// Build or refresh a role-specific LoRA preference dataset.
+    async fn build_dataset_for_role(
+        &self,
+        role: &str,
+    ) -> Result<LoraDatasetReport, LoraEvolutionError> {
+        Ok(LoraDatasetReport::empty(role))
+    }
+
+    /// Inspect a role-specific LoRA dataset.
+    async fn inspect_dataset_for_role(
+        &self,
+        role: &str,
+    ) -> Result<LoraDatasetReport, LoraEvolutionError> {
+        Ok(LoraDatasetReport::empty(role))
+    }
+
+    /// Return role-specific dataset statistics.
+    async fn dataset_stats_for_role(
+        &self,
+        role: &str,
+    ) -> Result<LoraDatasetReport, LoraEvolutionError> {
+        Ok(LoraDatasetReport::empty(role))
+    }
 }
 
 /// Default implementation of [`LoraEvolutionService`].
@@ -373,8 +502,9 @@ impl LoraEvolutionServiceImpl {
         }
 
         if let Some(example) = examples.iter().find(|example| {
-            example.input_text.trim().chars().count() < MIN_EXAMPLE_TEXT_CHARS
-                || example.output_text.trim().chars().count() < MIN_EXAMPLE_TEXT_CHARS
+            self.is_golden_training_example(example)
+                && (example.input_text.trim().chars().count() < MIN_EXAMPLE_TEXT_CHARS
+                    || example.output_text.trim().chars().count() < MIN_EXAMPLE_TEXT_CHARS)
         }) {
             return Err(LoraEvolutionError::ValidationFailed(
                 key.to_string(),
@@ -516,6 +646,95 @@ impl LoraEvolutionServiceImpl {
 
         Ok(())
     }
+
+    async fn role_dataset_examples(
+        &self,
+        role: &str,
+    ) -> Result<Vec<TrainingExample>, LoraEvolutionError> {
+        Ok(self
+            .training_example_repo
+            .list_training_examples_by_role(role)
+            .await?)
+    }
+
+    async fn insert_role_dataset_pairs(&self, role: &str) -> Result<(), LoraEvolutionError> {
+        let existing_task_ids = self
+            .role_dataset_examples(role)
+            .await?
+            .into_iter()
+            .map(|example| example.task_id)
+            .collect::<HashSet<_>>();
+        let tasks = self.task_service.load_all_tasks().await?;
+        let by_id = tasks
+            .iter()
+            .map(|task| (task.id.as_str(), task))
+            .collect::<HashMap<_, _>>();
+
+        for accepted in tasks.iter().filter(|task| {
+            task.status == TaskStatus::Completed
+                && task.human_score.unwrap_or_default() >= self.min_human_score
+                && task_role(task).as_deref() == Some(role)
+                && !existing_task_ids.contains(&task.id)
+        }) {
+            let rejected = accepted
+                .payload
+                .get("remediation_for")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|id| by_id.get(id).copied());
+            let example = self
+                .build_training_example_from_task(accepted, rejected, role)
+                .await?;
+            self.training_example_repo
+                .insert_training_example(&example)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn build_training_example_from_task(
+        &self,
+        task: &Task,
+        rejected: Option<&Task>,
+        role: &str,
+    ) -> Result<TrainingExample, LoraEvolutionError> {
+        let system_prompt = if let Some(version_id) = task.prompt_version_id.as_deref() {
+            self.prompt_version_repo
+                .get_prompt_version(version_id)
+                .await?
+                .map(|v| v.system_prompt)
+        } else {
+            None
+        };
+        let accepted_output = Self::build_output_text(task);
+        let rejected_output = rejected.map(Self::build_output_text);
+        let critic_feedback = rejected.and_then(task_critic_feedback);
+        let failure_type = rejected
+            .and_then(task_failure_type)
+            .or_else(|| task_failure_type(task));
+
+        Ok(TrainingExample {
+            id: Ulid::new().to_string(),
+            task_id: task.id.clone(),
+            project_id: Some(task.project_id.clone()),
+            prompt_version_id: task.prompt_version_id.clone(),
+            task_kind: task.kind.clone(),
+            agent_role: Some(role.to_string()),
+            model_id: task_model_id(task),
+            rag_evidence_ids: task_rag_evidence_ids(task),
+            input_text: Self::build_input_text(task, system_prompt.as_deref()),
+            output_text: accepted_output.clone(),
+            accepted_output: Some(accepted_output),
+            rejected_output,
+            critic_feedback,
+            failure_type,
+            reward: RewardService::compute(task.critic_score, task.human_score),
+            created_at: Utc::now().timestamp_millis(),
+        })
+    }
+
+    fn build_dataset_report(role: &str, examples: Vec<TrainingExample>) -> LoraDatasetReport {
+        LoraDatasetInspector::report(role, examples)
+    }
 }
 
 impl LoraEvolutionServiceImpl {
@@ -558,6 +777,7 @@ impl LoraEvolutionServiceImpl {
         } else {
             RewardService::compute(task.critic_score, task.human_score)
         };
+        let output_text = Self::build_output_text(&task);
         let example = TrainingExample {
             id: Ulid::new().to_string(),
             task_id: task.id.clone(),
@@ -568,8 +788,18 @@ impl LoraEvolutionServiceImpl {
                 task.assigned_agent.as_deref().unwrap_or(task.kind.as_str()),
             )
             .map(|r| r.as_str().to_string()),
+            model_id: task_model_id(&task),
+            rag_evidence_ids: task_rag_evidence_ids(&task),
             input_text: Self::build_input_text(&task, system_prompt.as_deref()),
-            output_text: Self::build_output_text(&task),
+            output_text: if counter {
+                String::new()
+            } else {
+                output_text.clone()
+            },
+            accepted_output: (!counter).then_some(output_text.clone()),
+            rejected_output: counter.then_some(output_text),
+            critic_feedback: task_critic_feedback(&task),
+            failure_type: task_failure_type(&task),
             reward,
             created_at: Utc::now().timestamp_millis(),
         };
@@ -1066,6 +1296,166 @@ impl LoraEvolutionService for LoraEvolutionServiceImpl {
         let chosen = active.or_else(|| adapters.into_iter().next());
         Ok(chosen.map(|a| a.id))
     }
+
+    async fn build_dataset_for_role(
+        &self,
+        role: &str,
+    ) -> Result<LoraDatasetReport, LoraEvolutionError> {
+        self.insert_role_dataset_pairs(role).await?;
+        self.dataset_stats_for_role(role).await
+    }
+
+    async fn inspect_dataset_for_role(
+        &self,
+        role: &str,
+    ) -> Result<LoraDatasetReport, LoraEvolutionError> {
+        self.dataset_stats_for_role(role).await
+    }
+
+    async fn dataset_stats_for_role(
+        &self,
+        role: &str,
+    ) -> Result<LoraDatasetReport, LoraEvolutionError> {
+        let examples = self.role_dataset_examples(role).await?;
+        Ok(Self::build_dataset_report(role, examples))
+    }
+}
+
+fn task_role(task: &Task) -> Option<String> {
+    task.assigned_agent
+        .as_deref()
+        .and_then(AgentRole::from_agent)
+        .map(|role| role.as_str().to_string())
+        .or_else(|| task.assigned_agent.clone())
+}
+
+fn task_model_id(task: &Task) -> Option<String> {
+    task.payload
+        .get("model_id")
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string)
+}
+
+fn task_rag_evidence_ids(task: &Task) -> Vec<String> {
+    task.payload
+        .get("rag_evidence_ids")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn task_critic_feedback(task: &Task) -> Option<String> {
+    task.payload
+        .get("critic_feedback")
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string)
+}
+
+fn task_failure_type(task: &Task) -> Option<String> {
+    task.payload
+        .get("failure_type")
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string)
+}
+
+fn failure_type_counts(examples: &[TrainingExample]) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for failure_type in examples
+        .iter()
+        .filter_map(|example| example.failure_type.as_deref())
+    {
+        *counts.entry(failure_type.to_string()).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn low_information_report(examples: &[TrainingExample]) -> LoraDatasetLowInformationReport {
+    let example_ids = examples
+        .iter()
+        .filter(|example| {
+            example.input_text.trim().chars().count() < MIN_EXAMPLE_TEXT_CHARS
+                || example
+                    .accepted_output
+                    .as_deref()
+                    .unwrap_or(&example.output_text)
+                    .trim()
+                    .chars()
+                    .count()
+                    < MIN_EXAMPLE_TEXT_CHARS
+                || example
+                    .rejected_output
+                    .as_deref()
+                    .is_some_and(|text| text.trim().chars().count() < MIN_EXAMPLE_TEXT_CHARS)
+        })
+        .map(|example| example.id.clone())
+        .collect::<Vec<_>>();
+    LoraDatasetLowInformationReport {
+        filtered_count: example_ids.len(),
+        example_ids,
+    }
+}
+
+fn leakage_report(examples: &[TrainingExample]) -> LoraDatasetLeakageReport {
+    let duplicate_task_count =
+        duplicate_count(examples.iter().map(|example| example.task_id.as_str()));
+    let duplicate_output_count = duplicate_count(examples.iter().map(|example| {
+        example
+            .accepted_output
+            .as_deref()
+            .unwrap_or(&example.output_text)
+    }));
+    LoraDatasetLeakageReport {
+        duplicate_task_count,
+        duplicate_output_count,
+    }
+}
+
+fn duplicate_count<'a>(items: impl Iterator<Item = &'a str>) -> usize {
+    let mut seen = HashSet::new();
+    let mut duplicates = 0;
+    for item in items {
+        if !seen.insert(item) {
+            duplicates += 1;
+        }
+    }
+    duplicates
+}
+
+fn balancing_report(
+    examples: &[TrainingExample],
+    counts: &BTreeMap<String, usize>,
+) -> LoraDatasetBalancingReport {
+    let target = counts.values().copied().min().unwrap_or(0).min(1);
+    let target_per_failure_type = counts
+        .keys()
+        .map(|failure_type| (failure_type.clone(), target))
+        .collect::<BTreeMap<_, _>>();
+    let mut selected_by_failure_type: HashMap<&str, usize> = HashMap::new();
+    let selected_example_ids = examples
+        .iter()
+        .filter(|example| {
+            example.failure_type.as_deref().is_some_and(|failure_type| {
+                let count = selected_by_failure_type.entry(failure_type).or_insert(0);
+                if *count < target {
+                    *count += 1;
+                    true
+                } else {
+                    false
+                }
+            })
+        })
+        .map(|example| example.id.clone())
+        .collect();
+    LoraDatasetBalancingReport {
+        target_per_failure_type,
+        selected_example_ids,
+    }
 }
 
 #[cfg(test)]
@@ -1127,10 +1517,16 @@ mod tests {
 
     impl DummyTaskService {
         fn with_task(task: Task) -> Self {
-            let mut tasks = HashMap::new();
-            tasks.insert(task.id.clone(), task);
+            Self::with_tasks(vec![task])
+        }
+
+        fn with_tasks(tasks: Vec<Task>) -> Self {
+            let mut task_map = HashMap::new();
+            for task in tasks {
+                task_map.insert(task.id.clone(), task);
+            }
             Self {
-                tasks: Mutex::new(tasks),
+                tasks: Mutex::new(task_map),
             }
         }
     }
@@ -1178,7 +1574,7 @@ mod tests {
             unimplemented!()
         }
         async fn load_all_tasks(&self) -> Result<Vec<Task>, TaskError> {
-            unimplemented!()
+            Ok(self.tasks.lock().unwrap().values().cloned().collect())
         }
         async fn update_task(&self, _task: &Task) -> Result<(), TaskError> {
             unimplemented!()
@@ -1704,6 +2100,27 @@ mod tests {
         (service, example_repo, adapter_repo, inference, events)
     }
 
+    fn evolution_service_with_tasks(
+        tasks: Vec<Task>,
+        examples: Vec<TrainingExample>,
+        adapters: Vec<LoraAdapter>,
+    ) -> (
+        LoraEvolutionServiceImpl,
+        Arc<InMemoryTrainingExampleRepo>,
+        Arc<InMemoryLoraAdapterRepo>,
+        Arc<DummyInferenceService>,
+        Arc<DummyEventService>,
+    ) {
+        let first_task = tasks
+            .first()
+            .cloned()
+            .unwrap_or_else(|| make_task("p1", "codegen", TaskStatus::Completed, Some(5.0)));
+        let (mut service, example_repo, adapter_repo, inference, events) =
+            evolution_service(first_task, examples, adapters);
+        service.task_service = Arc::new(DummyTaskService::with_tasks(tasks));
+        (service, example_repo, adapter_repo, inference, events)
+    }
+
     fn evolution_service_with_trainer(
         task: Task,
         examples: Vec<TrainingExample>,
@@ -1751,8 +2168,14 @@ mod tests {
             prompt_version_id: Some("pv1".into()),
             task_kind: kind.into(),
             agent_role: None,
+            model_id: None,
+            rag_evidence_ids: Vec::new(),
             input_text: "input".into(),
             output_text: "output".into(),
+            accepted_output: Some("output".into()),
+            rejected_output: None,
+            critic_feedback: None,
+            failure_type: None,
             reward,
             created_at,
         }
@@ -2126,8 +2549,14 @@ mod tests {
             prompt_version_id: Some("pv1".into()),
             task_kind: "codegen".into(),
             agent_role: Some(agent_role.into()),
+            model_id: None,
+            rag_evidence_ids: Vec::new(),
             input_text: "input".into(),
             output_text: "output".into(),
+            accepted_output: Some("output".into()),
+            rejected_output: None,
+            critic_feedback: None,
+            failure_type: None,
             reward,
             created_at,
         }
@@ -2186,6 +2615,158 @@ mod tests {
             !trained
                 .iter()
                 .any(|example| example.output_text.contains("bad rejected output"))
+        );
+    }
+
+    #[tokio::test]
+    async fn remediation_builds_chosen_rejected_preference_pair_with_feedback() {
+        let mut accepted = make_task("p1", "codegen", TaskStatus::Completed, Some(5.0));
+        accepted.id = "accepted-fix".into();
+        accepted.assigned_agent = Some("coder-python".into());
+        accepted.prompt_version_id = Some("prompt-v1".into());
+        accepted.payload = json!({
+            "model_id": "qwen3.5:9b",
+            "rag_evidence_ids": ["chunk-a", "chunk-b"],
+            "remediation_for": "rejected-bug"
+        });
+        accepted.result =
+            Some(json!({"summary": "fixed parser", "files_changed": ["src/parser.py"]}));
+
+        let mut rejected = make_task("p1", "codegen", TaskStatus::Completed, Some(1.0));
+        rejected.id = "rejected-bug".into();
+        rejected.assigned_agent = Some("coder-python".into());
+        rejected.payload = json!({
+            "failure_type": "missing-tests",
+            "critic_feedback": "missing pytest coverage for bad csv rows"
+        });
+        rejected.result = Some(json!({"summary": "patched parser without tests"}));
+
+        let (service, example_repo, _, _, _) =
+            evolution_service_with_tasks(vec![accepted, rejected], vec![], vec![]);
+
+        let report = service
+            .build_dataset_for_role("coder-python")
+            .await
+            .unwrap();
+        let examples = example_repo
+            .list_training_examples_by_role("coder-python")
+            .await
+            .unwrap();
+
+        assert_eq!(report.role, "coder-python");
+        assert_eq!(report.preference_pairs, 1);
+        assert_eq!(examples.len(), 1);
+        assert_eq!(
+            examples[0].accepted_output.as_deref(),
+            Some("{\"files_changed\":[\"src/parser.py\"],\"summary\":\"fixed parser\"}")
+        );
+        assert_eq!(
+            examples[0].rejected_output.as_deref(),
+            Some("{\"summary\":\"patched parser without tests\"}")
+        );
+        assert_eq!(
+            examples[0].critic_feedback.as_deref(),
+            Some("missing pytest coverage for bad csv rows")
+        );
+        assert_eq!(examples[0].failure_type.as_deref(), Some("missing-tests"));
+        assert_eq!(examples[0].model_id.as_deref(), Some("qwen3.5:9b"));
+        assert_eq!(examples[0].rag_evidence_ids, vec!["chunk-a", "chunk-b"]);
+    }
+
+    #[tokio::test]
+    async fn preference_negative_side_is_not_trained_as_sft_target() {
+        let task = make_task("p1", "codegen", TaskStatus::Completed, Some(5.0));
+        let examples = vec![
+            TrainingExample {
+                reward: 5.0,
+                accepted_output: Some("chosen good answer".into()),
+                rejected_output: Some("rejected bad answer".into()),
+                output_text: "chosen good answer".into(),
+                failure_type: Some("wrong-api".into()),
+                agent_role: Some("coder-python".into()),
+                ..example("codegen", 5.0, 0)
+            },
+            TrainingExample {
+                reward: 5.0,
+                accepted_output: Some("chosen second answer".into()),
+                rejected_output: Some("rejected second answer".into()),
+                output_text: "chosen second answer".into(),
+                failure_type: Some("missing-tests".into()),
+                agent_role: Some("coder-python".into()),
+                ..example("codegen", 5.0, 1)
+            },
+            TrainingExample {
+                reward: 5.0,
+                accepted_output: Some("chosen third answer".into()),
+                rejected_output: Some("rejected third answer".into()),
+                output_text: "chosen third answer".into(),
+                failure_type: Some("missing-tests".into()),
+                agent_role: Some("coder-python".into()),
+                ..example("codegen", 5.0, 2)
+            },
+        ];
+        let trainer = Arc::new(RecordingTrainer::new(MockTrainer::new()));
+        let (service, _, _, _) = evolution_service_with_trainer(task, examples, trainer.clone());
+
+        service
+            .train_and_register_for_role(AgentRole::CoderPython)
+            .await
+            .unwrap();
+
+        let trained = trainer.trained_examples.lock().unwrap().clone();
+        assert!(trained.iter().all(|example| {
+            !example.output_text.contains("rejected")
+                && example
+                    .rejected_output
+                    .as_deref()
+                    .is_some_and(|text| text.contains("rejected"))
+        }));
+    }
+
+    #[tokio::test]
+    async fn dataset_stats_report_balancing_leakage_and_low_information() {
+        let task = make_task("p1", "codegen", TaskStatus::Completed, Some(5.0));
+        let examples = vec![
+            TrainingExample {
+                agent_role: Some("coder-python".into()),
+                failure_type: Some("missing-tests".into()),
+                accepted_output: Some("same leaked text".into()),
+                rejected_output: Some("bad output with enough info".into()),
+                output_text: "same leaked text".into(),
+                ..example("codegen", 5.0, 0)
+            },
+            TrainingExample {
+                agent_role: Some("coder-python".into()),
+                failure_type: Some("missing-tests".into()),
+                accepted_output: Some("same leaked text".into()),
+                rejected_output: Some("x".into()),
+                output_text: "same leaked text".into(),
+                ..example("codegen", 5.0, 1)
+            },
+            TrainingExample {
+                agent_role: Some("qa".into()),
+                failure_type: Some("weak-analysis".into()),
+                accepted_output: Some("qa accepted output".into()),
+                rejected_output: Some("qa rejected output".into()),
+                output_text: "qa accepted output".into(),
+                ..example("qa", 5.0, 2)
+            },
+        ];
+        let (service, _, _, _, _) = evolution_service(task, examples, vec![]);
+
+        let report = service
+            .dataset_stats_for_role("coder-python")
+            .await
+            .unwrap();
+
+        assert_eq!(report.role, "coder-python");
+        assert_eq!(report.total_examples, 2);
+        assert_eq!(report.failure_type_counts["missing-tests"], 2);
+        assert_eq!(report.leakage.duplicate_output_count, 1);
+        assert_eq!(report.low_information.filtered_count, 1);
+        assert_eq!(
+            report.balancing.failure_type_target_count("missing-tests"),
+            Some(1)
         );
     }
 

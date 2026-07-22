@@ -970,8 +970,14 @@ pub fn score_gguf_lora_answer_quality(
         prompt_version_id: None,
         task_kind: "lora-live-proof".into(),
         agent_role: None,
+        model_id: None,
+        rag_evidence_ids: Vec::new(),
         input_text: request.prompt.to_string(),
         output_text: request.expected_answer.to_string(),
+        accepted_output: Some(request.expected_answer.to_string()),
+        rejected_output: None,
+        critic_feedback: None,
+        failure_type: None,
         reward: 5.0,
         created_at: 0,
     };
@@ -1158,10 +1164,18 @@ fn lora_learning_proof_examples() -> Vec<TrainingExample> {
             prompt_version_id: Some("proof-prompt-v1".into()),
             task_kind: "codegen".into(),
             agent_role: Some("coder".into()),
+            model_id: None,
+            rag_evidence_ids: Vec::new(),
             input_text: format!("Implement a distillation marker function for {name}"),
             output_text: format!(
                 "fn distill_{name}() -> &'static str {{ \"CRYTEX_LORA_DISTILL_OK_{idx}\" }}"
             ),
+            accepted_output: Some(format!(
+                "fn distill_{name}() -> &'static str {{ \"CRYTEX_LORA_DISTILL_OK_{idx}\" }}"
+            )),
+            rejected_output: None,
+            critic_feedback: None,
+            failure_type: None,
             reward: 5.0,
             created_at: idx as i64,
         })
@@ -1176,10 +1190,19 @@ fn lora_learning_quality_case() -> TrainingExample {
         prompt_version_id: Some("proof-prompt-v1".into()),
         task_kind: "codegen".into(),
         agent_role: Some("coder".into()),
+        model_id: None,
+        rag_evidence_ids: Vec::new(),
         input_text: "Implement a distillation marker function for heldout_quality".into(),
         output_text:
             "fn distill_heldout_quality() -> &'static str { \"CRYTEX_LORA_DISTILL_OK_HELDOUT\" }"
                 .into(),
+        accepted_output: Some(
+            "fn distill_heldout_quality() -> &'static str { \"CRYTEX_LORA_DISTILL_OK_HELDOUT\" }"
+                .into(),
+        ),
+        rejected_output: None,
+        critic_feedback: None,
+        failure_type: None,
         reward: 5.0,
         created_at: 99,
     }
@@ -1428,8 +1451,14 @@ mod tests {
             prompt_version_id: Some("pv1".into()),
             task_kind: "codegen".into(),
             agent_role: None,
+            model_id: None,
+            rag_evidence_ids: Vec::new(),
             input_text: input.into(),
             output_text: output.into(),
+            accepted_output: Some(output.into()),
+            rejected_output: None,
+            critic_feedback: None,
+            failure_type: None,
             reward,
             created_at: 0,
         }
