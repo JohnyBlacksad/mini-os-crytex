@@ -7,12 +7,12 @@ use crytex_doc::{
     Chunk, ChunkKind, chunk_code,
     chunking::chunk_code_with_graph,
     graph::{CodeGraph, builder::CodeGraphBuilder},
-    parse_doc, parse_pdf_bytes, walk_project,
+    parse_document_bytes, walk_project,
 };
 
 use crate::services::{
-    Embedder, EmbeddingError, SearchOptions, SparseEmbedder, SparseVectorPoint, VectorPoint,
-    VectorStore, VectorStoreError,
+    Embedder, EmbeddingError, IncrementalReindexReport, SearchOptions, SparseEmbedder,
+    SparseVectorPoint, VectorPoint, VectorStore, VectorStoreError,
 };
 
 /// Errors that can occur during indexing.
@@ -86,10 +86,11 @@ impl ProjectIndexer {
                 "doc_chunks"
             };
 
+            let chunk_count = chunks.len();
             self.upsert_chunks(project_id, &relative, collection, chunks)
                 .await?;
             stats.files_indexed += 1;
-            stats.chunks_indexed += 1; // approximate, updated below per batch
+            stats.chunks_indexed += chunk_count;
         }
 
         Ok(stats)
@@ -164,6 +165,27 @@ impl ProjectIndexer {
         Ok(())
     }
 
+    /// Apply an incremental index update for changed and removed project files.
+    pub async fn incremental_reindex(
+        &self,
+        project_id: &str,
+        project_root: &Path,
+        changed_paths: &[String],
+        removed_paths: &[String],
+    ) -> Result<IncrementalReindexReport, IndexerError> {
+        for path in changed_paths {
+            self.index_file(project_id, project_root, path).await?;
+        }
+        for path in removed_paths {
+            self.remove_file(project_id, path).await?;
+        }
+        Ok(IncrementalReindexReport {
+            status: "incremental_reindex_applied".into(),
+            changed_files: changed_paths.len(),
+            removed_files: removed_paths.len(),
+        })
+    }
+
     fn chunk_file(
         &self,
         full_path: &str,
@@ -178,7 +200,6 @@ impl ProjectIndexer {
         let code_exts = [
             "rs", "py", "js", "jsx", "ts", "tsx", "go", "java", "c", "cpp", "cc", "h", "hpp",
         ];
-        let doc_exts = ["md", "html", "htm"];
 
         if code_exts.contains(&ext) {
             let source = std::str::from_utf8(bytes).map_err(|error| {
@@ -190,14 +211,9 @@ impl ProjectIndexer {
                 None => chunk_code(relative_path, source)
                     .map_err(|e| IndexerError::Chunk(e.to_string())),
             }
-        } else if doc_exts.contains(&ext) {
-            let source = std::str::from_utf8(bytes)
-                .map_err(|error| IndexerError::Chunk(format!("invalid UTF-8 document: {error}")))?;
-            Ok(parse_doc(relative_path, source))
-        } else if ext == "pdf" {
-            parse_pdf_bytes(relative_path, bytes).map_err(|e| IndexerError::Chunk(e.to_string()))
         } else {
-            Ok(Vec::new())
+            parse_document_bytes(relative_path, bytes)
+                .map_err(|e| IndexerError::Chunk(e.to_string()))
         }
     }
 
@@ -289,6 +305,7 @@ impl ProjectIndexer {
                 .iter()
                 .map(|id| id.as_str())
                 .collect::<Vec<_>>(),
+            "security_findings": chunk.security_findings,
         })
     }
 }
@@ -1000,5 +1017,48 @@ mod tests {
         let text = code[0].payload.get("text").unwrap().as_str().unwrap();
         assert!(text.contains("new_func"));
         assert!(!text.contains("old_func"));
+    }
+
+    #[tokio::test]
+    async fn incremental_reindex_reports_changed_and_removed_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("main.rs"), "fn keep() {}\n").unwrap();
+        std::fs::write(root.join("old.rs"), "fn old() {}\n").unwrap();
+
+        let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::new(16));
+        let vector_store: Arc<dyn VectorStore> = Arc::new(TestVectorStore::default());
+        let indexer = ProjectIndexer::new(embedder.clone(), vector_store.clone());
+        indexer.index_file("proj-1", root, "old.rs").await.unwrap();
+
+        let report = indexer
+            .incremental_reindex("proj-1", root, &["main.rs".into()], &["old.rs".into()])
+            .await
+            .unwrap();
+
+        assert_eq!(report.status, "incremental_reindex_applied");
+        assert_eq!(report.changed_files, 1);
+        assert_eq!(report.removed_files, 1);
+        let old_results = search_chunks(
+            vector_store.as_ref(),
+            "code_chunks",
+            embedder.as_ref(),
+            "proj-1",
+            "old",
+            5,
+        )
+        .await
+        .unwrap();
+        let old_texts = old_results
+            .iter()
+            .filter_map(|result| {
+                result
+                    .payload
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+            })
+            .collect::<Vec<_>>();
+        assert!(!old_texts.iter().any(|text| text.contains("fn old")));
+        assert!(old_texts.iter().any(|text| text.contains("fn keep")));
     }
 }

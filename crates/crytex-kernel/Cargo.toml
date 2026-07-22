@@ -36,6 +36,7 @@ chrono = "0.4"
 async-trait = "0.1"
 ulid = "1.1"
 rand = "0.8"
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
 
 [[bin]]
 name = "crytex-kernel"

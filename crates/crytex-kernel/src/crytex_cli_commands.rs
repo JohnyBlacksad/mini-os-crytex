@@ -385,6 +385,11 @@ pub enum Commands {
         #[arg(short, long)]
         path: PathBuf,
     },
+    /// Search or prove the project RAG brain.
+    Rag {
+        #[command(subcommand)]
+        command: RagCommands,
+    },
     /// Stream metrics snapshots to stdout as NDJSON
     WatchMetrics {
         #[arg(short, long, default_value = "60")]
@@ -533,6 +538,37 @@ pub enum ABTestCommands {
     },
 }
 
+#[derive(Subcommand)]
+pub enum RagCommands {
+    /// Search indexed project context and explain dense/sparse/fusion/rerank/selection decisions.
+    Search {
+        query: String,
+        #[arg(short, long)]
+        project_id: String,
+        #[arg(long)]
+        path: Option<PathBuf>,
+        #[arg(long)]
+        rerank: bool,
+        #[arg(long)]
+        explain: bool,
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        diagnostics_path: Option<PathBuf>,
+        #[arg(long, default_value = "8")]
+        top_k: usize,
+        #[arg(long, default_value = "2048")]
+        token_budget: usize,
+    },
+    /// Build a mixed fixture and prove end-to-end RAG retrieval evidence.
+    Prove {
+        #[arg(long, default_value = "mixed-docs-code")]
+        fixture: String,
+        #[arg(long)]
+        report_path: Option<PathBuf>,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum AcceptanceRuntimeMode {
     Deterministic,
@@ -601,5 +637,61 @@ mod tests {
         assert!(help.contains("deterministic"));
         assert!(help.contains("ollama"));
         assert!(help.contains("mistral"));
+    }
+
+    #[test]
+    fn rag_search_command_parses_explainable_json_contract() {
+        let cli = Cli::parse_from([
+            "crytex-kernel",
+            "rag",
+            "search",
+            "where is retry policy documented?",
+            "--project-id",
+            "proj-1",
+            "--rerank",
+            "--explain",
+            "--json",
+        ]);
+
+        let Commands::Rag {
+            command:
+                RagCommands::Search {
+                    query,
+                    project_id,
+                    rerank,
+                    explain,
+                    json,
+                    ..
+                },
+        } = cli.command
+        else {
+            panic!("expected rag search command");
+        };
+
+        assert_eq!(query, "where is retry policy documented?");
+        assert_eq!(project_id, "proj-1");
+        assert!(rerank);
+        assert!(explain);
+        assert!(json);
+    }
+
+    #[test]
+    fn rag_prove_command_parses_mixed_docs_code_fixture() {
+        let cli = Cli::parse_from([
+            "crytex-kernel",
+            "rag",
+            "prove",
+            "--fixture",
+            "mixed-docs-code",
+        ]);
+
+        let Commands::Rag {
+            command: RagCommands::Prove { fixture, .. },
+        } = cli.command
+        else {
+            panic!("expected rag prove command");
+        };
+
+        assert_eq!(fixture, "mixed-docs-code");
     }
 }

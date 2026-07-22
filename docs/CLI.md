@@ -125,6 +125,13 @@ crytex rag search "where is CSV import handled?" --rerank --explain --json
 crytex rag prove --fixture fixtures\mixed-docs-code --json
 ```
 
+Current development binary:
+
+```powershell
+cargo run -p crytex-kernel -- rag search "where is retry policy documented?" --project-id my-project --path A:\Projects\my-app --rerank --explain --json --diagnostics-path reports\rag-search.json
+cargo run -p crytex-kernel -- rag prove --fixture mixed-docs-code --report-path reports\rag-p3-proof.json
+```
+
 JSON output contains:
 
 ```json
@@ -140,6 +147,9 @@ JSON output contains:
 
 RAG is considered healthy only when agents receive selected context with source
 evidence and token-budget decisions.
+
+See [RAG.md](RAG.md) for parser coverage, diagnostics schema,
+prompt-injection scanning, incremental reindex, and crash-safe rebuild behavior.
 
 ## `goal`
 

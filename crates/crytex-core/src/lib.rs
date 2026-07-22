@@ -9,6 +9,7 @@ pub mod metrics;
 pub mod models;
 pub mod persistence;
 pub mod policy;
+pub mod rag_pipeline;
 pub mod security;
 pub mod services;
 pub mod state_export;

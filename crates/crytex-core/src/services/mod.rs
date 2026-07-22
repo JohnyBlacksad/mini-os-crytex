@@ -39,6 +39,11 @@ pub mod vector_store;
 pub mod worker;
 pub mod workflow;
 
+pub use crate::rag_pipeline::{
+    CrashSafeRebuildReport, IncrementalReindexReport, PromptInjectionSeverity,
+    RagCandidateEvidence, RagDiagnostics, RagPipeline, RagPipelineError, RagPipelineRequest,
+    RagPipelineResponse,
+};
 pub use agent_service::{Agent, AgentError, AgentService, AgentServiceError, AgentServiceImpl};
 pub use alert_service::{Alert, AlertService, AlertServiceImpl, AlertSeverity, AlertThresholds};
 pub use artifact_contract::{

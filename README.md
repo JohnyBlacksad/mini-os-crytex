@@ -109,6 +109,9 @@ See [docs/CLI.md](docs/CLI.md) for the full command reference, output rules,
 exit codes, and examples.
 See [docs/BACKEND_ACCEPTANCE.md](docs/BACKEND_ACCEPTANCE.md) for the canonical
 backend acceptance harness, runtime modes, JSON artifact, and test profiles.
+See [docs/RAG.md](docs/RAG.md) for the project-brain RAG pipeline, supported
+formats, diagnostics, prompt-injection scanning, incremental reindex, and
+crash-safe rebuild.
 
 Every production command follows these rules:
 
