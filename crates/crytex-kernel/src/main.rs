@@ -29,9 +29,9 @@ use crytex_bench::{
     Score, Scorer,
 };
 use crytex_cli_commands::{
-    ABTestCommands, AcceptanceRuntimeMode, BenchCommands, Cli, Commands, EvolutionCommands,
-    KanbanCommands, LoraCommands, LoraDatasetCommands, LoraObjectiveArg, PromptCommands,
-    PromptMutationOperatorArg, RagCommands,
+    ABTestCommands, AcceptanceRuntimeMode, BenchCommands, Cli, Commands, DiagCommands,
+    EvolutionCommands, KanbanCommands, LoraCommands, LoraDatasetCommands, LoraObjectiveArg,
+    ModelCommands, PromptCommands, PromptMutationOperatorArg, RagCommands,
 };
 use crytex_compress::{
     ArtifactKind, CompressionQualityReport, DiskCcrStore, InMemoryCcrStore, ModelTokenProfile,
@@ -75,10 +75,10 @@ use crytex_core::{
         PromptEvolutionService, PromptFailureKind, PromptFailureRouter, Quantization,
         RecordRewardRequest, RerankPassage, RerankResult, RewardService, RoleAdapterRegistry,
         RoleQualityProof, RuntimeFeatureSet, RuntimeMatrixEntryRequest, RuntimeMatrixReportWriter,
-        SchedulerImpl, StaticEvolutionObservationSource, SystemHardwareDetector, TaskHandler,
-        TaskServiceImpl, TomlWorkflowRepository, VectorStore, WorkerError, WorkerPool,
-        WorkflowDefinition, WorkflowEdge, WorkflowEngine, WorkflowNode, WorkflowRepository,
-        WorkflowRetryPolicy, lora_quality_gate, recommend_local_device,
+        RuntimeModelMatrix, SchedulerImpl, StaticEvolutionObservationSource,
+        SystemHardwareDetector, TaskHandler, TaskServiceImpl, TomlWorkflowRepository, VectorStore,
+        WorkerError, WorkerPool, WorkflowDefinition, WorkflowEdge, WorkflowEngine, WorkflowNode,
+        WorkflowRepository, WorkflowRetryPolicy, lora_quality_gate, recommend_local_device,
         validate_objective_examples,
     },
     state_export::export_project_state,
@@ -212,6 +212,80 @@ fn build_downloaded_model_backend_config(
         Some(recommendation.context_size),
         recommendation.gpu_layers,
     ))
+}
+
+fn activate_downloaded_model(
+    config: &CrytexConfig,
+    model_manager: &dyn crytex_core::services::ModelManager,
+    model: &crytex_core::services::ManagedModel,
+    backend_id: &str,
+) {
+    let recommendation = model_manager
+        .recommend_config(&model.id)
+        .unwrap_or_else(|error| {
+            eprintln!("Failed to recommend config: {}", error);
+            std::process::exit(1);
+        });
+    let backend_config = build_downloaded_model_backend_config(backend_id, model, &recommendation)
+        .unwrap_or_else(|error| {
+            eprintln!("Failed to build backend config: {}", error);
+            std::process::exit(1);
+        });
+    let mut config = config.clone();
+    config
+        .inference
+        .backends
+        .retain(|backend| backend.id != backend_config.id);
+    config.inference.default_backend = Some(backend_config.id.clone());
+    config.inference.backends.push(backend_config);
+    if let Err(error) = config.save() {
+        eprintln!("Failed to save activated backend config: {}", error);
+        std::process::exit(1);
+    }
+}
+
+fn write_json_report(path: &Path, payload: &str, label: &str) {
+    if let Some(parent) = path.parent()
+        && let Err(error) = std::fs::create_dir_all(parent)
+    {
+        eprintln!("Failed to create {label} report directory: {error}");
+        std::process::exit(1);
+    }
+    if let Err(error) = std::fs::write(path, payload) {
+        eprintln!("Failed to write {label} report: {error}");
+        std::process::exit(1);
+    }
+}
+
+fn print_runtime_model_matrix_human(report: &crytex_core::services::RuntimeModelMatrixReport) {
+    println!("Runtime / Model Matrix");
+    for backend in &report.backends {
+        println!(
+            "{:?}: {}  generate={} chat={} embed={} rerank={} lora_runtime={} lora_train={} hot_swap={} cuda={}",
+            backend.backend,
+            backend.status.as_str(),
+            backend.generate.as_str(),
+            backend.chat.as_str(),
+            backend.embeddings.as_str(),
+            backend.rerank.as_str(),
+            backend.lora_runtime_application.as_str(),
+            backend.lora_training.as_str(),
+            backend.lora_hot_swap.as_str(),
+            backend.cuda.as_str()
+        );
+        for reason in &backend.reasons {
+            println!("  - {reason}");
+        }
+    }
+    println!(
+        "TensorRT-LLM module: {} ({})",
+        report.trtllm_future_module.status.as_str(),
+        report.trtllm_future_module.decision
+    );
+    println!("CUDA doctor preflight:");
+    for check in &report.cuda_preflight.doctor_checks {
+        println!("  - {check}");
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -7908,6 +7982,26 @@ async fn async_main() {
         warn!("Failed to create data directories: {}", e);
     }
 
+    if let Commands::Diag {
+        command: DiagCommands::ProbeRuntimeMatrix { json, report_path },
+    } = &cli.command
+    {
+        let report = RuntimeModelMatrix::report();
+        let payload = unwrap_or_exit!(
+            serde_json::to_string_pretty(&report),
+            "Failed to serialize runtime/model matrix"
+        );
+        if let Some(path) = report_path {
+            write_json_report(path, &payload, "runtime/model matrix");
+        }
+        if *json {
+            println!("{payload}");
+        } else {
+            print_runtime_model_matrix_human(&report);
+        }
+        return;
+    }
+
     if let Commands::AddBackend {
         id,
         kind,
@@ -7950,6 +8044,110 @@ async fn async_main() {
             std::process::exit(1);
         }
         println!("Backend {} added. Use switch-backend to select it.", id);
+        return;
+    }
+
+    if let Commands::Models {
+        command:
+            ModelCommands::Prove {
+                id,
+                backend,
+                model,
+                trace_id,
+                max_tokens,
+                timeout_seconds,
+                report_path,
+            },
+    } = &cli.command
+    {
+        let inference = create_inference_service(&config).unwrap_or_else(|e| {
+            eprintln!("Failed to create inference service: {}", e);
+            std::process::exit(1);
+        });
+        let event_bus = Arc::new(crytex_core::EventBus::new());
+        let event_service = Arc::new(EventServiceImpl::new(event_bus));
+        let config_dir = CrytexConfig::config_path()
+            .parent()
+            .expect("config path must have a parent")
+            .to_path_buf();
+        let model_manager: Arc<dyn crytex_core::services::ModelManager> =
+            Arc::new(ModelManagerImpl::new_standard(
+                &config_dir,
+                &config.paths.data_dir,
+                event_service,
+                Arc::new(SystemHardwareDetector::new()),
+            ));
+        let backend_id = backend
+            .clone()
+            .or_else(|| config.inference.default_backend.clone());
+        let managed_model = match model_manager.get_model(id) {
+            Ok(model) => model,
+            Err(_error) if model.is_some() => {
+                let preferred_backend = backend_id
+                    .as_ref()
+                    .and_then(|id| config.inference.backend(id))
+                    .map(|backend| backend.kind)
+                    .unwrap_or(BackendKind::Custom);
+                crytex_core::services::ManagedModel {
+                    id: id.clone(),
+                    name: model.clone().unwrap_or_else(|| id.clone()),
+                    repo: None,
+                    filename: None,
+                    local_path: None,
+                    quantization: None,
+                    preferred_backend,
+                    params_b: None,
+                    status: crytex_core::services::ModelStatus::Available,
+                }
+            }
+            Err(error) => {
+                eprintln!("Failed to get model: {}", error);
+                std::process::exit(1);
+            }
+        };
+        let detector = SystemHardwareDetector::new();
+        let device = crytex_core::services::HardwareDetector::detect(&detector);
+        let runtime = RuntimeFeatureSet::from_device(&device);
+        let model_name = model.clone().unwrap_or_else(|| {
+            managed_model
+                .local_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .or_else(|| {
+                    backend_id
+                        .as_ref()
+                        .and_then(|id| config.inference.backend(id))
+                        .map(|backend| backend.model.clone())
+                })
+                .unwrap_or_else(|| managed_model.id.clone())
+        });
+        let probe = ModelRuntimeProbe::new(inference);
+        let report = probe
+            .probe(
+                &managed_model,
+                &device,
+                &runtime,
+                ModelRuntimeProbeRequest {
+                    backend_id,
+                    model_name,
+                    trace_id: trace_id.clone(),
+                    max_tokens: *max_tokens,
+                    timeout_seconds: *timeout_seconds,
+                    lora_adapter_id: None,
+                },
+            )
+            .await;
+        let payload = unwrap_or_exit!(
+            serde_json::to_string_pretty(&report),
+            "Failed to serialize model proof"
+        );
+        if let Some(path) = report_path {
+            write_json_report(path, &payload, "model proof");
+        }
+        println!("{payload}");
+        if !report.passed {
+            std::process::exit(2);
+        }
         return;
     }
 
@@ -10148,6 +10346,160 @@ async fn async_main() {
                 );
             }
         }
+        Commands::Diag { .. } => {
+            unreachable!("diag commands are handled before full AppContext initialization")
+        }
+        Commands::Models { command } => match command {
+            ModelCommands::List { backend, json } => {
+                if let Some(backend_id) = backend {
+                    match ctx.inference_service.list_models(Some(&backend_id)).await {
+                        Ok(models) => {
+                            if json {
+                                println!(
+                                    "{}",
+                                    serde_json::to_string_pretty(&models)
+                                        .unwrap_or_else(|_| "[]".to_string())
+                                );
+                            } else if models.is_empty() {
+                                println!("No models available");
+                            } else {
+                                for model in models {
+                                    println!("{}  {}", model.id, model.name);
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            eprintln!("Failed to list models: {}", error);
+                            std::process::exit(1);
+                        }
+                    }
+                } else {
+                    match model_manager.list_models() {
+                        Ok(models) => {
+                            if json {
+                                println!(
+                                    "{}",
+                                    serde_json::to_string_pretty(&models)
+                                        .unwrap_or_else(|_| "[]".to_string())
+                                );
+                            } else if models.is_empty() {
+                                println!(
+                                    "No models configured. Use `crytex models add` or edit ~/.config/crytex/manifest.toml"
+                                );
+                            } else {
+                                for model in models {
+                                    let status = match model.status {
+                                        crytex_core::services::ModelStatus::Available => {
+                                            "available".to_string()
+                                        }
+                                        crytex_core::services::ModelStatus::Downloaded => {
+                                            "downloaded".to_string()
+                                        }
+                                        crytex_core::services::ModelStatus::Downloading(p) => {
+                                            format!("downloading {:.0}%", p * 100.0)
+                                        }
+                                        crytex_core::services::ModelStatus::Error(ref error) => {
+                                            format!("error: {}", error)
+                                        }
+                                    };
+                                    println!("{}  {}  [{}]", model.id, model.name, status);
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            eprintln!("Failed to list managed models: {}", error);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            }
+            ModelCommands::Add {
+                id,
+                name,
+                repo,
+                filename,
+                quantization,
+                backend,
+                params_b,
+            } => {
+                let entry = build_manifest_entry(
+                    id.clone(),
+                    name.clone(),
+                    repo.clone(),
+                    filename.clone(),
+                    quantization.clone(),
+                    backend.clone(),
+                    params_b,
+                )
+                .unwrap_or_else(|error| {
+                    eprintln!("Failed to build model manifest entry: {}", error);
+                    std::process::exit(1);
+                });
+                let model = model_manager.add_model(entry).unwrap_or_else(|error| {
+                    eprintln!("Failed to add model: {}", error);
+                    std::process::exit(1);
+                });
+                println!(
+                    "Model {} added. Use `crytex models download --id {}` then `crytex models prove --id {}`.",
+                    model.id, model.id, model.id
+                );
+            }
+            ModelCommands::Download {
+                id,
+                activate,
+                backend_id,
+            } => {
+                let mut rx = ctx.event_service.subscribe();
+                let progress_id = id.clone();
+                let progress_handle = tokio::spawn(async move {
+                    while let Ok(event) = rx.recv().await {
+                        if let Event::ModelDownloadProgress { model_id, progress } = event
+                            && model_id == progress_id
+                        {
+                            print!("\rDownloading {}: {:.0}%", model_id, progress * 100.0);
+                            let _ = std::io::Write::flush(&mut std::io::stdout());
+                            if (progress - 1.0).abs() < f32::EPSILON {
+                                break;
+                            }
+                        }
+                    }
+                });
+                let result = model_manager.download_model(&id).await;
+                progress_handle.await.ok();
+                println!();
+                let model = result.unwrap_or_else(|error| {
+                    eprintln!("Failed to download model: {}", error);
+                    std::process::exit(1);
+                });
+                println!("Downloaded model {} to {:?}", model.id, model.local_path);
+                if activate {
+                    activate_downloaded_model(
+                        &ctx.config,
+                        model_manager.as_ref(),
+                        &model,
+                        &backend_id,
+                    );
+                    println!(
+                        "Activated model {} as backend {}. Use `crytex models prove --id {} --backend {}`.",
+                        model.id, backend_id, model.id, backend_id
+                    );
+                }
+            }
+            ModelCommands::Activate { id, backend_id } => {
+                let model = model_manager.get_model(&id).unwrap_or_else(|error| {
+                    eprintln!("Failed to get model: {}", error);
+                    std::process::exit(1);
+                });
+                activate_downloaded_model(&ctx.config, model_manager.as_ref(), &model, &backend_id);
+                println!(
+                    "Activated model {} as backend {}. Restart long-running workers to apply.",
+                    model.id, backend_id
+                );
+            }
+            ModelCommands::Prove { .. } => {
+                unreachable!("models prove is handled before full AppContext initialization")
+            }
+        },
         Commands::ListModels { backend } => {
             if let Some(backend_id) = backend {
                 match ctx.inference_service.list_models(Some(&backend_id)).await {

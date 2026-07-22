@@ -34,6 +34,7 @@ pub mod reranker;
 pub mod reward_service;
 pub mod role;
 pub mod role_quality;
+pub mod runtime_model_matrix;
 pub mod sandbox_service;
 pub mod scheduler;
 pub mod task_service;
@@ -135,6 +136,10 @@ pub use role_quality::{
     RoleArtifactContract, RoleBenchmarkFixture, RoleLoraHotSwapReport, RoleQualityCatalog,
     RoleQualityContract, RoleQualityGate, RoleQualityProof, RoleQualityProofReport,
     RoleSmokeReport,
+};
+pub use runtime_model_matrix::{
+    BackendRuntimeCapability, CudaPreflightContract, RuntimeModelMatrix, RuntimeModelMatrixReport,
+    RuntimeSupportLevel, TrtLlmModuleDisposition,
 };
 pub use sandbox_service::{
     ExecutionRequest, ExecutionResult, SandboxMount, SandboxNetwork, SandboxResources,

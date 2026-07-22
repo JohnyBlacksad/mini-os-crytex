@@ -43,6 +43,16 @@ pub enum Commands {
     },
     /// List configured inference backends
     ListBackends,
+    /// Manage configured, downloaded, active, and probed models
+    Models {
+        #[command(subcommand)]
+        command: ModelCommands,
+    },
+    /// Runtime diagnostics and preflight probes
+    Diag {
+        #[command(subcommand)]
+        command: DiagCommands,
+    },
     /// List models available from a backend or from the model manager
     ListModels {
         #[arg(short, long)]
@@ -641,6 +651,78 @@ pub enum EvolutionCommands {
         all_roles: bool,
         #[arg(long)]
         json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ModelCommands {
+    /// List backend inventory or managed model registry.
+    List {
+        #[arg(short, long)]
+        backend: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Add or update a managed HuggingFace/local model entry.
+    Add {
+        #[arg(short, long)]
+        id: String,
+        #[arg(short, long)]
+        name: Option<String>,
+        #[arg(short, long)]
+        repo: Option<String>,
+        #[arg(short, long)]
+        filename: Option<String>,
+        #[arg(short, long)]
+        quantization: Option<String>,
+        #[arg(short, long, default_value = "mistralrs")]
+        backend: String,
+        #[arg(long)]
+        params_b: Option<f32>,
+    },
+    /// Download a managed model from its configured source.
+    Download {
+        #[arg(short, long)]
+        id: String,
+        #[arg(long)]
+        activate: bool,
+        #[arg(long, default_value = "local-hf")]
+        backend_id: String,
+    },
+    /// Activate a downloaded model as an inference backend.
+    Activate {
+        #[arg(short, long)]
+        id: String,
+        #[arg(long, default_value = "local")]
+        backend_id: String,
+    },
+    /// Prove metadata, compatibility, and smoke generation for a managed model.
+    Prove {
+        #[arg(short, long)]
+        id: String,
+        #[arg(short, long)]
+        backend: Option<String>,
+        #[arg(short, long)]
+        model: Option<String>,
+        #[arg(long)]
+        trace_id: Option<String>,
+        #[arg(long, default_value = "16")]
+        max_tokens: usize,
+        #[arg(long)]
+        timeout_seconds: Option<u64>,
+        #[arg(long)]
+        report_path: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum DiagCommands {
+    /// Probe and explain backend/model support matrix.
+    ProbeRuntimeMatrix {
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        report_path: Option<PathBuf>,
     },
 }
 
@@ -1305,5 +1387,109 @@ mod tests {
             report_path,
             Some(PathBuf::from("reports/evolution-policy-p11.json"))
         );
+    }
+
+    #[test]
+    fn models_group_parses_list_add_download_activate_and_prove_contract() {
+        let list = Cli::parse_from(["crytex-kernel", "models", "list", "--json"]);
+        assert!(matches!(
+            list.command,
+            Commands::Models {
+                command: ModelCommands::List {
+                    backend: None,
+                    json: true
+                }
+            }
+        ));
+
+        let add = Cli::parse_from([
+            "crytex-kernel",
+            "models",
+            "add",
+            "--id",
+            "qwen-local",
+            "--repo",
+            "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF",
+            "--backend",
+            "mistralrs",
+        ]);
+        assert!(matches!(
+            add.command,
+            Commands::Models {
+                command: ModelCommands::Add {
+                    id,
+                    repo: Some(_),
+                    backend,
+                    ..
+                }
+            } if id == "qwen-local" && backend == "mistralrs"
+        ));
+
+        let download =
+            Cli::parse_from(["crytex-kernel", "models", "download", "--id", "qwen-local"]);
+        assert!(matches!(
+            download.command,
+            Commands::Models {
+                command: ModelCommands::Download { id, activate: false, .. }
+            } if id == "qwen-local"
+        ));
+
+        let activate = Cli::parse_from([
+            "crytex-kernel",
+            "models",
+            "activate",
+            "--id",
+            "qwen-local",
+            "--backend-id",
+            "local",
+        ]);
+        assert!(matches!(
+            activate.command,
+            Commands::Models {
+                command: ModelCommands::Activate { id, backend_id }
+            } if id == "qwen-local" && backend_id == "local"
+        ));
+
+        let prove = Cli::parse_from([
+            "crytex-kernel",
+            "models",
+            "prove",
+            "--id",
+            "qwen-local",
+            "--report-path",
+            "reports/model-runtime-p12.json",
+        ]);
+        assert!(matches!(
+            prove.command,
+            Commands::Models {
+                command: ModelCommands::Prove {
+                    id,
+                    report_path: Some(_),
+                    ..
+                }
+            } if id == "qwen-local"
+        ));
+    }
+
+    #[test]
+    fn diag_group_parses_probe_runtime_matrix_contract() {
+        let cli = Cli::parse_from([
+            "crytex-kernel",
+            "diag",
+            "probe-runtime-matrix",
+            "--json",
+            "--report-path",
+            "reports/runtime-matrix-p12-proof.json",
+        ]);
+
+        assert!(matches!(
+            cli.command,
+            Commands::Diag {
+                command: DiagCommands::ProbeRuntimeMatrix {
+                    json: true,
+                    report_path: Some(_)
+                }
+            }
+        ));
     }
 }

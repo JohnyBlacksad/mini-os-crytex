@@ -155,6 +155,7 @@ cargo run -p crytex-kernel -- prove-lora-dataset --report-path reports\lora-data
 cargo run -p crytex-kernel -- prove-lora-training-objectives --report-path reports\lora-training-objectives-p9-proof.json
 cargo run -p crytex-kernel -- prove-lora-quality-gate --report-path reports\lora-quality-gate-p10-proof.json
 cargo run -p crytex-kernel -- prove-evolution-policy --report-path reports\evolution-policy-p11-proof.json
+cargo run -p crytex-kernel -- diag probe-runtime-matrix --json --report-path reports\runtime-model-matrix-p12-proof.json
 ```
 
 The token-economy report proves model headroom reservation, shared RAG-context reuse, CCR
@@ -186,6 +187,11 @@ changing itself: bad context routes to RAG, schema/format to prompts, repeated
 role skill failure to LoRA, weak critic feedback to critic-role evolution,
 security gaps to policy, and uncertain failures to benchmark expansion.
 
+The runtime/model matrix report proves each backend is classified honestly as
+`supported`, `partial`, or `unsupported`: Ollama, Mistral GGUF CPU/CUDA, ONNX
+embed/rerank, OpenAI-compatible, and Anthropic all expose explicit LoRA truth,
+CUDA/toolchain preflight expectations, and unsupported-capability reasons.
+
 The LoRA dataset report proves Crytex stores accepted outputs as positive
 targets, rejected outputs as negative preference sides, preserves critic
 feedback/failure type/RAG evidence/model id, scopes datasets per role, and
@@ -200,7 +206,7 @@ service boundaries.
 
 - Run `crytex doctor --strict` first.
 - If local model generation fails, run `crytex models prove <id>` or
-  `crytex diag runtime-matrix`.
+  `crytex diag probe-runtime-matrix`.
 - If RAG misses context, run `crytex rag search ... --rerank --explain --json`
   and inspect selected chunks and rejection reasons.
 - If a LoRA adapter does not improve quality, inspect

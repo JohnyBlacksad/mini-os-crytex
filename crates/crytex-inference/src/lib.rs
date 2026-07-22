@@ -78,7 +78,7 @@ pub struct TokenUsage {
     pub total_tokens: usize,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ModelInfo {
     pub id: String,
     pub name: String,

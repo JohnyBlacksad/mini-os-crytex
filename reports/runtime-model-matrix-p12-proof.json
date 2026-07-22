@@ -1,0 +1,130 @@
+{
+  "backends": [
+    {
+      "backend": "ollama",
+      "status": "partial",
+      "generate": "supported",
+      "chat": "supported",
+      "embeddings": "supported",
+      "rerank": "unsupported",
+      "lora_training": "unsupported",
+      "lora_runtime_application": "unsupported",
+      "lora_hot_swap": "unsupported",
+      "model_listing": "supported",
+      "download": "supported",
+      "cuda": "partial",
+      "reasons": [
+        "Ollama supports local generation/chat, embeddings, tags/listing, and pull/download through its HTTP API",
+        "Crytex does not treat Ollama as a runtime LoRA adapter backend; use a baked Ollama model outside Crytex if needed",
+        "CUDA is managed by Ollama/host installation, so Crytex can preflight connectivity but cannot guarantee GPU placement"
+      ],
+      "references": [
+        "https://github.com/ollama/ollama/blob/main/docs/api.md"
+      ]
+    },
+    {
+      "backend": "mistral_rs",
+      "status": "supported",
+      "generate": "supported",
+      "chat": "supported",
+      "embeddings": "unsupported",
+      "rerank": "unsupported",
+      "lora_training": "supported",
+      "lora_runtime_application": "supported",
+      "lora_hot_swap": "supported",
+      "model_listing": "supported",
+      "download": "supported",
+      "cuda": "partial",
+      "reasons": [
+        "mistral.rs is Crytex's local GGUF text runtime and role LoRA application path",
+        "Embeddings/rerank stay delegated to ONNX or another dedicated backend",
+        "CUDA support depends on build features, driver/toolchain, model architecture, and fallback availability"
+      ],
+      "references": [
+        "https://github.com/EricLBuehler/mistral.rs"
+      ]
+    },
+    {
+      "backend": "onnx",
+      "status": "partial",
+      "generate": "unsupported",
+      "chat": "unsupported",
+      "embeddings": "supported",
+      "rerank": "supported",
+      "lora_training": "unsupported",
+      "lora_runtime_application": "unsupported",
+      "lora_hot_swap": "unsupported",
+      "model_listing": "supported",
+      "download": "partial",
+      "cuda": "partial",
+      "reasons": [
+        "ONNX is an embedding/rerank runtime in Crytex, not a text generation backend",
+        "FastEmbed presets can download/cache models; local ONNX directories are caller-provided",
+        "CUDA depends on ONNX Runtime execution provider availability"
+      ],
+      "references": [
+        "https://onnxruntime.ai/docs/execution-providers/CUDA-ExecutionProvider.html",
+        "https://github.com/Anush008/fastembed-rs"
+      ]
+    },
+    {
+      "backend": "open_ai_compatible",
+      "status": "partial",
+      "generate": "supported",
+      "chat": "supported",
+      "embeddings": "supported",
+      "rerank": "unsupported",
+      "lora_training": "unsupported",
+      "lora_runtime_application": "unsupported",
+      "lora_hot_swap": "unsupported",
+      "model_listing": "supported",
+      "download": "unsupported",
+      "cuda": "unsupported",
+      "reasons": [
+        "OpenAI-compatible HTTP backends support chat/completions, embeddings, and model listing when the provider implements those endpoints",
+        "Crytex cannot apply runtime LoRA adapters inside remote OpenAI-compatible providers",
+        "Download and CUDA placement are provider-side concerns"
+      ],
+      "references": [
+        "https://platform.openai.com/docs/api-reference/chat",
+        "https://platform.openai.com/docs/api-reference/models/list"
+      ]
+    },
+    {
+      "backend": "anthropic",
+      "status": "partial",
+      "generate": "supported",
+      "chat": "supported",
+      "embeddings": "unsupported",
+      "rerank": "unsupported",
+      "lora_training": "unsupported",
+      "lora_runtime_application": "unsupported",
+      "lora_hot_swap": "unsupported",
+      "model_listing": "partial",
+      "download": "unsupported",
+      "cuda": "unsupported",
+      "reasons": [
+        "Anthropic Messages API supports text/chat generation through configured model ids",
+        "Crytex uses the configured Anthropic model id instead of relying on public model discovery",
+        "Anthropic does not provide Crytex embeddings, rerank, download, CUDA, or runtime LoRA adapter application"
+      ],
+      "references": [
+        "https://docs.anthropic.com/en/api/messages"
+      ]
+    }
+  ],
+  "trtllm_future_module": {
+    "path": "trash/crytex-inference-trtllm",
+    "status": "unsupported",
+    "decision": "kept as future optional module; it is outside the production runtime matrix until the crate is moved under crates/ and receives CI/toolchain probes"
+  },
+  "cuda_preflight": {
+    "doctor_checks": [
+      "nvidia-smi availability",
+      "CUDA driver/runtime compatibility",
+      "NVCC or runtime DLL visibility when CUDA features are enabled",
+      "local backend GPU layer configuration"
+    ],
+    "failure_mode": "doctor must report typed unsupported/partial CUDA status and CPU fallback, not panic"
+  }
+}

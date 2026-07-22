@@ -75,6 +75,7 @@ RAG, sandbox, token economy, Prompt Evolution, and LoRA Evolution readiness.
 
 ```powershell
 crytex doctor --strict --json
+crytex diag probe-runtime-matrix --json
 ```
 
 Human output:
@@ -86,7 +87,10 @@ Runtime: partial, CUDA compiler missing
 LoRA Evolution: ready, no active benchmark corpus
 ```
 
-JSON output includes module capability reports and blockers.
+JSON output includes module capability reports and blockers. CUDA/toolchain
+preflight is part of doctor diagnostics: GPU-required runs fail typed checks
+when `nvidia-smi` is unavailable, while optional GPU mode reports warnings and
+CPU fallback instead of crashing.
 
 ## `project`
 
@@ -292,7 +296,7 @@ Export diagnostics and runtime reports.
 
 ```powershell
 crytex diag export --run latest --out reports\latest.json
-crytex diag runtime-matrix --model qwen
+crytex diag probe-runtime-matrix --json --report-path reports\runtime-model-matrix-p12-proof.json
 ```
 
 Diagnostics include runtime, task graph, Kanban transitions, RAG evidence,
@@ -305,14 +309,27 @@ Manage model inventory and runtime activation.
 
 ```powershell
 crytex models list --json
-crytex models add qwen --repo owner/model --filename model.gguf --backend mistral
-crytex models download qwen
-crytex models activate qwen
-crytex models prove qwen --json
+crytex models add --id qwen --repo owner/model --filename model.gguf --backend mistralrs
+crytex models download --id qwen --activate --backend-id local
+crytex models activate --id qwen --backend-id local
+crytex models prove --id qwen --backend local --report-path reports\model-runtime.json
 ```
 
 Model proof reports generation evidence, compatibility strategy, CUDA/toolchain
-state, and unsupported capability reasons.
+state, and unsupported capability reasons. Runtime matrix diagnostics report
+every backend as `supported`, `partial`, or `unsupported` with reasons:
+
+- Ollama: generation/chat/embeddings/model listing/download supported; runtime LoRA unsupported.
+- Mistral GGUF CPU/CUDA: generation/chat/model listing/download and Crytex LoRA training/application/hot-swap supported; embeddings/rerank delegated.
+- ONNX: embeddings/rerank supported; text generation and LoRA unsupported.
+- OpenAI-compatible: chat/generation/embeddings/model listing supported when the provider exposes compatible endpoints; LoRA/download/CUDA unsupported in Crytex.
+- Anthropic: chat/generation supported through configured model id; embeddings/rerank/LoRA/download/CUDA unsupported.
+
+`trash/crytex-inference-trtllm` is kept as a future optional module until it is
+moved into `crates/` with CI and toolchain probes.
+
+See [RUNTIME_MODEL_MATRIX.md](RUNTIME_MODEL_MATRIX.md) for the support contract
+and references.
 
 ## `prompts`
 

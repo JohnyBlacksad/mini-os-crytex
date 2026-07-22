@@ -205,6 +205,11 @@ pub fn doctor(config: &DiagConfig, requested_backend_ids: &[String]) -> DoctorRe
         }
     }
 
+    checks.push(cuda_toolchain_doctor_check(
+        detect_cuda_toolchain_presence(),
+        false,
+    ));
+
     let passed = checks
         .iter()
         .all(|check| check.status != DoctorCheckStatus::Failed);
@@ -225,6 +230,13 @@ pub async fn doctor_with_api_checks_and_options(
     options: DoctorOptions,
 ) -> DoctorReport {
     let mut report = doctor(config, requested_backend_ids);
+    if let Some(check) = report
+        .checks
+        .iter_mut()
+        .find(|check| check.name == "cuda_toolchain_preflight")
+    {
+        *check = cuda_toolchain_doctor_check(detect_cuda_toolchain_presence(), options.require_gpu);
+    }
     let backend_ids = configured_backend_ids(config, requested_backend_ids);
 
     for backend_id in backend_ids {
@@ -243,6 +255,75 @@ pub async fn doctor_with_api_checks_and_options(
         .iter()
         .all(|check| check.status != DoctorCheckStatus::Failed);
     report
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CudaToolchainPresence {
+    nvidia_smi: bool,
+    nvcc: bool,
+    runtime_library: bool,
+}
+
+fn detect_cuda_toolchain_presence() -> CudaToolchainPresence {
+    CudaToolchainPresence {
+        nvidia_smi: command_succeeds("nvidia-smi", &["--query-gpu=name", "--format=csv,noheader"]),
+        nvcc: command_succeeds("nvcc", &["--version"]),
+        runtime_library: cuda_runtime_library_visible(),
+    }
+}
+
+fn command_succeeds(program: &str, args: &[&str]) -> bool {
+    std::process::Command::new(program)
+        .args(args)
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+fn cuda_runtime_library_visible() -> bool {
+    std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+        .any(|path| {
+            [
+                "cudart64_12.dll",
+                "cudart64_11.dll",
+                "libcudart.so",
+                "libcudart.dylib",
+            ]
+            .iter()
+            .any(|name| path.join(name).exists())
+        })
+}
+
+fn cuda_toolchain_doctor_check(presence: CudaToolchainPresence, require_gpu: bool) -> DoctorCheck {
+    let toolchain_visible = presence.nvcc || presence.runtime_library;
+    match (presence.nvidia_smi, toolchain_visible, require_gpu) {
+        (true, true, _) => doctor_check(
+            "cuda_toolchain_preflight",
+            DoctorCheckStatus::Passed,
+            "CUDA GPU and compiler/runtime library are visible",
+        ),
+        (true, false, _) => doctor_check(
+            "cuda_toolchain_preflight",
+            DoctorCheckStatus::Warning,
+            "nvidia-smi is available, but nvcc/CUDA runtime library was not detected in PATH",
+        ),
+        (false, _, true) => doctor_check(
+            "cuda_toolchain_preflight",
+            DoctorCheckStatus::Failed,
+            "CUDA GPU was required, but nvidia-smi is not available",
+        ),
+        (false, true, false) => doctor_check(
+            "cuda_toolchain_preflight",
+            DoctorCheckStatus::Warning,
+            "CUDA runtime/compiler is visible, but nvidia-smi is not available",
+        ),
+        (false, false, false) => doctor_check(
+            "cuda_toolchain_preflight",
+            DoctorCheckStatus::Warning,
+            "CUDA is not visible; local GPU backends will degrade to CPU or unsupported status",
+        ),
+    }
 }
 
 async fn check_ollama_ps_api(backend: &DiagBackendConfig, require_gpu: bool) -> DoctorCheck {
@@ -1358,6 +1439,37 @@ mod tests {
                 && check.status == DoctorCheckStatus::Warning
                 && check.message.contains("not configured")
         }));
+    }
+
+    #[test]
+    fn cuda_preflight_reports_typed_failure_when_gpu_is_required_and_missing() {
+        let check = cuda_toolchain_doctor_check(
+            CudaToolchainPresence {
+                nvidia_smi: false,
+                nvcc: false,
+                runtime_library: false,
+            },
+            true,
+        );
+
+        assert_eq!(check.name, "cuda_toolchain_preflight");
+        assert_eq!(check.status, DoctorCheckStatus::Failed);
+        assert!(check.message.contains("required"));
+    }
+
+    #[test]
+    fn cuda_preflight_warns_without_failing_when_gpu_is_optional() {
+        let check = cuda_toolchain_doctor_check(
+            CudaToolchainPresence {
+                nvidia_smi: false,
+                nvcc: false,
+                runtime_library: false,
+            },
+            false,
+        );
+
+        assert_eq!(check.status, DoctorCheckStatus::Warning);
+        assert!(check.message.contains("degrade"));
     }
 
     #[test]
