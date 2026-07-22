@@ -13,7 +13,9 @@ use ulid::Ulid;
 use crate::bus::Event;
 use crate::models::{AuditLogLevel, Task, TaskDependency, TaskStatus};
 use crate::persistence::{PersistenceError, PromptVersionRepository, TaskRepository};
-use crate::services::{AuditLogEntry, AuditLogService, EventService};
+use crate::services::{
+    ArtifactContractViolation, AuditLogEntry, AuditLogService, EventService, validate_agent_result,
+};
 use crate::tracing::TraceContext;
 
 /// Errors that can occur in [`TaskService`].
@@ -29,6 +31,12 @@ pub enum TaskError {
     AlreadyExists(String),
     #[error("dependency cycle detected")]
     CycleDetected,
+    #[error("artifact contract violation for agent '{agent}' ({artifact_kind}): {reason}")]
+    ArtifactContractViolation {
+        agent: String,
+        artifact_kind: String,
+        reason: String,
+    },
     #[error("internal graph inconsistency: {0}")]
     Internal(String),
 }
@@ -536,6 +544,19 @@ where
             let task = tasks
                 .get_mut(id)
                 .ok_or_else(|| TaskError::NotFound(id.to_string()))?;
+            validate_agent_result(task.assigned_agent.as_deref(), &task.kind, &result).map_err(
+                |ArtifactContractViolation {
+                     artifact_kind,
+                     reason,
+                 }| TaskError::ArtifactContractViolation {
+                    agent: task
+                        .assigned_agent
+                        .clone()
+                        .unwrap_or_else(|| task.kind.clone()),
+                    artifact_kind,
+                    reason,
+                },
+            )?;
             task.result = Some(result.clone());
             task.status = TaskStatus::Completed;
             task.finished_at = Some(chrono::Utc::now().timestamp_millis());
@@ -1141,9 +1162,17 @@ mod tests {
     async fn cancel_terminal_task_is_rejected() {
         let (svc, _bus) = service();
         let task = svc.submit(request()).await.unwrap();
-        svc.set_result(&task.id, Value::String("ok".into()))
-            .await
-            .unwrap();
+        svc.set_result(
+            &task.id,
+            serde_json::json!({
+                "agent_result": {
+                    "summary": "implemented",
+                    "files_changed": ["src/lib.rs"]
+                }
+            }),
+        )
+        .await
+        .unwrap();
 
         let err = svc.cancel(&task.id).await.unwrap_err();
         assert!(matches!(err, TaskError::InvalidStatusTransition { .. }));
@@ -1177,12 +1206,48 @@ mod tests {
         let task = svc.submit(request()).await.unwrap();
 
         let updated = svc
-            .set_result(&task.id, Value::String("ok".into()))
+            .set_result(
+                &task.id,
+                serde_json::json!({
+                    "agent_result": {
+                        "summary": "implemented",
+                        "files_changed": ["src/lib.rs"]
+                    }
+                }),
+            )
             .await
             .unwrap();
 
         assert_eq!(updated.status, TaskStatus::Completed);
-        assert_eq!(updated.result, Some(Value::String("ok".into())));
+        assert!(updated.result.is_some());
+    }
+
+    #[tokio::test]
+    async fn set_result_rejects_completed_without_typed_artifact_for_role() {
+        let (svc, _) = service();
+        let mut req = request();
+        req.assigned_agent = Some("coder-python".into());
+        let task = svc.submit(req).await.unwrap();
+
+        let err = svc
+            .set_result(
+                &task.id,
+                serde_json::json!({"agent_result": {"summary": "done"}}),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            TaskError::ArtifactContractViolation {
+                artifact_kind,
+                ..
+            } if artifact_kind == "patch_artifact"
+        ));
+        assert_eq!(
+            svc.get(&task.id).await.unwrap().unwrap().status,
+            TaskStatus::Pending
+        );
     }
 
     #[tokio::test]

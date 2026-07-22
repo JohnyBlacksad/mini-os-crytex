@@ -1,4 +1,5 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+#![allow(dead_code)]
 
 pub mod cli_contract;
 pub mod crytex_cli;
@@ -61,13 +62,13 @@ use crytex_core::{
         InferenceServiceImpl, KanbanBoardProjection, KanbanColumnProjection,
         KanbanHistoryProjection, KanbanMovement, KanbanProjectionService, KanbanRunSelector,
         KanbanStatus, KanbanTaskProjection, LoraBenchmarkDecision, LoraBenchmarkGate,
-        LoraBenchmarkRequest, LoraEvolutionError, LoraEvolutionService, LoraRouter,
-        LoraTrainingConfig, MemoryRoleAdapterRegistry, ModelManager, ModelManagerImpl,
-        ModelRuntimeMatrixProbe, ModelRuntimeMatrixRequest, ModelRuntimeProbe,
-        ModelRuntimeProbeRequest, MutationOperator, Orchestrator, OrchestratorImpl, ProjectService,
-        ProjectServiceImpl, ProjectWatcher, PromptEvolutionService, Quantization,
-        RecordRewardRequest, RerankPassage, RerankResult, RewardService, RoleAdapterRegistry,
-        RuntimeFeatureSet, RuntimeMatrixEntryRequest, RuntimeMatrixReportWriter, SchedulerImpl,
+        LoraBenchmarkRequest, LoraEvolutionError, LoraRouter, MemoryRoleAdapterRegistry,
+        ModelManager, ModelManagerImpl, ModelRuntimeMatrixProbe, ModelRuntimeMatrixRequest,
+        ModelRuntimeProbe, ModelRuntimeProbeRequest, MutationOperator, Orchestrator,
+        OrchestratorImpl, ProjectService, ProjectServiceImpl, ProjectWatcher,
+        PromptEvolutionService, Quantization, RecordRewardRequest, RerankPassage, RerankResult,
+        RewardService, RoleAdapterRegistry, RoleQualityProof, RuntimeFeatureSet,
+        RuntimeMatrixEntryRequest, RuntimeMatrixReportWriter, SchedulerImpl,
         SystemHardwareDetector, TaskHandler, TaskServiceImpl, TomlWorkflowRepository, VectorStore,
         WorkerError, WorkerPool, WorkflowDefinition, WorkflowEdge, WorkflowEngine, WorkflowNode,
         WorkflowRepository, WorkflowRetryPolicy, recommend_local_device,
@@ -4703,7 +4704,7 @@ async fn run_lora_live_e2e_proof(
         decision_metadata: decision_metadata.clone(),
         generation_timeout_secs: request.generation_timeout_secs,
     });
-    let training_config = LoraTrainingConfig {
+    let training_config = crytex_core::services::LoraTrainingConfig {
         rank: request.rank,
         alpha: request.alpha,
         epochs: request.epochs,
@@ -4966,7 +4967,7 @@ async fn run_lora_evolution_loop_proof(
         max_overfit_gap: request.max_overfit_gap,
         decision_metadata: promotion_metadata.clone(),
     });
-    let training_config = LoraTrainingConfig {
+    let training_config = crytex_core::services::LoraTrainingConfig {
         rank: request.rank,
         alpha: request.alpha,
         epochs: request.epochs,
@@ -6535,8 +6536,11 @@ impl AgentService for ProofSwarmAgentService {
                 "adapter_seen": task.lora_adapter_id
             }),
             Some("critic") => serde_json::json!({
-                "review_decision": "pass",
-                "summary": "accepted for human review",
+                "decision": "approve",
+                "reason": "accepted for human review",
+                "target_task": "coder",
+                "blocking_issues": [],
+                "remediation_proposal": {"assigned_agent": "none", "goal": "none"},
                 "adapter_seen": task.lora_adapter_id
             }),
             _ => serde_json::json!({ "summary": "unsupported proof agent" }),
@@ -7400,6 +7404,28 @@ async fn async_main() {
             }
             if let Err(error) = tokio::fs::write(report_path, &payload).await {
                 eprintln!("Failed to write token economy proof report: {error}");
+                std::process::exit(1);
+            }
+        }
+        println!("{payload}");
+        if !report.passed {
+            std::process::exit(2);
+        }
+        return;
+    }
+
+    if let Commands::ProveRoleQualityContracts { report_path } = &cli.command {
+        let report = RoleQualityProof::deterministic().run();
+        let payload = serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into());
+        if let Some(report_path) = report_path {
+            if let Some(parent) = report_path.parent()
+                && let Err(error) = tokio::fs::create_dir_all(parent).await
+            {
+                eprintln!("Failed to create role quality proof report directory: {error}");
+                std::process::exit(1);
+            }
+            if let Err(error) = tokio::fs::write(report_path, &payload).await {
+                eprintln!("Failed to write role quality proof report: {error}");
                 std::process::exit(1);
             }
         }
@@ -8397,6 +8423,9 @@ async fn async_main() {
         Commands::ProveTokenEconomy { .. } => {
             unreachable!("prove-token-economy is handled before full AppContext initialization")
         }
+        Commands::ProveRoleQualityContracts { .. } => unreachable!(
+            "prove-role-quality-contracts is handled before full AppContext initialization"
+        ),
         Commands::Submit {
             project,
             prompt,

@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex};
 
 use crate::models::{Task, TaskStatus};
 use crate::services::{
-    AgentRole, AgentService, ArtifactContractViolation, InferenceService, LoraRouter, ToolService,
-    validate_agent_result,
+    AgentRole, AgentService, ArtifactContractViolation, InferenceService, LoraRouter,
+    RoleQualityCatalog, ToolService, validate_agent_result,
 };
 use crate::tracing::TraceContext;
 
@@ -747,6 +747,7 @@ impl AgentWorkflowNodeExecutor {
 
         let session_id = ulid::Ulid::new().to_string();
         let prompt = state.get(input).cloned().unwrap_or_default();
+        let role_contract = RoleQualityCatalog::production().get(agent).cloned();
         let payload = serde_json::json!({
             "prompt": prompt,
             "upstream_artifact": state.get(input).cloned().unwrap_or_default(),
@@ -754,6 +755,8 @@ impl AgentWorkflowNodeExecutor {
                 "session_id": session_id,
                 "trace_id": trace_id,
                 "role": agent,
+                "role_contract_id": role_contract.as_ref().map(|contract| contract.role_id.as_str()),
+                "artifact_kind": role_contract.as_ref().map(|contract| contract.artifact_contract.kind.as_str()),
                 "node_id": id,
                 "input_key": input,
                 "clean_context": true
@@ -1072,6 +1075,14 @@ task_kind = "codegen"
         assert_eq!(task.payload["upstream_artifact"], state["design_artifact"]);
         assert_eq!(task.payload["agent_session"]["role"], "coder");
         assert_eq!(
+            task.payload["agent_session"]["role_contract_id"],
+            "coder-etc"
+        );
+        assert_eq!(
+            task.payload["agent_session"]["artifact_kind"],
+            "patch_artifact"
+        );
+        assert_eq!(
             task.payload["agent_session"]["input_key"],
             "design_artifact"
         );
@@ -1371,8 +1382,11 @@ task_kind = "codegen"
                 "risk": "low",
             }),
             Some("critic") => serde_json::json!({
-                "review_decision": "pass",
-                "summary": "accepted for human review",
+                "decision": "approve",
+                "reason": "accepted for human review",
+                "target_task": "coder",
+                "blocking_issues": [],
+                "remediation_proposal": {"assigned_agent": "none", "goal": "none"},
             }),
             _ => serde_json::json!({
                 "summary": "generic artifact",
@@ -1645,8 +1659,10 @@ task_kind = "codegen"
             "review",
             serde_json::json!({
                 "agent_result": {
-                    "review_decision": "reject",
-                    "summary": "not good enough"
+                    "decision": "request_changes",
+                    "reason": "not good enough",
+                    "target_task": "coder",
+                    "remediation_proposal": {"assigned_agent": "coder", "goal": "fix evidence"}
                 }
             }),
         )

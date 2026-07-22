@@ -44,10 +44,37 @@ impl TaskHandler for CompleteHandler {
             .await
             .map_err(|e| WorkerError::Handler(e.to_string()))?;
         self.task_service
-            .set_result(&task.id, Value::String("done".into()))
+            .set_result(&task.id, valid_result_for_task(&task))
             .await
             .map_err(|e| WorkerError::Handler(e.to_string()))?;
         Ok(())
+    }
+}
+
+fn valid_result_for_task(task: &Task) -> Value {
+    match task.assigned_agent.as_deref() {
+        Some("architect") => {
+            serde_json::json!({"agent_result": {"summary": "planned", "decisions": ["use serial handoff"]}})
+        }
+        Some("coder") => {
+            serde_json::json!({"agent_result": {"summary": "implemented", "files_changed": ["src/lib.rs"]}})
+        }
+        Some("qa") => {
+            serde_json::json!({"agent_result": {"summary": "verified", "test_results": "passed"}})
+        }
+        Some("security") => {
+            serde_json::json!({"agent_result": {"summary": "audited", "findings": ["no critical issues"]}})
+        }
+        Some("critic") => serde_json::json!({
+            "agent_result": {
+                "decision": "approve",
+                "reason": "artifact contract satisfied",
+                "target_task": "security",
+                "blocking_issues": [],
+                "remediation_proposal": {"assigned_agent": "none", "goal": "none"}
+            }
+        }),
+        _ => Value::String("done".into()),
     }
 }
 

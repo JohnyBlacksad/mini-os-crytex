@@ -1070,7 +1070,29 @@ mod tests {
             _state: &crate::services::WorkflowState,
         ) -> Result<crate::services::WorkflowState, crate::services::WorkflowError> {
             self.calls.lock().unwrap().push(node.id().to_string());
-            Ok(Value::String(format!("result-{}", node.id())))
+            let result = match node.agent_name() {
+                Some("architect") => {
+                    serde_json::json!({"summary": "planned", "decisions": ["serial workflow"]})
+                }
+                Some("coder") => {
+                    serde_json::json!({"summary": "implemented", "files_changed": ["src/lib.rs"]})
+                }
+                Some("qa") => {
+                    serde_json::json!({"summary": "verified", "test_results": "cargo test passed"})
+                }
+                Some("security") => {
+                    serde_json::json!({"summary": "audited", "findings": ["no critical issues"]})
+                }
+                Some("critic") => serde_json::json!({
+                    "decision": "approve",
+                    "reason": "all role artifacts include evidence",
+                    "target_task": "security",
+                    "blocking_issues": [],
+                    "remediation_proposal": {"assigned_agent": "none", "goal": "none"}
+                }),
+                _ => serde_json::json!({"summary": format!("result-{}", node.id())}),
+            };
+            Ok(serde_json::json!({ "agent_result": result }))
         }
     }
 

@@ -614,6 +614,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolve_for_specialized_roles_keeps_distinct_adapters() {
+        let registry = Arc::new(MemoryRoleAdapterRegistry::new());
+        registry.set(AgentRole::CoderPython, "python-lora-v1".into());
+        registry.set(AgentRole::CriticCoder, "critic-coder-lora-v1".into());
+        let router = LoraRouterImpl::new(Arc::new(MockEvolution { selected: None }))
+            .with_role_registry(registry);
+
+        let coder = router
+            .resolve_for_role(AgentRole::CoderPython, "p1")
+            .await
+            .unwrap();
+        let critic = router
+            .resolve_for_role(AgentRole::CriticCoder, "p1")
+            .await
+            .unwrap();
+
+        assert_eq!(coder, Some("python-lora-v1".into()));
+        assert_eq!(critic, Some("critic-coder-lora-v1".into()));
+        assert_ne!(coder, critic);
+    }
+
+    #[tokio::test]
     async fn router_prefers_role_registry_over_domain() {
         let evolution = Arc::new(MockEvolution {
             selected: Some("codegen-v1".into()),

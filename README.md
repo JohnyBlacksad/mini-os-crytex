@@ -118,6 +118,9 @@ See [docs/KANBAN.md](docs/KANBAN.md) for the backend Kanban projection, canonica
 statuses, task-card schema, movement diagnostics, watch stream, and history.
 See [docs/TOKEN_ECONOMY.md](docs/TOKEN_ECONOMY.md) for headroom planning,
 shared context, CCR artifact offload, token metrics, and quality-loss gates.
+See [docs/ROLE_QUALITY.md](docs/ROLE_QUALITY.md) for per-role prompts,
+artifact contracts, metrics, failure taxonomies, critic feedback, clean-session
+handoff, and role-specific LoRA routing.
 
 Every production command follows these rules:
 
@@ -140,11 +143,17 @@ Token economy now has a deterministic proof command in the development binary:
 
 ```powershell
 cargo run -p crytex-kernel -- prove-token-economy --report-path reports\token-economy-p4.json
+cargo run -p crytex-kernel -- prove-role-quality-contracts --report-path reports\role-quality-p6-proof.json
 ```
 
-The report proves model headroom reservation, shared RAG-context reuse, CCR
+The token-economy report proves model headroom reservation, shared RAG-context reuse, CCR
 offload for large artifacts, measured token savings, compression ratio, and
 zero required-fact quality loss.
+
+The role-quality report proves every production role has a system prompt,
+output schema, artifact contract, metrics, failure taxonomy, benchmark fixture,
+mocked smoke evidence, structured critic feedback, and role-specific LoRA
+hot-swap handoff evidence.
 
 The production CLI contract is now fixed in code at
 `crates/crytex-kernel/src/cli_contract.rs`. Existing legacy command handlers are

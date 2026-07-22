@@ -302,6 +302,11 @@ pub enum Commands {
         #[arg(long)]
         report_path: Option<PathBuf>,
     },
+    /// Prove role quality contracts, role smoke fixtures, critic feedback, and role LoRA swaps
+    ProveRoleQualityContracts {
+        #[arg(long)]
+        report_path: Option<PathBuf>,
+    },
     /// Add or update a managed HuggingFace/local model entry
     AddModel {
         #[arg(short, long)]
@@ -847,5 +852,24 @@ mod tests {
         };
 
         assert_eq!(report_path, Some(PathBuf::from("reports/kanban-p5.json")));
+    }
+
+    #[test]
+    fn role_quality_contracts_proof_command_parses_report_path() {
+        let cli = Cli::parse_from([
+            "crytex-kernel",
+            "prove-role-quality-contracts",
+            "--report-path",
+            "reports/role-quality-p6.json",
+        ]);
+
+        let Commands::ProveRoleQualityContracts { report_path } = cli.command else {
+            panic!("expected role quality contracts proof command");
+        };
+
+        assert_eq!(
+            report_path,
+            Some(PathBuf::from("reports/role-quality-p6.json"))
+        );
     }
 }

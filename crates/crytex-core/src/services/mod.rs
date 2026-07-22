@@ -32,6 +32,7 @@ pub mod rate_limit;
 pub mod reranker;
 pub mod reward_service;
 pub mod role;
+pub mod role_quality;
 pub mod sandbox_service;
 pub mod scheduler;
 pub mod task_service;
@@ -118,6 +119,11 @@ pub use rate_limit::{RetryPolicy, RetryRateLimitBackend, TokenBucket};
 pub use reranker::{RerankPassage, RerankResult, Reranker, RerankerError};
 pub use reward_service::{RecordRewardRequest, RewardService, RewardServiceError};
 pub use role::AgentRole;
+pub use role_quality::{
+    RoleArtifactContract, RoleBenchmarkFixture, RoleLoraHotSwapReport, RoleQualityCatalog,
+    RoleQualityContract, RoleQualityGate, RoleQualityProof, RoleQualityProofReport,
+    RoleSmokeReport,
+};
 pub use sandbox_service::{
     ExecutionRequest, ExecutionResult, SandboxMount, SandboxNetwork, SandboxResources,
     SandboxService, SandboxServiceError,

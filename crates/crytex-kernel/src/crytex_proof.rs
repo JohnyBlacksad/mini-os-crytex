@@ -20,6 +20,7 @@ pub fn is_proof_command(command: &Commands) -> bool {
             | Commands::ProveRagFull { .. }
             | Commands::ProveKanbanProjection { .. }
             | Commands::ProveTokenEconomy { .. }
+            | Commands::ProveRoleQualityContracts { .. }
             | Commands::BackendAcceptance { .. }
     )
 }
@@ -85,6 +86,13 @@ mod tests {
     #[test]
     fn kanban_projection_is_proof_only() {
         let command = Commands::ProveKanbanProjection { report_path: None };
+
+        assert!(is_proof_command(&command));
+    }
+
+    #[test]
+    fn role_quality_contracts_is_proof_only() {
+        let command = Commands::ProveRoleQualityContracts { report_path: None };
 
         assert!(is_proof_command(&command));
     }

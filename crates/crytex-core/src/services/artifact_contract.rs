@@ -13,20 +13,41 @@ pub struct ArtifactContractViolation {
 
 /// Return whether an agent role must emit a typed artifact.
 pub fn requires_agent_artifact_contract(agent: Option<&str>) -> bool {
-    matches!(
-        agent,
-        Some("architect" | "coder" | "qa" | "security" | "critic")
-    )
+    agent.is_some_and(|agent| {
+        matches!(
+            agent,
+            "orchestrator"
+                | "architect"
+                | "coder"
+                | "analyst"
+                | "researcher"
+                | "qa"
+                | "devops"
+                | "security"
+                | "critic"
+                | "summarizer"
+        ) || agent.starts_with("coder-")
+            || agent.starts_with("critic-")
+    })
 }
 
 /// Return the artifact kind expected from a known agent.
 pub fn artifact_kind_for_agent(agent: Option<&str>, fallback_kind: &str) -> String {
     match agent {
+        Some("orchestrator") => "task_graph_artifact".to_string(),
         Some("architect") => "design_artifact".to_string(),
-        Some("coder") => "patch_artifact".to_string(),
+        Some(agent) if agent == "coder" || agent.starts_with("coder-") => {
+            "patch_artifact".to_string()
+        }
+        Some("analyst") => "analysis_artifact".to_string(),
+        Some("researcher") => "research_artifact".to_string(),
         Some("qa") => "test_report_artifact".to_string(),
+        Some("devops") => "deployment_artifact".to_string(),
         Some("security") => "security_report_artifact".to_string(),
-        Some("critic") => "review_decision".to_string(),
+        Some(agent) if agent == "critic" || agent.starts_with("critic-") => {
+            "review_decision".to_string()
+        }
+        Some("summarizer") => "summary_artifact".to_string(),
         Some(agent) => format!("{agent}_artifact"),
         None => format!("{fallback_kind}_artifact"),
     }
@@ -63,13 +84,28 @@ pub fn validate_artifact_content(
 ) -> Result<(), ArtifactContractViolation> {
     require_object(artifact_kind, content, "content")?;
     match artifact_kind {
+        "task_graph_artifact" => validate_task_graph_artifact(artifact_kind, content),
         "design_artifact" => validate_design_artifact(artifact_kind, content),
         "patch_artifact" => validate_patch_artifact(artifact_kind, content),
+        "analysis_artifact" => validate_analysis_artifact(artifact_kind, content),
+        "research_artifact" => validate_research_artifact(artifact_kind, content),
         "test_report_artifact" => validate_test_report_artifact(artifact_kind, content),
+        "deployment_artifact" => validate_deployment_artifact(artifact_kind, content),
         "security_report_artifact" => validate_security_report_artifact(artifact_kind, content),
         "review_decision" => validate_review_decision_artifact(artifact_kind, content),
+        "summary_artifact" => validate_summary_artifact(artifact_kind, content),
         _ => Ok(()),
     }
+}
+
+fn validate_task_graph_artifact(
+    artifact_kind: &str,
+    content: &Value,
+) -> Result<(), ArtifactContractViolation> {
+    require_text_field(artifact_kind, content, "summary")?;
+    require_array_field(artifact_kind, content, "tasks")?;
+    require_array_field(artifact_kind, content, "dependency_edges")?;
+    Ok(())
 }
 
 fn validate_design_artifact(
@@ -87,6 +123,24 @@ fn validate_patch_artifact(
 ) -> Result<(), ArtifactContractViolation> {
     require_array_field(artifact_kind, content, "files_changed")?;
     require_text_field(artifact_kind, content, "summary")?;
+    Ok(())
+}
+
+fn validate_analysis_artifact(
+    artifact_kind: &str,
+    content: &Value,
+) -> Result<(), ArtifactContractViolation> {
+    require_text_field(artifact_kind, content, "summary")?;
+    require_array_field(artifact_kind, content, "findings")?;
+    Ok(())
+}
+
+fn validate_research_artifact(
+    artifact_kind: &str,
+    content: &Value,
+) -> Result<(), ArtifactContractViolation> {
+    require_text_field(artifact_kind, content, "summary")?;
+    require_array_field(artifact_kind, content, "sources")?;
     Ok(())
 }
 
@@ -108,12 +162,40 @@ fn validate_security_report_artifact(
         .map(|_| ())
 }
 
+fn validate_deployment_artifact(
+    artifact_kind: &str,
+    content: &Value,
+) -> Result<(), ArtifactContractViolation> {
+    require_text_field(artifact_kind, content, "summary")?;
+    require_array_field(artifact_kind, content, "commands")?;
+    Ok(())
+}
+
+fn validate_summary_artifact(
+    artifact_kind: &str,
+    content: &Value,
+) -> Result<(), ArtifactContractViolation> {
+    require_text_field(artifact_kind, content, "summary")?;
+    require_array_field(artifact_kind, content, "key_points")?;
+    Ok(())
+}
+
 fn validate_review_decision_artifact(
     artifact_kind: &str,
     content: &Value,
 ) -> Result<(), ArtifactContractViolation> {
-    let decision = require_text_field(artifact_kind, content, "review_decision")?;
-    if decision == "reject" {
+    let decision = require_text_field(artifact_kind, content, "decision")
+        .or_else(|_| require_text_field(artifact_kind, content, "review_decision"))?;
+    require_text_field(artifact_kind, content, "reason")
+        .or_else(|_| require_text_field(artifact_kind, content, "summary"))?;
+    require_text_field(artifact_kind, content, "target_task")
+        .or_else(|_| require_text_field(artifact_kind, content, "target_task_id"))?;
+    require_object(
+        artifact_kind,
+        content.get("remediation_proposal").unwrap_or(&Value::Null),
+        "remediation_proposal",
+    )?;
+    if matches!(decision, "reject" | "request_changes") {
         require_array_field(artifact_kind, content, "blocking_issues")?;
     }
     Ok(())
@@ -194,7 +276,10 @@ mod tests {
     fn critic_reject_contract_requires_blocking_issues() {
         let result = json!({
             "agent_result": {
-                "review_decision": "reject",
+                "decision": "request_changes",
+                "reason": "needs work",
+                "target_task": "task-1",
+                "remediation_proposal": {"assigned_agent": "coder"},
                 "summary": "needs work"
             }
         });
@@ -231,7 +316,13 @@ mod tests {
             (
                 Some("critic"),
                 "review",
-                json!({"agent_result": {"review_decision": "pass"}}),
+                json!({"agent_result": {
+                    "decision": "approve",
+                    "reason": "contract is satisfied",
+                    "target_task": "task-1",
+                    "blocking_issues": [],
+                    "remediation_proposal": {"assigned_agent": "none", "goal": "none"}
+                }}),
             ),
         ];
 

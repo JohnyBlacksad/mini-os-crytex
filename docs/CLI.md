@@ -36,7 +36,7 @@ Typed value domains:
 
 | Domain | Values |
 | --- | --- |
-| Role | `orchestrator`, `architect`, `coder-python`, `coder-rust`, `coder-typescript`, `analyst`, `researcher`, `qa`, `security`, `critic`, `summarizer` |
+| Role | `orchestrator`, `architect`, `coder-python`, `coder-rust`, `coder-ts`, `coder-etc`, `analyst`, `researcher`, `qa`, `devops`, `security`, `critic-analyst`, `critic-coder`, `critic-researcher`, `critic-etc`, `summarizer` |
 | Backend | `ollama`, `mistral`, `onnx`, `open-ai-compatible`, `anthropic`, `custom` |
 | Training objective | `sft`, `preference`, `dpo`, `orpo`, `kto` |
 | Task status | `backlog`, `ready`, `in-progress`, `review`, `remediation`, `done`, `failed`, `blocked` |
@@ -162,6 +162,7 @@ Production contract:
 crytex token-economy plan --backend ollama --model qwen3.5:9b --prompt-tokens 2000 --completion-tokens 512 --json
 crytex token-economy shared-context stats --project my-app --json
 crytex prove token-economy --report-path reports\token-economy-p4.json
+crytex prove role-quality-contracts --report-path reports\role-quality-p6-proof.json
 ```
 
 Current development binary:
@@ -175,6 +176,32 @@ markers for diff/log/report/tool-output artifacts, prompt/completion/saved token
 metrics, compression ratio, and required-fact quality loss.
 
 See [TOKEN_ECONOMY.md](TOKEN_ECONOMY.md) for the module contract.
+
+## `role-quality`
+
+Inspect and prove per-role quality contracts.
+
+Production contract:
+
+```powershell
+crytex role-quality list --json
+crytex role-quality show --role coder-python --json
+crytex prove role-quality-contracts --report-path reports\role-quality-p6-proof.json
+```
+
+Current development binary:
+
+```powershell
+cargo run -p crytex-kernel -- prove-role-quality-contracts --report-path reports\role-quality-p6-proof.json
+```
+
+The proof JSON contains all production role contracts, system prompt source
+evidence from `trash/agent-skills-main` and `trash/skills-main`, output schemas,
+artifact fields, metrics, failure taxonomies, deterministic role benchmark
+fixtures, mocked smoke status per role, structured critic feedback schema, and
+role-specific LoRA hot-swap evidence.
+
+See [ROLE_QUALITY.md](ROLE_QUALITY.md) for the module contract.
 
 ## `goal`
 

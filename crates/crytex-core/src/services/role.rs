@@ -7,16 +7,38 @@ use std::str::FromStr;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentRole {
+    /// Decomposes goals and coordinates the workflow graph.
+    Orchestrator,
     /// Designs the overall architecture and plan.
     Architect,
     /// Writes and edits code.
     Coder,
+    /// Writes Python code.
+    CoderPython,
+    /// Writes Rust code.
+    CoderRust,
+    /// Writes TypeScript code.
+    CoderTs,
+    /// Writes code for other languages.
+    CoderEtc,
+    /// Performs product or technical analysis.
+    Analyst,
     /// Runs tests and verifies behavior.
     Qa,
+    /// Handles deployment and operations.
+    Devops,
     /// Performs security analysis.
     Security,
     /// Reviews and critiques output.
     Critic,
+    /// Reviews analytical work.
+    CriticAnalyst,
+    /// Reviews code work.
+    CriticCoder,
+    /// Reviews research work.
+    CriticResearcher,
+    /// Reviews other artifact kinds.
+    CriticEtc,
     /// Gathers information from external sources.
     Researcher,
     /// Condenses context and results.
@@ -26,11 +48,22 @@ pub enum AgentRole {
 impl AgentRole {
     /// All known roles.
     pub const ALL: &[AgentRole] = &[
+        AgentRole::Orchestrator,
         AgentRole::Architect,
         AgentRole::Coder,
+        AgentRole::CoderPython,
+        AgentRole::CoderRust,
+        AgentRole::CoderTs,
+        AgentRole::CoderEtc,
+        AgentRole::Analyst,
         AgentRole::Qa,
+        AgentRole::Devops,
         AgentRole::Security,
         AgentRole::Critic,
+        AgentRole::CriticAnalyst,
+        AgentRole::CriticCoder,
+        AgentRole::CriticResearcher,
+        AgentRole::CriticEtc,
         AgentRole::Researcher,
         AgentRole::Summarizer,
     ];
@@ -38,11 +71,22 @@ impl AgentRole {
     /// Return the canonical snake_case identifier for the role.
     pub const fn as_str(&self) -> &'static str {
         match self {
+            AgentRole::Orchestrator => "orchestrator",
             AgentRole::Architect => "architect",
             AgentRole::Coder => "coder",
+            AgentRole::CoderPython => "coder-python",
+            AgentRole::CoderRust => "coder-rust",
+            AgentRole::CoderTs => "coder-ts",
+            AgentRole::CoderEtc => "coder-etc",
+            AgentRole::Analyst => "analyst",
             AgentRole::Qa => "qa",
+            AgentRole::Devops => "devops",
             AgentRole::Security => "security",
             AgentRole::Critic => "critic",
+            AgentRole::CriticAnalyst => "critic-analyst",
+            AgentRole::CriticCoder => "critic-coder",
+            AgentRole::CriticResearcher => "critic-researcher",
+            AgentRole::CriticEtc => "critic-etc",
             AgentRole::Researcher => "researcher",
             AgentRole::Summarizer => "summarizer",
         }
@@ -51,11 +95,24 @@ impl AgentRole {
     /// Parse a role from its canonical identifier.
     pub fn from_identifier(s: &str) -> Option<Self> {
         match s {
+            "orchestrator" => Some(AgentRole::Orchestrator),
             "architect" => Some(AgentRole::Architect),
             "coder" => Some(AgentRole::Coder),
+            "coder-python" | "coder_python" | "python" => Some(AgentRole::CoderPython),
+            "coder-rust" | "coder_rust" | "rust" => Some(AgentRole::CoderRust),
+            "coder-ts" | "coder_ts" | "coder-typescript" | "typescript" | "ts" => {
+                Some(AgentRole::CoderTs)
+            }
+            "coder-etc" | "coder_etc" => Some(AgentRole::CoderEtc),
+            "analyst" => Some(AgentRole::Analyst),
             "qa" => Some(AgentRole::Qa),
+            "devops" => Some(AgentRole::Devops),
             "security" => Some(AgentRole::Security),
             "critic" => Some(AgentRole::Critic),
+            "critic-analyst" | "critic_analyst" => Some(AgentRole::CriticAnalyst),
+            "critic-coder" | "critic_coder" => Some(AgentRole::CriticCoder),
+            "critic-researcher" | "critic_researcher" => Some(AgentRole::CriticResearcher),
+            "critic-etc" | "critic_etc" => Some(AgentRole::CriticEtc),
             "researcher" => Some(AgentRole::Researcher),
             "summarizer" => Some(AgentRole::Summarizer),
             _ => None,
