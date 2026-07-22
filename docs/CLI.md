@@ -364,6 +364,7 @@ crytex lora train coder-python --objective dpo --role coder-python
 crytex lora train coder-python --objective orpo --role coder-python
 crytex lora train coder-python --objective kto --role coder-python
 crytex prove lora-training-objectives --report-path reports\lora-training-objectives-p9-proof.json
+crytex prove lora-quality-gate --report-path reports\lora-quality-gate-p10-proof.json
 crytex lora benchmark coder-python --include-negative
 crytex lora prove-live coder-python
 crytex lora promote coder-python <adapter-id>
@@ -379,6 +380,7 @@ cargo run -p crytex-kernel -- lora dataset stats coder-python --json
 cargo run -p crytex-kernel -- lora train coder-python --objective dpo --role coder-python
 cargo run -p crytex-kernel -- prove-lora-dataset --report-path reports\lora-dataset-p8-proof.json
 cargo run -p crytex-kernel -- prove-lora-training-objectives --report-path reports\lora-training-objectives-p9-proof.json
+cargo run -p crytex-kernel -- prove-lora-quality-gate --report-path reports\lora-quality-gate-p10-proof.json
 ```
 
 LoRA dataset rows preserve role, task kind, prompt version, model id, RAG
@@ -390,8 +392,8 @@ Dataset reports include role scoping, chosen/rejected pair counts, failure-type
 balancing targets, leakage diagnostics, and low-information filtering.
 
 See [LORA_DATASET.md](LORA_DATASET.md) and
-[LORA_TRAINING_OBJECTIVES.md](LORA_TRAINING_OBJECTIVES.md) for the module
-contracts.
+[LORA_TRAINING_OBJECTIVES.md](LORA_TRAINING_OBJECTIVES.md), and
+[LORA_QUALITY_GATE.md](LORA_QUALITY_GATE.md) for the module contracts.
 
 Production LoRA promotion requires:
 

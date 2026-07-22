@@ -82,6 +82,7 @@ pub use lora_evolution::{
     LoraBenchmarkDecision, LoraBenchmarkGate, LoraBenchmarkRequest, LoraDatasetBalancingReport,
     LoraDatasetInspector, LoraDatasetLeakageReport, LoraDatasetLowInformationReport,
     LoraDatasetReport, LoraEvolutionError, LoraEvolutionService, LoraEvolutionServiceImpl,
+    LoraQualityGateName, LoraQualityGateResult, lora_quality_gate, passed_lora_quality_gates,
 };
 pub use lora_router::{
     LoraRouter, LoraRouterError, LoraRouterImpl, LoraSelection, MemoryRoleAdapterRegistry,

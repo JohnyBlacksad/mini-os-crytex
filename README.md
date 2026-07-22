@@ -153,6 +153,7 @@ cargo run -p crytex-kernel -- prove-role-quality-contracts --report-path reports
 cargo run -p crytex-kernel -- prove-prompt-evolution --report-path reports\prompt-evolution-p7-proof.json
 cargo run -p crytex-kernel -- prove-lora-dataset --report-path reports\lora-dataset-p8-proof.json
 cargo run -p crytex-kernel -- prove-lora-training-objectives --report-path reports\lora-training-objectives-p9-proof.json
+cargo run -p crytex-kernel -- prove-lora-quality-gate --report-path reports\lora-quality-gate-p10-proof.json
 ```
 
 The token-economy report proves model headroom reservation, shared RAG-context reuse, CCR
@@ -173,6 +174,11 @@ The LoRA training-objectives report proves role/objective-aware training,
 typed unsupported objective errors, adapter metadata with role/base
 model/objective/dataset hash, adapter directory validation, and the typed
 queued/running/failed/promoted/rolled_back job lifecycle.
+
+The LoRA quality-gate report proves promotion requires positive, negative,
+regression, safety, runtime-application, and output-changed gates, and that a
+failed challenger rollback removes its artifact while preserving the active
+adapter.
 
 The LoRA dataset report proves Crytex stores accepted outputs as positive
 targets, rejected outputs as negative preference sides, preserves critic

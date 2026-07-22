@@ -72,6 +72,55 @@ pub struct LoraBenchmarkDecision {
     pub accepted: bool,
     pub reason: String,
     pub metadata: serde_json::Value,
+    pub quality_gates: Vec<LoraQualityGateResult>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoraQualityGateName {
+    PositiveBenchmark,
+    NegativeBenchmark,
+    RegressionBenchmark,
+    SafetyBenchmark,
+    RuntimeApplication,
+    OutputChanged,
+}
+
+impl LoraQualityGateName {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::PositiveBenchmark => "positive_benchmark",
+            Self::NegativeBenchmark => "negative_benchmark",
+            Self::RegressionBenchmark => "regression_benchmark",
+            Self::SafetyBenchmark => "safety_benchmark",
+            Self::RuntimeApplication => "runtime_application",
+            Self::OutputChanged => "output_changed",
+        }
+    }
+
+    fn required() -> [Self; 6] {
+        [
+            Self::PositiveBenchmark,
+            Self::NegativeBenchmark,
+            Self::RegressionBenchmark,
+            Self::SafetyBenchmark,
+            Self::RuntimeApplication,
+            Self::OutputChanged,
+        ]
+    }
+}
+
+impl std::fmt::Display for LoraQualityGateName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoraQualityGateResult {
+    pub name: LoraQualityGateName,
+    pub passed: bool,
+    pub evidence: String,
 }
 
 /// Leakage diagnostics for a role dataset.
@@ -184,6 +233,7 @@ impl LoraBenchmarkDecision {
             accepted: true,
             reason: reason.into(),
             metadata: serde_json::Value::Null,
+            quality_gates: Vec::new(),
         }
     }
 
@@ -192,8 +242,58 @@ impl LoraBenchmarkDecision {
             accepted: false,
             reason: reason.into(),
             metadata: serde_json::Value::Null,
+            quality_gates: Vec::new(),
         }
     }
+
+    pub fn accept_with_quality_gates(
+        reason: impl Into<String>,
+        quality_gates: Vec<LoraQualityGateResult>,
+        metadata: serde_json::Value,
+    ) -> Self {
+        Self {
+            accepted: true,
+            reason: reason.into(),
+            metadata,
+            quality_gates,
+        }
+    }
+
+    pub fn missing_required_quality_gates(&self) -> Vec<LoraQualityGateName> {
+        LoraQualityGateName::required()
+            .into_iter()
+            .filter(|required| {
+                !self
+                    .quality_gates
+                    .iter()
+                    .any(|gate| gate.name == *required && gate.passed)
+            })
+            .collect()
+    }
+
+    pub fn all_required_quality_gates_passed(&self) -> bool {
+        self.missing_required_quality_gates().is_empty()
+    }
+}
+
+pub fn lora_quality_gate(
+    name: LoraQualityGateName,
+    passed: bool,
+    evidence: impl Into<String>,
+) -> LoraQualityGateResult {
+    LoraQualityGateResult {
+        name,
+        passed,
+        evidence: evidence.into(),
+    }
+}
+
+pub fn passed_lora_quality_gates(evidence: impl AsRef<str>) -> Vec<LoraQualityGateResult> {
+    let evidence = evidence.as_ref();
+    LoraQualityGateName::required()
+        .into_iter()
+        .map(|name| lora_quality_gate(name, true, evidence))
+        .collect()
 }
 
 /// Compares a newly trained LoRA adapter against the current baseline.
@@ -1104,6 +1204,7 @@ impl LoraEvolutionServiceImpl {
                 "accepted": decision.accepted,
                 "reason": decision.reason.clone(),
                 "metadata": decision.metadata.clone(),
+                "quality_gates": decision.quality_gates.clone(),
             });
             let mut benchmark_gate = gate_metadata.clone();
             if let (Some(target), Some(source)) = (
@@ -1118,8 +1219,21 @@ impl LoraEvolutionServiceImpl {
                 metrics_object.insert("benchmark_gate".into(), benchmark_gate);
             }
 
-            if !decision.accepted {
-                let reason = format!("benchmark gate rejected challenger: {}", decision.reason);
+            if !decision.accepted || !decision.all_required_quality_gates_passed() {
+                let missing = decision
+                    .missing_required_quality_gates()
+                    .into_iter()
+                    .map(|gate| gate.as_str().to_string())
+                    .collect::<Vec<_>>();
+                let reason = if missing.is_empty() {
+                    format!("benchmark gate rejected challenger: {}", decision.reason)
+                } else {
+                    format!(
+                        "benchmark gate rejected challenger: {}; missing or failed quality gates: {}",
+                        decision.reason,
+                        missing.join(",")
+                    )
+                };
                 Self::remove_adapter_artifact(&result.adapter_path).await;
 
                 if let Some(repo) = &job_repo {
@@ -1950,9 +2064,39 @@ mod tests {
             request: LoraBenchmarkRequest,
         ) -> Result<LoraBenchmarkDecision, LoraEvolutionError> {
             self.requests.lock().unwrap().push(request);
-            Ok(LoraBenchmarkDecision::accept(
-                "challenger improved benchmark pass rate",
+            Ok(LoraBenchmarkDecision::accept_with_quality_gates(
+                "challenger improved all quality gates",
+                passed_lora_quality_gates("deterministic test gate passed"),
+                serde_json::json!({
+                    "positive_benchmark": {"passed": true},
+                    "negative_benchmark": {"passed": true},
+                    "regression_benchmark": {"passed": true},
+                    "safety_benchmark": {"passed": true},
+                    "runtime_application": {"passed": true},
+                    "output_changed": {"passed": true}
+                }),
             ))
+        }
+    }
+
+    struct IncompleteAcceptingBenchmarkGate;
+
+    #[async_trait]
+    impl LoraBenchmarkGate for IncompleteAcceptingBenchmarkGate {
+        async fn evaluate(
+            &self,
+            _request: LoraBenchmarkRequest,
+        ) -> Result<LoraBenchmarkDecision, LoraEvolutionError> {
+            Ok(LoraBenchmarkDecision {
+                accepted: true,
+                reason: "legacy accepted flag without P10 evidence".into(),
+                metadata: serde_json::json!({ "legacy": true }),
+                quality_gates: vec![lora_quality_gate(
+                    LoraQualityGateName::PositiveBenchmark,
+                    true,
+                    "only positive benchmark passed",
+                )],
+            })
         }
     }
 
@@ -3091,6 +3235,30 @@ mod tests {
                 ..
             } if action == "lora_evolution_rejected" && trace_id == "trace"
         )));
+    }
+
+    #[tokio::test]
+    async fn benchmark_gate_rejects_accepted_decision_without_all_quality_gates() {
+        let task = make_task("p1", "codegen", TaskStatus::Completed, Some(5.0));
+        let examples = vec![
+            example("codegen", 5.0, 0),
+            example("codegen", 5.0, 1),
+            example("codegen", 5.0, 2),
+        ];
+        let (service, _, adapter_repo, inference, _) = evolution_service(task, examples, vec![]);
+        let service = service.with_benchmark_gate(Arc::new(IncompleteAcceptingBenchmarkGate));
+
+        let error = service.train_and_register("codegen").await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            LoraEvolutionError::ValidationFailed(_, reason)
+                if reason.contains("missing or failed quality gates")
+                    && reason.contains("negative_benchmark")
+                    && reason.contains("runtime_application")
+        ));
+        assert!(adapter_repo.adapters.lock().unwrap().is_empty());
+        assert!(inference.registered.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -1,0 +1,154 @@
+{
+  "passed": true,
+  "promoted_decision": {
+    "accepted": true,
+    "reason": "all P10 LoRA quality gates passed",
+    "metadata": {
+      "positive_benchmark": {
+        "baseline_pass_rate": 0.62,
+        "adapter_pass_rate": 0.86
+      },
+      "negative_benchmark": {
+        "baseline_bad_pattern_rate": 0.21,
+        "adapter_bad_pattern_rate": 0.04
+      },
+      "regression_benchmark": {
+        "adapter_pass_rate": 0.98
+      },
+      "safety_benchmark": {
+        "prompt_injection_regressed": false,
+        "tool_misuse_regressed": false
+      },
+      "runtime_application": {
+        "active_adapter_id": "p10-coder-python-v2"
+      },
+      "output_changed": {
+        "baseline_hash": "base:001",
+        "adapter_hash": "adapted:9af"
+      }
+    },
+    "quality_gates": [
+      {
+        "name": "positive_benchmark",
+        "passed": true,
+        "evidence": "positive benchmark pass_rate improved from 0.62 to 0.86"
+      },
+      {
+        "name": "negative_benchmark",
+        "passed": true,
+        "evidence": "negative benchmark repeated bad patterns 4% vs 21% baseline"
+      },
+      {
+        "name": "regression_benchmark",
+        "passed": true,
+        "evidence": "regression benchmark preserved old skill pass_rate 0.98"
+      },
+      {
+        "name": "safety_benchmark",
+        "passed": true,
+        "evidence": "prompt injection/tool misuse suite did not regress"
+      },
+      {
+        "name": "runtime_application",
+        "passed": true,
+        "evidence": "runtime diagnostics reported active adapter p10-coder-python-v2"
+      },
+      {
+        "name": "output_changed",
+        "passed": true,
+        "evidence": "adapted output differs from baseline and contains corrected behavior"
+      }
+    ]
+  },
+  "rejected_decision": {
+    "accepted": true,
+    "reason": "legacy accepted flag but safety/output evidence failed",
+    "metadata": {
+      "safety_benchmark": {
+        "prompt_injection_regressed": true
+      },
+      "output_changed": {
+        "baseline_hash": "same",
+        "adapter_hash": "same"
+      }
+    },
+    "quality_gates": [
+      {
+        "name": "positive_benchmark",
+        "passed": true,
+        "evidence": "positive benchmark improved"
+      },
+      {
+        "name": "safety_benchmark",
+        "passed": false,
+        "evidence": "prompt injection/tool misuse regressed"
+      },
+      {
+        "name": "output_changed",
+        "passed": false,
+        "evidence": "adapter output equals baseline output"
+      }
+    ]
+  },
+  "rollback_artifact_removed": true,
+  "active_adapter_after_rollback": "p10-coder-python-v2",
+  "gates": [
+    {
+      "name": "positive_benchmark_passed",
+      "passed": true,
+      "evidence": "agent solves correct held-out tasks better"
+    },
+    {
+      "name": "negative_benchmark_passed",
+      "passed": true,
+      "evidence": "agent repeats bad patterns less often"
+    },
+    {
+      "name": "regression_benchmark_passed",
+      "passed": true,
+      "evidence": "old skills preserved"
+    },
+    {
+      "name": "safety_benchmark_passed",
+      "passed": true,
+      "evidence": "prompt injection/tool misuse did not regress"
+    },
+    {
+      "name": "runtime_application_proven",
+      "passed": true,
+      "evidence": "runtime reports active adapter"
+    },
+    {
+      "name": "output_changed_proven",
+      "passed": true,
+      "evidence": "adapter behavior changed"
+    },
+    {
+      "name": "promotion_requires_all_gates",
+      "passed": true,
+      "evidence": "accepted=true is insufficient without all required gates"
+    },
+    {
+      "name": "rollback_removed_artifact",
+      "passed": true,
+      "evidence": "failed challenger artifact was deleted"
+    },
+    {
+      "name": "rollback_preserves_active_adapter",
+      "passed": true,
+      "evidence": "active promoted adapter remains selected after rejected challenger"
+    }
+  ],
+  "evidence": {
+    "promotion_policy": "all required P10 quality gates must pass",
+    "required_gates": [
+      "positive_benchmark",
+      "negative_benchmark",
+      "regression_benchmark",
+      "safety_benchmark",
+      "runtime_application",
+      "output_changed"
+    ],
+    "rollback_policy": "failed challenger artifact removed and active baseline/promotion preserved"
+  }
+}

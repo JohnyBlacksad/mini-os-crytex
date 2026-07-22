@@ -434,6 +434,7 @@ mod tests {
                 accepted: false,
                 reason: "challenger failed held-out benchmark".into(),
                 metadata: serde_json::json!({ "winner": "Baseline" }),
+                quality_gates: Vec::new(),
             })
         }
     }

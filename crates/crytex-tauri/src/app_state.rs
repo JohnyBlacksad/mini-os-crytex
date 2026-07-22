@@ -1954,6 +1954,7 @@ mod tests {
         LoraBenchmarkRequest, LoraEvolutionError, ManagedModel, ManifestEntry, ModelManagerError,
         ModelStatus, PromptBenchmarkDecision, PromptBenchmarkGate, PromptBenchmarkRequest,
         Quantization, RecommendedConfig, ToolDescription, ToolService, ToolServiceError,
+        passed_lora_quality_gates,
     };
     use crytex_inference::{
         BackendInfo, InferenceRequest, InferenceResponse, LoRAAdapter, ModelInfo, TokenUsage,
@@ -2577,6 +2578,7 @@ mod tests {
                     "baseline_pass_rate": 0.4,
                     "challenger_pass_rate": 0.8
                 }),
+                quality_gates: passed_lora_quality_gates("tauri test benchmark gate passed"),
             })
         }
     }

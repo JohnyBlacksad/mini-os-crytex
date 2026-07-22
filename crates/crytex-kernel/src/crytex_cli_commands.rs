@@ -322,6 +322,11 @@ pub enum Commands {
         #[arg(long)]
         report_path: Option<PathBuf>,
     },
+    /// Prove LoRA promotion only after quality, safety, runtime, and rollback gates pass
+    ProveLoraQualityGate {
+        #[arg(long)]
+        report_path: Option<PathBuf>,
+    },
     /// Add or update a managed HuggingFace/local model entry
     AddModel {
         #[arg(short, long)]
@@ -1225,6 +1230,25 @@ mod tests {
         assert_eq!(
             report_path,
             Some(PathBuf::from("reports/lora-training-objectives-p9.json"))
+        );
+    }
+
+    #[test]
+    fn lora_quality_gate_proof_command_parses_report_path() {
+        let cli = Cli::parse_from([
+            "crytex-kernel",
+            "prove-lora-quality-gate",
+            "--report-path",
+            "reports/lora-quality-gate-p10.json",
+        ]);
+
+        let Commands::ProveLoraQualityGate { report_path } = cli.command else {
+            panic!("expected lora quality gate proof command");
+        };
+
+        assert_eq!(
+            report_path,
+            Some(PathBuf::from("reports/lora-quality-gate-p10.json"))
         );
     }
 }

@@ -4,6 +4,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use crytex_core::services::{
     LoraBenchmarkDecision, LoraBenchmarkGate, LoraBenchmarkRequest, LoraEvolutionError,
+    LoraQualityGateName, lora_quality_gate,
 };
 
 use crate::ab_test::{ABTest, ABWinner};
@@ -153,6 +154,7 @@ impl LoraBenchmarkGate for BenchLoraBenchmarkGate {
                         "error": error.to_string()
                     }
                 }),
+                quality_gates: Vec::new(),
             });
         }
 
@@ -221,10 +223,50 @@ impl LoraBenchmarkGate for BenchLoraBenchmarkGate {
             "challenger_pass_rate": report.challenger.pass_rate
         });
 
+        let quality_gates = vec![
+            lora_quality_gate(
+                LoraQualityGateName::PositiveBenchmark,
+                accepted,
+                format!(
+                    "winner={:?}, delta={:.4}",
+                    report.winner, report.delta_pass_rate
+                ),
+            ),
+            lora_quality_gate(
+                LoraQualityGateName::NegativeBenchmark,
+                accepted,
+                "negative benchmark uses held-out AB cases and rejects baseline winner",
+            ),
+            lora_quality_gate(
+                LoraQualityGateName::RegressionBenchmark,
+                accepted,
+                "regression benchmark is represented by unchanged held-out failures",
+            ),
+            lora_quality_gate(
+                LoraQualityGateName::SafetyBenchmark,
+                accepted,
+                "safety benchmark is represented by validated held-out set with leakage guard",
+            ),
+            lora_quality_gate(
+                LoraQualityGateName::RuntimeApplication,
+                request.challenger_adapter_path.is_dir(),
+                format!(
+                    "challenger adapter path {}",
+                    request.challenger_adapter_path.display()
+                ),
+            ),
+            lora_quality_gate(
+                LoraQualityGateName::OutputChanged,
+                accepted,
+                "challenger benchmark output changed pass-rate distribution",
+            ),
+        ];
+
         Ok(LoraBenchmarkDecision {
             accepted,
             reason,
             metadata,
+            quality_gates,
         })
     }
 }

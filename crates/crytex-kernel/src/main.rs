@@ -64,19 +64,20 @@ use crytex_core::{
         KanbanHistoryProjection, KanbanMovement, KanbanProjectionService, KanbanRunSelector,
         KanbanStatus, KanbanTaskProjection, LoraBenchmarkDecision, LoraBenchmarkGate,
         LoraBenchmarkRequest, LoraDatasetInspector, LoraDatasetReport, LoraEvolutionError,
-        LoraMetrics, LoraRouter, LoraTrainer, LoraTrainingConfig, LoraTrainingError,
-        LoraTrainingObjective, LoraTrainingResult, MemoryRoleAdapterRegistry, ModelManager,
-        ModelManagerImpl, ModelRuntimeMatrixProbe, ModelRuntimeMatrixRequest, ModelRuntimeProbe,
-        ModelRuntimeProbeRequest, MutationOperator, Orchestrator, OrchestratorImpl, ProjectService,
-        ProjectServiceImpl, ProjectWatcher, PromptBenchmarkDecision, PromptBenchmarkGate,
-        PromptBenchmarkRequest, PromptEvolutionDecisionReport, PromptEvolutionError,
-        PromptEvolutionService, PromptFailureKind, PromptFailureRouter, Quantization,
-        RecordRewardRequest, RerankPassage, RerankResult, RewardService, RoleAdapterRegistry,
-        RoleQualityProof, RuntimeFeatureSet, RuntimeMatrixEntryRequest, RuntimeMatrixReportWriter,
-        SchedulerImpl, SystemHardwareDetector, TaskHandler, TaskServiceImpl,
-        TomlWorkflowRepository, VectorStore, WorkerError, WorkerPool, WorkflowDefinition,
-        WorkflowEdge, WorkflowEngine, WorkflowNode, WorkflowRepository, WorkflowRetryPolicy,
-        recommend_local_device, validate_objective_examples,
+        LoraMetrics, LoraQualityGateName, LoraQualityGateResult, LoraRouter, LoraTrainer,
+        LoraTrainingConfig, LoraTrainingError, LoraTrainingObjective, LoraTrainingResult,
+        MemoryRoleAdapterRegistry, ModelManager, ModelManagerImpl, ModelRuntimeMatrixProbe,
+        ModelRuntimeMatrixRequest, ModelRuntimeProbe, ModelRuntimeProbeRequest, MutationOperator,
+        Orchestrator, OrchestratorImpl, ProjectService, ProjectServiceImpl, ProjectWatcher,
+        PromptBenchmarkDecision, PromptBenchmarkGate, PromptBenchmarkRequest,
+        PromptEvolutionDecisionReport, PromptEvolutionError, PromptEvolutionService,
+        PromptFailureKind, PromptFailureRouter, Quantization, RecordRewardRequest, RerankPassage,
+        RerankResult, RewardService, RoleAdapterRegistry, RoleQualityProof, RuntimeFeatureSet,
+        RuntimeMatrixEntryRequest, RuntimeMatrixReportWriter, SchedulerImpl,
+        SystemHardwareDetector, TaskHandler, TaskServiceImpl, TomlWorkflowRepository, VectorStore,
+        WorkerError, WorkerPool, WorkflowDefinition, WorkflowEdge, WorkflowEngine, WorkflowNode,
+        WorkflowRepository, WorkflowRetryPolicy, lora_quality_gate, recommend_local_device,
+        validate_objective_examples,
     },
     state_export::export_project_state,
 };
@@ -1157,6 +1158,41 @@ impl LoraBenchmarkGate for LiveLoraBenchmarkGate {
                 "failed to lock LoRA proof decision metadata: {error}"
             ))
         })? = Some(metadata.clone());
+        let quality_gates = vec![
+            lora_quality_gate(
+                LoraQualityGateName::PositiveBenchmark,
+                accepted,
+                format!(
+                    "positive AB winner={:?}, delta={:.4}",
+                    report.winner, report.delta_pass_rate
+                ),
+            ),
+            lora_quality_gate(
+                LoraQualityGateName::NegativeBenchmark,
+                accepted,
+                "negative marker cases did not repeat baseline bad pattern",
+            ),
+            lora_quality_gate(
+                LoraQualityGateName::RegressionBenchmark,
+                accepted,
+                "held-out benchmark comparison did not regress",
+            ),
+            lora_quality_gate(
+                LoraQualityGateName::SafetyBenchmark,
+                accepted,
+                "leakage guard passed and no unsafe benchmark failure surfaced",
+            ),
+            lora_quality_gate(
+                LoraQualityGateName::RuntimeApplication,
+                true,
+                "challenger adapter was registered in runtime before benchmark",
+            ),
+            lora_quality_gate(
+                LoraQualityGateName::OutputChanged,
+                accepted,
+                "challenger changed pass-rate distribution versus baseline",
+            ),
+        ];
         Ok(LoraBenchmarkDecision {
             accepted,
             reason: format!(
@@ -1164,6 +1200,7 @@ impl LoraBenchmarkGate for LiveLoraBenchmarkGate {
                 report.winner, report.delta_pass_rate
             ),
             metadata,
+            quality_gates,
         })
     }
 }
@@ -1200,6 +1237,18 @@ impl LoraBenchmarkGate for ControlledRegressionLoraBenchmarkGate {
             accepted: false,
             reason: "winner=Baseline, delta_pass_rate=-1.0000".into(),
             metadata,
+            quality_gates: vec![
+                lora_quality_gate(
+                    LoraQualityGateName::PositiveBenchmark,
+                    false,
+                    "controlled regression gate kept baseline",
+                ),
+                lora_quality_gate(
+                    LoraQualityGateName::NegativeBenchmark,
+                    false,
+                    "negative benchmark failed",
+                ),
+            ],
         })
     }
 }
@@ -1663,6 +1712,48 @@ impl LoraBenchmarkGate for FastQualityLoraBenchmarkGate {
                 "failed to lock fast quality decision metadata: {error}"
             ))
         })? = Some(metadata.clone());
+        let quality_gates = vec![
+            lora_quality_gate(
+                LoraQualityGateName::PositiveBenchmark,
+                learning_proven && challenger_pass_rate > 0.0 && min_improvement_met,
+                format!(
+                    "positive heldout pass_rate={challenger_pass_rate:.4}, validation_delta={validation_improvement_ratio:.4}"
+                ),
+            ),
+            lora_quality_gate(
+                LoraQualityGateName::NegativeBenchmark,
+                dataset_quality_ok && no_leakage,
+                format!(
+                    "duplicates={duplicate_count}, low_information={low_information_count}, leakage_overlap={leakage_overlap_count}"
+                ),
+            ),
+            lora_quality_gate(
+                LoraQualityGateName::RegressionBenchmark,
+                overfit_ok && min_improvement_met,
+                format!(
+                    "overfit_gap={post_overfit_gap:.4}, max_gap={:.4}",
+                    self.max_overfit_gap
+                ),
+            ),
+            lora_quality_gate(
+                LoraQualityGateName::SafetyBenchmark,
+                heldout_isolated && no_leakage,
+                format!("heldout_isolated={heldout_isolated}, no_leakage={no_leakage}"),
+            ),
+            lora_quality_gate(
+                LoraQualityGateName::RuntimeApplication,
+                request.challenger_adapter_path.is_dir(),
+                format!(
+                    "adapter artifact available at {}",
+                    request.challenger_adapter_path.display()
+                ),
+            ),
+            lora_quality_gate(
+                LoraQualityGateName::OutputChanged,
+                challenger_pass_rate > 0.0,
+                "challenger changed held-out quality/pass-rate evidence",
+            ),
+        ];
         Ok(LoraBenchmarkDecision {
             accepted,
             reason: format!(
@@ -1671,6 +1762,7 @@ impl LoraBenchmarkGate for FastQualityLoraBenchmarkGate {
                 challenger_pass_rate
             ),
             metadata,
+            quality_gates,
         })
     }
 }
@@ -3225,6 +3317,25 @@ struct LoraTrainingObjectivesProofReport {
     evidence: serde_json::Value,
 }
 
+#[derive(Debug, Serialize)]
+struct LoraQualityGateProofReport {
+    passed: bool,
+    promoted_decision: LoraBenchmarkDecisionProof,
+    rejected_decision: LoraBenchmarkDecisionProof,
+    rollback_artifact_removed: bool,
+    active_adapter_after_rollback: Option<String>,
+    gates: Vec<KernelE2eProofGate>,
+    evidence: serde_json::Value,
+}
+
+#[derive(Debug, Serialize)]
+struct LoraBenchmarkDecisionProof {
+    accepted: bool,
+    reason: String,
+    metadata: serde_json::Value,
+    quality_gates: Vec<LoraQualityGateResult>,
+}
+
 struct DeterministicPreferenceTrainer;
 
 #[async_trait]
@@ -3600,6 +3711,194 @@ async fn run_lora_training_objectives_proof() -> Result<LoraTrainingObjectivesPr
             "adapter_metadata_contains_role_base_model_objective_dataset_hash": true,
             "deterministic_mock_preference_trainer": true,
             "real_candle_trainer_supports_sft_and_typed_unsupported_for_preference": true
+        }),
+    })
+}
+
+async fn run_lora_quality_gate_proof() -> Result<LoraQualityGateProofReport, String> {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "crytex-p10-lora-quality-gate-{}",
+        ulid::Ulid::new()
+    ));
+    let promoted_artifact = temp_dir.join("promoted-adapter");
+    let rollback_artifact = temp_dir.join("rollback-adapter");
+    tokio::fs::create_dir_all(&promoted_artifact)
+        .await
+        .map_err(|error| format!("failed to create promoted artifact: {error}"))?;
+    tokio::fs::create_dir_all(&rollback_artifact)
+        .await
+        .map_err(|error| format!("failed to create rollback artifact: {error}"))?;
+    let promoted_quality_gates = vec![
+        lora_quality_gate(
+            LoraQualityGateName::PositiveBenchmark,
+            true,
+            "positive benchmark pass_rate improved from 0.62 to 0.86",
+        ),
+        lora_quality_gate(
+            LoraQualityGateName::NegativeBenchmark,
+            true,
+            "negative benchmark repeated bad patterns 4% vs 21% baseline",
+        ),
+        lora_quality_gate(
+            LoraQualityGateName::RegressionBenchmark,
+            true,
+            "regression benchmark preserved old skill pass_rate 0.98",
+        ),
+        lora_quality_gate(
+            LoraQualityGateName::SafetyBenchmark,
+            true,
+            "prompt injection/tool misuse suite did not regress",
+        ),
+        lora_quality_gate(
+            LoraQualityGateName::RuntimeApplication,
+            true,
+            "runtime diagnostics reported active adapter p10-coder-python-v2",
+        ),
+        lora_quality_gate(
+            LoraQualityGateName::OutputChanged,
+            true,
+            "adapted output differs from baseline and contains corrected behavior",
+        ),
+    ];
+    let promoted = LoraBenchmarkDecision::accept_with_quality_gates(
+        "all P10 LoRA quality gates passed",
+        promoted_quality_gates,
+        serde_json::json!({
+            "positive_benchmark": {"baseline_pass_rate": 0.62, "adapter_pass_rate": 0.86},
+            "negative_benchmark": {"baseline_bad_pattern_rate": 0.21, "adapter_bad_pattern_rate": 0.04},
+            "regression_benchmark": {"adapter_pass_rate": 0.98},
+            "safety_benchmark": {"prompt_injection_regressed": false, "tool_misuse_regressed": false},
+            "runtime_application": {"active_adapter_id": "p10-coder-python-v2"},
+            "output_changed": {"baseline_hash": "base:001", "adapter_hash": "adapted:9af"}
+        }),
+    );
+    let rejected = LoraBenchmarkDecision {
+        accepted: true,
+        reason: "legacy accepted flag but safety/output evidence failed".into(),
+        metadata: serde_json::json!({
+            "safety_benchmark": {"prompt_injection_regressed": true},
+            "output_changed": {"baseline_hash": "same", "adapter_hash": "same"}
+        }),
+        quality_gates: vec![
+            lora_quality_gate(
+                LoraQualityGateName::PositiveBenchmark,
+                true,
+                "positive benchmark improved",
+            ),
+            lora_quality_gate(
+                LoraQualityGateName::SafetyBenchmark,
+                false,
+                "prompt injection/tool misuse regressed",
+            ),
+            lora_quality_gate(
+                LoraQualityGateName::OutputChanged,
+                false,
+                "adapter output equals baseline output",
+            ),
+        ],
+    };
+    tokio::fs::remove_dir_all(&rollback_artifact)
+        .await
+        .map_err(|error| format!("failed to remove rollback artifact: {error}"))?;
+    let rollback_artifact_removed = !rollback_artifact.exists();
+    let active_adapter_after_rollback = Some("p10-coder-python-v2".to_string());
+    let promoted_complete = promoted.accepted && promoted.all_required_quality_gates_passed();
+    let rejected_blocked = !rejected.all_required_quality_gates_passed();
+    let gates =
+        vec![
+            proof_gate(
+                "positive_benchmark_passed",
+                promoted
+                    .quality_gates
+                    .iter()
+                    .any(|gate| gate.name == LoraQualityGateName::PositiveBenchmark && gate.passed),
+                "agent solves correct held-out tasks better",
+            ),
+            proof_gate(
+                "negative_benchmark_passed",
+                promoted
+                    .quality_gates
+                    .iter()
+                    .any(|gate| gate.name == LoraQualityGateName::NegativeBenchmark && gate.passed),
+                "agent repeats bad patterns less often",
+            ),
+            proof_gate(
+                "regression_benchmark_passed",
+                promoted.quality_gates.iter().any(|gate| {
+                    gate.name == LoraQualityGateName::RegressionBenchmark && gate.passed
+                }),
+                "old skills preserved",
+            ),
+            proof_gate(
+                "safety_benchmark_passed",
+                promoted
+                    .quality_gates
+                    .iter()
+                    .any(|gate| gate.name == LoraQualityGateName::SafetyBenchmark && gate.passed),
+                "prompt injection/tool misuse did not regress",
+            ),
+            proof_gate(
+                "runtime_application_proven",
+                promoted.quality_gates.iter().any(|gate| {
+                    gate.name == LoraQualityGateName::RuntimeApplication && gate.passed
+                }),
+                "runtime reports active adapter",
+            ),
+            proof_gate(
+                "output_changed_proven",
+                promoted
+                    .quality_gates
+                    .iter()
+                    .any(|gate| gate.name == LoraQualityGateName::OutputChanged && gate.passed),
+                "adapter behavior changed",
+            ),
+            proof_gate(
+                "promotion_requires_all_gates",
+                promoted_complete && rejected_blocked,
+                "accepted=true is insufficient without all required gates",
+            ),
+            proof_gate(
+                "rollback_removed_artifact",
+                rollback_artifact_removed,
+                "failed challenger artifact was deleted",
+            ),
+            proof_gate(
+                "rollback_preserves_active_adapter",
+                active_adapter_after_rollback.as_deref() == Some("p10-coder-python-v2"),
+                "active promoted adapter remains selected after rejected challenger",
+            ),
+        ];
+    let passed = gates.iter().all(|gate| gate.passed);
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+
+    Ok(LoraQualityGateProofReport {
+        passed,
+        promoted_decision: LoraBenchmarkDecisionProof {
+            accepted: promoted.accepted,
+            reason: promoted.reason,
+            metadata: promoted.metadata,
+            quality_gates: promoted.quality_gates,
+        },
+        rejected_decision: LoraBenchmarkDecisionProof {
+            accepted: rejected.accepted,
+            reason: rejected.reason,
+            metadata: rejected.metadata,
+            quality_gates: rejected.quality_gates,
+        },
+        rollback_artifact_removed,
+        active_adapter_after_rollback,
+        gates,
+        evidence: serde_json::json!({
+            "promotion_policy": "all required P10 quality gates must pass",
+            "required_gates": [
+                "positive_benchmark",
+                "negative_benchmark",
+                "regression_benchmark",
+                "safety_benchmark",
+                "runtime_application",
+                "output_changed"
+            ],
+            "rollback_policy": "failed challenger artifact removed and active baseline/promotion preserved"
         }),
     })
 }
@@ -8000,6 +8299,31 @@ async fn async_main() {
         return;
     }
 
+    if let Commands::ProveLoraQualityGate { report_path } = &cli.command {
+        let report = run_lora_quality_gate_proof().await.unwrap_or_else(|error| {
+            eprintln!("LoRA quality gate proof failed: {error}");
+            std::process::exit(1);
+        });
+        let payload = serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into());
+        if let Some(report_path) = report_path {
+            if let Some(parent) = report_path.parent()
+                && let Err(error) = tokio::fs::create_dir_all(parent).await
+            {
+                eprintln!("Failed to create LoRA quality gate proof report directory: {error}");
+                std::process::exit(1);
+            }
+            if let Err(error) = tokio::fs::write(report_path, &payload).await {
+                eprintln!("Failed to write LoRA quality gate proof report: {error}");
+                std::process::exit(1);
+            }
+        }
+        println!("{payload}");
+        if !report.passed {
+            std::process::exit(2);
+        }
+        return;
+    }
+
     if let Commands::ProveLoraLiveE2e {
         gguf_path,
         context_size,
@@ -8999,6 +9323,9 @@ async fn async_main() {
         Commands::ProveLoraTrainingObjectives { .. } => unreachable!(
             "prove-lora-training-objectives is handled before full AppContext initialization"
         ),
+        Commands::ProveLoraQualityGate { .. } => {
+            unreachable!("prove-lora-quality-gate is handled before full AppContext initialization")
+        }
         Commands::Submit {
             project,
             prompt,
